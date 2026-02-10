@@ -7,7 +7,7 @@ from tenacity import (retry, stop_after_attempt,  # for exponential backoff
 from openai import OpenAI
 
 
-CLIENT = OpenAI(api_key=os.environ['OPENAI_API_KEY'])
+CLIENT = OpenAI(api_key='a')
 
 
 @retry(wait=wait_random_exponential(min=1, max=10))
