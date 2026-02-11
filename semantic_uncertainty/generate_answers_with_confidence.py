@@ -160,7 +160,8 @@ def main(args):
         it = 0
         for index in tqdm(indices):
             # Probably a typo
-            if (it + 1 % 10) == 0:
+            if ((it + 1) % 10) == 0:
+                print("it has been run")
                 gc.collect()
                 torch.cuda.empty_cache()
             it += 1
@@ -223,18 +224,17 @@ def main(args):
                     logging.info('question: '.ljust(15) + question)
                     logging.info('low-t prediction: '.ljust(15) + '\n' + predicted_answer)
                     logging.info('correct answer: '.ljust(15) + str(correct_answer))
-                    logging.info('accuracy: '.ljust(15) + str(acc))
+                    # logging.info('accuracy: '.ljust(15) + str(acc))
                     logging.info('decoded tokens: '.ljust(15) + '\n' + str(decoded_tokens))
                     # print out embeddings, but just the first 5
-                    logging.info('\nemb_sec_last_token: '.ljust(15) + (str(emb_sec_last_token.shape) if hasattr(emb_sec_last_token, 'shape') else str(len(emb_sec_last_token))))
-                    logging.info('emb_sec_last_token: '.ljust(15) + '\n' + str(emb_sec_last_token[0][0]))
-                    logging.info('emb_tok_bef_gen: '.ljust(15) + (str(emb_tok_bef_gen.shape) if hasattr(emb_tok_bef_gen, 'shape') else str(len(emb_tok_bef_gen))))
-                    logging.info('emb_tok_bef_gen: '.ljust(15) + '\n' + str(emb_tok_bef_gen[0][0]))
-                    logging.info('all_embeddings: '.ljust(15) + (str(all_embeddings.shape) if hasattr(all_embeddings, 'shape') else str(len(all_embeddings))))
-                    n_all = len(all_embeddings) if hasattr(all_embeddings, '__len__') else (all_embeddings.shape[0] if hasattr(all_embeddings, 'shape') else 0)
-                    if n_all >= 2:
-                        logging.info('this from all_embeddings should equal emb_sec_last_token: '.ljust(15) + '\n' + str(all_embeddings[-2][0, 0, -1, :]))
-                        logging.info('this from all_embeddings should equal emb_tok_bef_gen: '.ljust(15) + '\n' + str(all_embeddings[0][0, 0, -1, :]))
+
+                    # These codes were for checking, but commented out for better performance
+                    # logging.info('emb_sec_last_token: '.ljust(15) + '\n' + str(emb_sec_last_token[0][0]))
+                    # logging.info('emb_tok_bef_gen: '.ljust(15) + '\n' + str(emb_tok_bef_gen[0][0]))
+                    # n_all = len(all_embeddings) if hasattr(all_embeddings, '__len__') else (all_embeddings.shape[0] if hasattr(all_embeddings, 'shape') else 0)
+                    # if n_all >= 2:
+                    #     logging.info('this from all_embeddings should equal emb_sec_last_token: '.ljust(15) + '\n' + str(all_embeddings[-2][0, 0, -1, :]))
+                    #     logging.info('this from all_embeddings should equal emb_tok_bef_gen: '.ljust(15) + '\n' + str(all_embeddings[0][0, 0, -1, :]))
 
 
                     accuracies.append(acc)
@@ -248,11 +248,15 @@ def main(args):
                         'all_embeddings': all_embeddings,
                         'decoded_tokens': decoded_tokens,
                     }
+                    generations[example['id']].update({
+                        'most_likely_answer': most_likely_answer_dict,
+                        'reference': utils.get_reference(example),
+                    })
                 else:
                     logging.info('high-t prediction '.ljust(15) + str(i) + ' : ' + predicted_answer)
                     # Aggregate predictions over num_generations.
                     full_responses.append(
-                        (predicted_answer, token_log_likelihoods, embedding, acc))
+                        (predicted_answer, token_log_likelihoods, all_embeddings, acc))
 
             # Append all predictions for this example to `generations`.
             generations[example['id']]['responses'] = full_responses
