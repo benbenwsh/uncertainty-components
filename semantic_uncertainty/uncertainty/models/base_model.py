@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from typing import List, Text
 
 
-STOP_SEQUENCES = ['\n\n\n\n', '\n\n\n', '\n\n', '\n', 'Question:', 'Context:']
+STOP_SEQUENCES = ['\n\n\n\n', '\n\n\n']
 
 
 class BaseModel(ABC):

@@ -9,6 +9,7 @@ import wandb
 from evaluate import load
 
 from uncertainty.models.huggingface_models import HuggingfaceModel
+from uncertainty.models.huggingface_models_all_embeddings import HuggingfaceModelAllEmbeddings
 from uncertainty.utils import openai as oai
 
 BRIEF_PROMPTS = {
@@ -106,6 +107,9 @@ def get_parser(stages=['generate', 'compute']):
             "--answerable_only", default=False,
             action=argparse.BooleanOptionalAction,
             help='Exclude unanswerable questions.')
+        parser.add_argument(
+            "--confidence", default=False, action=argparse.BooleanOptionalAction,
+            help="If true, the prompt also asks the model to output its confidence, and we record embeddings at every token position.")
 
     if 'compute' in stages:
         parser.add_argument('--recompute_accuracy',
@@ -275,9 +279,20 @@ def get_reference(example):
 def init_model(args):
     mn = args.model_name
     if 'llama' in mn.lower() or 'falcon' in mn.lower() or 'mistral' in mn.lower() or 'phi' in mn.lower():
-        model = HuggingfaceModel(
-            mn, stop_sequences='default',
-            max_new_tokens=args.model_max_new_tokens)
+        # If confidence flag is set, use the all-embeddings model implementation.
+        if args.confidence == True:
+            print('Initialising HuggingfaceModelAllEmbeddings for confidence embeddings...')
+            model = HuggingfaceModelAllEmbeddings(
+                mn, stop_sequences='default',
+                max_new_tokens=args.model_max_new_tokens)
+        else:
+            print('Initialising HuggingfaceModel...')
+            model = HuggingfaceModel(
+                mn, stop_sequences='default',
+                max_new_tokens=args.model_max_new_tokens)
+        # model = HuggingfaceModel(
+        #     mn, stop_sequences='default',
+        #     max_new_tokens=args.model_max_new_tokens)
     else:
         raise ValueError(f'Unknown model_name `{mn}`.')
     return model

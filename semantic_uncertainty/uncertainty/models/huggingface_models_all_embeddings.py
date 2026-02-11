@@ -86,8 +86,8 @@ def remove_split_layer(device_map_in):
     return device_map
 
 
-class HuggingfaceModel(BaseModel):
-    """HuggingfaceModel."""
+class HuggingfaceModelAllEmbeddings(BaseModel):
+    """HuggingfaceModel variant that returns all token embeddings when requested."""
 
     def __init__(self, model_name, stop_sequences=None, max_new_tokens=None):
         if max_new_tokens is None:
@@ -315,6 +315,13 @@ class HuggingfaceModel(BaseModel):
         n_input_token = len(inputs['input_ids'][0])
         n_generated = token_stop_index - n_input_token
 
+        # Remove input tokens from decoded_tokens
+        decoded_tokens = [self.tokenizer.decode([token_id], skip_special_tokens=False) for token_id in outputs.sequences[0]]
+        sliced_decoded_tokens = decoded_tokens[n_input_token:]
+
+        logging.info(f'Length of generated output (with special tokens) (sliced_decoded_tokens): {len(sliced_decoded_tokens)}')
+        logging.info(f'Full length (input prompt + generated output) (with special tokens) (decoded_tokens): {len(decoded_tokens)}')
+
         if n_generated == 0:
             logging.warning('Only stop_words were generated. For likelihoods and embeddings, taking stop word instead.')
             n_generated = 1
@@ -354,18 +361,29 @@ class HuggingfaceModel(BaseModel):
         last_token_embedding = last_layer[:, -1, :].cpu()
 
         if return_latent:
+            # Collect all embeddings (per-layer tensors) and the corresponding inputs.
+            all_embeddings = []
+            for h in hidden:
+                # h may be a tuple/list of per-layer tensors or a tensor
+                if isinstance(h, (list, tuple)):
+                    stacked = torch.stack([layer for layer in h])
+                else:
+                    stacked = h
+                all_embeddings.append(stacked.cpu())
+
             # Stack second last token embeddings from all layers 
             if len(hidden) == 1:  # FIX: runtime error for mistral-7b on bioasq
                 sec_last_input = hidden[0]
             elif ((n_generated - 2) >= len(hidden)):
                 sec_last_input = hidden[-2]
             else:
-                sec_last_input = hidden[n_generated - 2]
-            sec_last_token_embedding = torch.stack([layer[:, -1, :] for layer in sec_last_input]).cpu()
+                # TODO: it used to be a mistake
+                sec_last_input = hidden[n_generated - 1]
+            emb_sec_last_token = torch.stack([layer[:, -1, :] for layer in sec_last_input]).cpu()
     
             # Get the last input token embeddings (before generated tokens)
             last_tok_bef_gen_input = hidden[0]
-            last_tok_bef_gen_embedding = torch.stack([layer[:, -1, :] for layer in last_tok_bef_gen_input]).cpu()
+            emb_tok_bef_gen = torch.stack([layer[:, -1, :] for layer in last_tok_bef_gen_input]).cpu()
 
         # Get log_likelihoods.
         transition_scores = self.model.compute_transition_scores(
@@ -383,14 +401,14 @@ class HuggingfaceModel(BaseModel):
         if len(log_likelihoods) == 0:
             raise ValueError
 
-        hidden_states = (last_token_embedding,)
+        hidden_states = ()
 
         if return_latent:
-            hidden_states += (sec_last_token_embedding, last_tok_bef_gen_embedding)
+            hidden_states += (emb_sec_last_token, emb_tok_bef_gen, all_embeddings)
         else:
-            hidden_states += (None, None)
+            hidden_states += (None, None, None)
 
-        return_values = (sliced_answer, log_likelihoods, hidden_states)
+        return_values = (sliced_answer, log_likelihoods, hidden_states, sliced_decoded_tokens)
 
         return return_values
 

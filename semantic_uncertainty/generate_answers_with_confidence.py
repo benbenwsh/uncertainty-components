@@ -1,4 +1,4 @@
-"""Predict with LLM on task."""
+"""Predict with LLM on task, appending a confidence request to the final question."""
 import gc
 import os
 import logging
@@ -17,10 +17,13 @@ from compute_uncertainty_measures import main as main_compute
 
 
 utils.setup_logger()
-openai.api_key = os.getenv("OPENAI_API_KEY")  # Set up OpenAI API credentials.
+openai.api_key = os.getenv("a")  # Set up OpenAI API credentials.
 
+# Prompt template is from just_ask_for_calibration paper
+CONFIDENCE_PROMPT = "Provide your best guess and the probability that it is correct (0.0 to 1.0) for the following question. Give ONLY the guess and probability, no other words or explanation. For example:\n\nGuess: <most likely guess, as short as possible; not a complete sentence, just the guess!>\n Probability: <the probability between 0.0 and 1.0 that your guess is correct, without any extra commentary whatsoever; just the probability!>\n\nThe question is: "
 
 def main(args):
+    logging.info('GPU: %s', torch.cuda.get_device_name())
     if args.dataset == 'svamp':
         if not args.use_context:
             logging.info('Forcing `use_context=True` for svamp dataset.')
@@ -136,15 +139,27 @@ def main(args):
             dataset = validation_dataset
             possible_indices = range(0, len(dataset))
 
-        # Evaluate over random subset of the datasets.
-        indices = random.sample(possible_indices, min(args.num_samples, len(dataset)))
+        # indices = random.sample(possible_indices, min(args.num_samples, len(dataset)))
+        # 9:1 split of total num_samples between train (90%) and validation (10%).
+        TRAIN_RATIO = 0.9
+        num_samples = int(args.num_samples * TRAIN_RATIO) if dataset_split == 'train' else int(args.num_samples * (1 - TRAIN_RATIO))
+        # I changed it to become not random
+        # indices = random.sample(possible_indices, min(num_samples, len(dataset)))
+        indices = possible_indices[:min(num_samples, len(dataset))]
+
+        logging.info('Size of dataset split:', len(dataset))
+        logging.info('Number of samples to generate:', len(indices))
+
+        # # Evaluate over random subset of the datasets.
+        # indices = random.sample(possible_indices, min(args.num_samples, len(dataset)))
         experiment_details[dataset_split] = {'indices': indices}
 
-        if args.num_samples > len(dataset):
+        if num_samples > len(dataset):
             logging.warning('Not enough samples in dataset. Using all %d samples.', len(dataset))
 
         it = 0
         for index in tqdm(indices):
+            # Probably a typo
             if (it + 1 % 10) == 0:
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -156,11 +171,22 @@ def main(args):
             generations[example['id']] = {'question': question, 'context': context}
             correct_answer = example['answers']['text']
 
-            current_input = make_prompt(
-                context, question, None, BRIEF, args.brief_always and args.enable_brief)
+            # current_input = make_prompt(
+            #     context, question, None, BRIEF, args.brief_always and args.enable_brief)
+            # Insert confidence prompt before the 'Answer:' marker so it's part of the final question.
+            # if '\nAnswer:' in current_input:
+            #     current_input = current_input.replace('\nAnswer:', f'\n{CONFIDENCE_PROMPT}\nAnswer:')
+            # else:
+            #     current_input = current_input + CONFIDENCE_PROMPT
+            current_input = CONFIDENCE_PROMPT + question
+            # if '\nAnswer:' in current_input:
+            #     current_input = CONFIDENCE_PROMPTcurrent_input.replace('\nAnswer:', f'\n{CONFIDENCE_PROMPT}\nAnswer:')
+            # else:
+            #     current_input = CONFIDENCT_PROMPT
+
             local_prompt = prompt + current_input
 
-            logging.info('Current input: '.ljust(15) + current_input)
+            logging.info('Full prompt:\n' + local_prompt)
 
             full_responses = []
 
@@ -178,12 +204,10 @@ def main(args):
                 # Temperature for first generation is always `0.1`.
                 temperature = 0.1 if i == 0 else args.temperature
 
-                predicted_answer, token_log_likelihoods, (embedding, emb_last_before_gen, emb_before_eos) = model.predict(local_prompt, temperature, return_latent=True) 
+                predicted_answer, token_log_likelihoods, (emb_sec_last_token, emb_tok_bef_gen, all_embeddings), decoded_tokens = model.predict(local_prompt, temperature, return_latent=True) 
                 
-                # Last token embedding
-                embedding = embedding.cpu() if embedding is not None else None
-                emb_last_before_gen = emb_last_before_gen.cpu() if emb_last_before_gen is not None else None
-                emb_before_eos = emb_before_eos.cpu() if emb_before_eos is not None else None
+                emb_sec_last_token = emb_sec_last_token.cpu() if emb_sec_last_token is not None else None
+                emb_tok_bef_gen = emb_tok_bef_gen.cpu() if emb_tok_bef_gen is not None else None
                 
                 compute_acc = args.compute_accuracy_at_all_temps or (i == 0)
                 if correct_answer and compute_acc:
@@ -197,24 +221,33 @@ def main(args):
                     if args.use_context:
                         logging.info('context: '.ljust(15) + str(context))
                     logging.info('question: '.ljust(15) + question)
-                    logging.info('low-t prediction: '.ljust(15) + predicted_answer)
+                    logging.info('low-t prediction: '.ljust(15) + '\n' + predicted_answer)
                     logging.info('correct answer: '.ljust(15) + str(correct_answer))
                     logging.info('accuracy: '.ljust(15) + str(acc))
+                    logging.info('decoded tokens: '.ljust(15) + '\n' + str(decoded_tokens))
+                    # print out embeddings, but just the first 5
+                    logging.info('\nemb_sec_last_token: '.ljust(15) + (str(emb_sec_last_token.shape) if hasattr(emb_sec_last_token, 'shape') else str(len(emb_sec_last_token))))
+                    logging.info('emb_sec_last_token: '.ljust(15) + '\n' + str(emb_sec_last_token[0][0]))
+                    logging.info('emb_tok_bef_gen: '.ljust(15) + (str(emb_tok_bef_gen.shape) if hasattr(emb_tok_bef_gen, 'shape') else str(len(emb_tok_bef_gen))))
+                    logging.info('emb_tok_bef_gen: '.ljust(15) + '\n' + str(emb_tok_bef_gen[0][0]))
+                    logging.info('all_embeddings: '.ljust(15) + (str(all_embeddings.shape) if hasattr(all_embeddings, 'shape') else str(len(all_embeddings))))
+                    n_all = len(all_embeddings) if hasattr(all_embeddings, '__len__') else (all_embeddings.shape[0] if hasattr(all_embeddings, 'shape') else 0)
+                    if n_all >= 2:
+                        logging.info('this from all_embeddings should equal emb_sec_last_token: '.ljust(15) + '\n' + str(all_embeddings[-2][0, 0, -1, :]))
+                        logging.info('this from all_embeddings should equal emb_tok_bef_gen: '.ljust(15) + '\n' + str(all_embeddings[0][0, 0, -1, :]))
+
 
                     accuracies.append(acc)
                     most_likely_answer_dict = {
                         'response': predicted_answer,
                         'token_log_likelihoods': token_log_likelihoods,
-                        'embedding': embedding,
                         'accuracy': acc,
-                        'emb_last_tok_before_gen': emb_last_before_gen,
-                        'emb_tok_before_eos': emb_before_eos, 
+                        'correct_answer': correct_answer, 
+                        'emb_sec_last_token': emb_sec_last_token,
+                        'emb_tok_bef_gen': emb_tok_bef_gen,
+                        'all_embeddings': all_embeddings,
+                        'decoded_tokens': decoded_tokens,
                     }
-
-                    generations[example['id']].update({
-                        'most_likely_answer': most_likely_answer_dict,
-                        'reference': utils.get_reference(example),
-                    })
                 else:
                     logging.info('high-t prediction '.ljust(15) + str(i) + ' : ' + predicted_answer)
                     # Aggregate predictions over num_generations.
