@@ -2,6 +2,7 @@
 import gc
 import os
 import logging
+import pickle
 import random
 from tqdm import tqdm
 
@@ -158,6 +159,13 @@ def main(args):
             logging.warning('Not enough samples in dataset. Using all %d samples.', len(dataset))
 
         it = 0
+        generations_filename = f'{dataset_split}_generations.pkl'
+        generations_filepath = f'{wandb.run.dir}/{generations_filename}'
+        
+        # Initialize the streaming pickle file (will append batches to it)
+        with open(generations_filepath, 'wb') as f:
+            pass  # Create/clear the file
+        
         for index in tqdm(indices):
             # Probably a typo
             if ((it + 1) % 10) == 0:
@@ -261,6 +269,13 @@ def main(args):
             # Append all predictions for this example to `generations`.
             generations[example['id']]['responses'] = full_responses
 
+            # Stream batch to pickle file every 50 examples to reduce RAM usage
+            if len(generations) >= 50:
+                with open(generations_filepath, 'ab') as f:
+                    pickle.dump(generations, f)
+                logging.info(f'Streamed batch of {len(generations)} examples to {generations_filename}')
+                generations.clear()
+
             if args.compute_p_true and dataset_split == 'validation':
                 # Already compute p_true here. Avoid cost of generations in compute_uncertainty script.
                 p_true = p_true_utils.calculate_p_true(
@@ -270,8 +285,15 @@ def main(args):
                 p_trues.append(p_true)
                 logging.info('p_true: %s', p_true)
 
-        # Save generations for that split.
-        utils.save(generations, f'{dataset_split}_generations.pkl')
+        # Stream any remaining examples in the final batch
+        if len(generations) > 0:
+            with open(generations_filepath, 'ab') as f:
+                pickle.dump(generations, f)
+            logging.info(f'Streamed final batch of {len(generations)} examples to {generations_filename}')
+            generations.clear()
+        
+        # # Save wandb file reference
+        # wandb.save(generations_filepath)
 
         # Log overall accuracy.
         accuracy = np.mean(accuracies)
