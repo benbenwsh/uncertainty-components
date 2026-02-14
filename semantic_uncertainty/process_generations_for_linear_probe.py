@@ -61,22 +61,20 @@ def normalise_response_item(item) -> dict | None:
     Normalise a response item (tuple or dict) to a common shape.
 
     Tuple: (response_str, token_log_likelihoods, embedding, acc) -> embedding ignored; others None.
-    Dict: response, emb_sec_last_token, emb_tok_bef_gen, decoded_tokens.
+    Dict: response, emb_tok_bef_gen, decoded_tokens.
 
-    Returns dict with keys: response, emb_sec_last_token, emb_tok_bef_gen, decoded_tokens.
+    Returns dict with keys: response, emb_tok_bef_gen, decoded_tokens.
     Returns None if item is invalid.
     """
     if isinstance(item, dict):
         return {
             'response': item.get('response'),
-            'emb_sec_last_token': item.get('emb_sec_last_token'),
             'emb_tok_bef_gen': item.get('emb_tok_bef_gen'),
             'decoded_tokens': item.get('decoded_tokens'),
         }
     if isinstance(item, (list, tuple)) and len(item) >= 4:
         return {
             'response': item[0],
-            'emb_sec_last_token': None,
             'emb_tok_bef_gen': None,
             'decoded_tokens': None,
         }
@@ -89,16 +87,12 @@ def prompt_user_for_probability(response_str: str, example_id) -> float | str:
 
     Returns float in [0,1] or REJECT_KEYWORD if user rejects the example.
     """
-    print(f"\n[Example id: {example_id}] Could not parse probability from response:", file=sys.stderr)
-    print("-" * 60, file=sys.stderr)
-    print(response_str, file=sys.stderr)
-    print("-" * 60, file=sys.stderr)
-    print(
-        f"Enter a number in [0, 1] or '{REJECT_KEYWORD}' to exclude this example: ",
-        end="",
-        file=sys.stderr,
-    )
-    line = sys.stdin.readline().strip().lower()
+    print(f"\n[Example id: {example_id}] Could not parse probability from response:")
+    print("-" * 60)
+    # TODO: maybe add question in here in the future
+    print(response_str)
+    print("-" * 60)
+    line = input(f"Enter a number in [0, 1] or '{REJECT_KEYWORD}' to exclude this example: ")
     if line == REJECT_KEYWORD:
         return REJECT_KEYWORD
     try:
@@ -107,12 +101,12 @@ def prompt_user_for_probability(response_str: str, example_id) -> float | str:
             return value
     except ValueError:
         pass
-    print("Invalid input. Enter a number in [0, 1] or 'reject'.", file=sys.stderr)
+    print("Invalid input. Enter a number in [0, 1] or 'reject'.")
     return prompt_user_for_probability(response_str, example_id)
 
 
 # Keys whose values are embeddings: show only first 5 values in JSON for readability.
-_EMBEDDING_KEYS = frozenset({'emb_sec_last_token', 'emb_tok_bef_gen'})
+_EMBEDDING_KEYS = frozenset({'emb_tok_bef_gen'})
 
 
 def _first_n_values(obj, n: int = 5):
@@ -144,19 +138,61 @@ def _first_n_values(obj, n: int = 5):
     flatten(lst)
     return out[:n]
 
+# Only for visualisation in json
+def _first_and_last_layer_values(obj, n: int = 5):
+    """
+    Extract first n values from first layer [0] and last layer [-1] of embeddings.
+    Returns dict with 'first_layer' and 'last_layer' keys.
+    """
+    try:
+        # Convert to numpy array if needed
+        if not isinstance(obj, np.ndarray):
+            if hasattr(obj, 'numpy'):
+                arr = obj.numpy()
+            elif hasattr(obj, 'cpu'):
+                arr = obj.cpu().numpy()
+            else:
+                arr = np.asarray(obj)
+        else:
+            arr = obj
+        
+        # Handle different shapes: [layers, ...] or [layers, batch, hidden_dim] etc.
+        if arr.ndim == 0:
+            # Scalar - return as is
+            return {'first_layer': float(arr), 'last_layer': float(arr)}
+        
+        # Get first layer [0] and last layer [-1]
+        first_layer = arr[0] if arr.shape[0] > 0 else arr
+        last_layer = arr[-1] if arr.shape[0] > 0 else arr
+        
+        # Flatten and take first n values
+        first_flat = np.asarray(first_layer).ravel()[:n].tolist()
+        last_flat = np.asarray(last_layer).ravel()[:n].tolist()
+        
+        return {
+            'first_layer': first_flat,
+            'last_layer': last_flat
+        }
+    except (IndexError, AttributeError, TypeError, ValueError) as e:
+        # Fallback to original behavior if extraction fails
+        return {'first_layer': _first_n_values(obj, n), 'last_layer': _first_n_values(obj, n)}
+
 
 def convert_for_json(obj, parent_key=None):
-    """Convert numpy/torch arrays to lists for JSON; for embedding keys show only first 5 values."""
+    """Convert numpy/torch arrays to lists for JSON; for embedding keys show first 5 values from first and last layers."""
     is_embedding = parent_key in _EMBEDDING_KEYS
     if isinstance(obj, np.ndarray):
-        return _first_n_values(obj, 5) if is_embedding else obj.tolist()
+        return _first_and_last_layer_values(obj, 5) if is_embedding else obj.tolist()
     if hasattr(obj, 'tolist') and callable(getattr(obj, 'tolist')):
         try:
-            lst = obj.tolist()
             if is_embedding:
-                return _first_n_values(obj, 5)
+                return _first_and_last_layer_values(obj, 5)
+            lst = obj.tolist()
             return lst
         except (TypeError, ValueError):
+            # If tolist fails but it's an embedding, try direct extraction
+            if is_embedding:
+                return _first_and_last_layer_values(obj, 5)
             pass
     if isinstance(obj, np.floating):
         return float(obj)
@@ -169,13 +205,13 @@ def convert_for_json(obj, parent_key=None):
     return obj
 
 
-def process_example(example_id, example: dict, *, dry_run: bool) -> dict | None:
+def process_example(example_id, example: dict) -> dict | None:
     """
     Process one example: normalise response items, parse probability for each.
 
-    On parse failure, if not dry_run, prompts user; if user rejects, returns None.
+    On parse failure, prompts user; if user rejects, returns None.
     Returns dict with question, context, responses (list of processed items) or None if rejected.
-    Note: pickle output will only include verbalised_confidence, emb_sec_last_token, emb_tok_bef_gen.
+    Note: pickle output will only include verbalised_confidence, emb_tok_bef_gen.
     JSON output includes all fields (question, context, response, decoded_tokens) with truncated embeddings.
     """
     most_likely = example.get('most_likely_answer')
@@ -196,22 +232,12 @@ def process_example(example_id, example: dict, *, dry_run: bool) -> dict | None:
             continue
         prob = parse_probability_from_response(response_str)
         if prob is None:
-            if dry_run:
-                processed.append({
-                    'verbalised_confidence': None,
-                    'emb_sec_last_token': norm.get('emb_sec_last_token'),
-                    'emb_tok_bef_gen': norm.get('emb_tok_bef_gen'),
-                    'response': response_str,
-                    'decoded_tokens': norm.get('decoded_tokens'),
-                })
-                continue
             user_val = prompt_user_for_probability(response_str, example_id)
             if user_val == REJECT_KEYWORD:
                 return None
             prob = user_val
         processed.append({
             'verbalised_confidence': float(prob),
-            'emb_sec_last_token': norm.get('emb_sec_last_token'),
             'emb_tok_bef_gen': norm.get('emb_tok_bef_gen'),
             'response': response_str,
             'decoded_tokens': norm.get('decoded_tokens'),
@@ -235,7 +261,7 @@ def main():
     )
     parser.add_argument(
         "--output_dir",
-        default=".",
+        default="./processed_generations",
         help="Output directory for pickle and JSON (default: current dir)",
     )
     parser.add_argument(
@@ -243,29 +269,11 @@ def main():
         default="_linear_probe",
         help="Suffix for output filenames (default: _linear_probe)",
     )
-    parser.add_argument(
-        "--dry_run",
-        action="store_true",
-        help="Only run parser on all examples; print stats; do not write files or prompt",
-    )
-    parser.add_argument(
-        "--dry_run_n",
-        type=int,
-        default=None,
-        help="If set with --dry_run, only process first N examples",
-    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
     if not input_path.exists():
-        print(f"Error: input file not found: {input_path}", file=sys.stderr)
-        sys.exit(1)
-
-    with open(input_path, "rb") as f:
-        generations = pickle.load(f)
-
-    if not isinstance(generations, dict):
-        print("Error: expected generations to be a dict keyed by example id", file=sys.stderr)
+        print(f"Error: input file not found: {input_path}")
         sys.exit(1)
 
     # Derive base name: train_generations.pkl -> train, validation_generations.pkl -> validation
@@ -287,57 +295,95 @@ def main():
 
     n_ok = 0
     n_reject = 0
-    n_parse_fail = 0
-    limit = args.dry_run_n if args.dry_run and args.dry_run_n is not None else None
-    result = {}
-    keys = list(generations.keys())
-    if limit is not None:
-        keys = keys[:limit]
-
-    for example_id in keys:
-        example = generations[example_id]
-        out = process_example(example_id, example, dry_run=args.dry_run)
-        if out is None:
-            n_reject += 1
-            continue
-        # Count parse failures in this example (dry run only)
-        if args.dry_run:
-            for r in out["responses"]:
-                if r.get("verbalised_confidence") is None:
-                    n_parse_fail += 1
-        n_ok += 1
-        result[example_id] = out
-
-    if args.dry_run:
-        print(
-            f"Dry run: {n_ok} examples kept, {n_reject} rejected, "
-            f"{n_parse_fail} response(s) with parse failure (would prompt)."
-        )
-        return
-
-    # Create minimal version for pickle: only verbalised_confidence, emb_sec_last_token, emb_tok_bef_gen
-    pickle_result = {}
-    for example_id, example_data in result.items():
-        pickle_result[example_id] = {
-            'responses': [
-                {
-                    'verbalised_confidence': r['verbalised_confidence'],
-                    'emb_sec_last_token': r['emb_sec_last_token'],
-                    'emb_tok_bef_gen': r['emb_tok_bef_gen'],
-                }
-                for r in example_data['responses']
-            ]
-        }
-
-    # Save pickle (minimal data: only embeddings and confidence)
-    with open(pickle_path, "wb") as f:
-        pickle.dump(pickle_result, f)
+    first_item = True  # Track first JSON entry for comma handling
+    
+    # Open output files for streaming writes
+    # Note: Pickle output will contain appended batch dicts (for RAM efficiency).
+    # To read: use the same streaming logic as input reading (read batches and merge).
+    pickle_file = open(pickle_path, "wb")
+    json_file = open(json_path, "w")
+    json_file.write("{\n")  # Start JSON object
+    
+    # Stream read and process pickle file batch by batch
+    try:
+        with open(input_path, "rb") as input_file:
+            print(f"Reading input file: {input_path}")
+            batch_num = 0
+            while True:
+                try:
+                    # Read one batch from input file
+                    input_batch = pickle.load(input_file)
+                    if not isinstance(input_batch, dict):
+                        print(f"Warning: skipping non-dict batch {batch_num}")
+                        continue
+                    
+                    batch_num += 1
+                    print(f"Processing input batch {batch_num} with {len(input_batch)} examples...")
+                    
+                    # Process each example in this batch immediately
+                    batch_pickle_result = {}
+                    batch_json_result = {}
+                    
+                    for example_id, example in input_batch.items():
+                        out = process_example(example_id, example)
+                        if out is None:
+                            n_reject += 1
+                            continue
+                        
+                        n_ok += 1
+                        
+                        # Add to batch for pickle (minimal data)
+                        batch_pickle_result[example_id] = {
+                            'responses': [
+                                {
+                                    'verbalised_confidence': r['verbalised_confidence'],
+                                    'emb_tok_bef_gen': r['emb_tok_bef_gen'],
+                                }
+                                for r in out['responses']
+                            ]
+                        }
+                        # Add to batch for JSON (full data)
+                        batch_json_result[example_id] = out
+                    
+                    # Write processed batch immediately to output files
+                    if batch_pickle_result:
+                        # Append batch to pickle file
+                        pickle.dump(batch_pickle_result, pickle_file)
+                        
+                        # Write batch to JSON file (with proper comma handling)
+                        for eid, example_data in batch_json_result.items():
+                            if not first_item:
+                                json_file.write(",\n")
+                            json_file.write(f'  "{eid}": ')
+                            # Convert to JSON string with proper indentation
+                            json_str = json.dumps(convert_for_json(example_data), indent=2)
+                            # Add extra indentation for nested content
+                            indented = "\n".join("    " + line if line.strip() else line 
+                                                 for line in json_str.split("\n"))
+                            json_file.write(indented)
+                            first_item = False
+                        
+                        # Clear batches from memory immediately
+                        batch_pickle_result.clear()
+                        batch_json_result.clear()
+                        
+                except EOFError:
+                    # End of file - no more batches
+                    break
+            
+            if n_ok == 0:
+                print("Error: no valid examples processed from pickle file")
+                sys.exit(1)
+                
+    except Exception as e:
+        print(f"Error reading pickle file: {e}")
+        sys.exit(1)
+    
+    # Close files
+    pickle_file.close()
+    json_file.write("\n}")  # Close JSON object
+    json_file.close()
     print(f"Wrote {pickle_path}")
-
-    # Save JSON (full data with truncated embeddings)
-    jsonable = convert_for_json(result)
-    with open(json_path, "w") as f:
-        json.dump(jsonable, f, indent=2)
     print(f"Wrote {json_path}")
 
 

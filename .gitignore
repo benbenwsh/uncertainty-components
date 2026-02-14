@@ -145,3 +145,4 @@ dmypy.json
 bhw22/
 out/
 results/
+*.pkl
