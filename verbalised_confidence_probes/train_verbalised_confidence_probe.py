@@ -17,6 +17,7 @@ Usage:
 
 import argparse
 import pickle
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -118,8 +119,8 @@ def train_verbalised_confidence_probe(X_train, y_train, X_val, y_val,
         y_train: Training confidence values (n_samples,)
         X_val: Validation embeddings (n_samples, n_features)
         y_val: Validation confidence values (n_samples,)
-        model_type: 'ridge' or 'linear'
-        alpha: Regularization strength for Ridge (ignored for LinearRegression)
+        model_type: 'ridge' or 'linear'.
+        alpha: Regularization strength for Ridge (how much to penalise large weights) (ignored for linear).
     
     Returns:
         Trained model and metrics dictionary
@@ -176,8 +177,58 @@ def train_verbalised_confidence_probe(X_train, y_train, X_val, y_val,
     print(f"  MSE:  {val_mse:.6f}")
     print(f"  MAE:  {val_mae:.6f}")
     print(f"  R²:   {val_r2:.6f}")
-    
+
     return model, metrics
+
+
+def _get_run_dir(output_dir: Path, layer_idx: int) -> Path:
+    """Return output_dir / layer_{n} / k where k is the first empty subdir 1, 2, 3, ..."""
+    layer_dir = output_dir / f"layer_{layer_idx}"
+    layer_dir.mkdir(parents=True, exist_ok=True)
+    k = 1
+    while (layer_dir / str(k)).exists():
+        k += 1
+    run_dir = layer_dir / str(k)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def write_config_txt(run_dir: Path, args, model_type: str, n_train: int, n_val: int,
+                     metrics: dict, train_path: str, val_path: str) -> None:
+    """Write a config/summary txt file into run_dir."""
+    lines = [
+        "Verbalised confidence probe – training configuration and results",
+        "=" * 60,
+        f"Model type: {model_type}",
+        f"Layer index: {args.layer_idx}",
+        f"Embedding: emb_tok_bef_gen",
+        f"Alpha (regularization): {args.alpha}",
+        f"Train path: {train_path}",
+        f"Val path: {val_path}",
+        "",
+        "Data",
+        "-" * 40,
+        f"Number of training samples: {n_train}",
+        f"Number of validation samples: {n_val}",
+        f"Split (train / val): {n_train} / {n_val}",
+        "",
+    ]
+    lines.extend([
+        "Final metrics",
+        "-" * 40,
+        "Train:",
+        f"  MSE:  {metrics['train']['mse']:.6f}",
+        f"  MAE:  {metrics['train']['mae']:.6f}",
+        f"  R²:   {metrics['train']['r2']:.6f}",
+        "Validation:",
+        f"  MSE:  {metrics['val']['mse']:.6f}",
+        f"  MAE:  {metrics['val']['mae']:.6f}",
+        f"  R²:   {metrics['val']['r2']:.6f}",
+        "",
+        f"Trained at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+    ])
+    with open(run_dir / 'config.txt', 'w') as f:
+        f.write("\n".join(lines))
 
 
 def plot_results(y_true, y_pred, split_name, output_dir=None):
@@ -273,6 +324,7 @@ def main():
     )
     parser.add_argument(
         '--save_model',
+        default=True,
         action='store_true',
         help='Save trained model to pickle file'
     )
@@ -294,17 +346,20 @@ def main():
         alpha=args.alpha
     )
     
-    # Generate plots if requested
+    # Output directory and run_dir (layer_n/k) for plots and/or model save
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = _get_run_dir(output_dir, args.layer_idx) if (args.plot or args.save_model) else None
+    
+    # Generate plots if requested (save into layer_n folder)
     if args.plot:
         print("\nGenerating plots...")
-        plot_results(y_train, model.predict(X_train), 'train', args.output_dir)
-        plot_results(y_val, model.predict(X_val), 'val', args.output_dir)
+        plot_results(y_train, model.predict(X_train), 'train', str(run_dir))
+        plot_results(y_val, model.predict(X_val), 'val', str(run_dir))
     
-    # Save model if requested
+    # Save model and artifacts to results/layer_{n}/{k}/
     if args.save_model:
-        output_dir = Path(args.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        model_path = output_dir / 'verbalised_confidence_probe.pkl'
+        model_path = run_dir / 'verbalised_confidence_probe.pkl'
         with open(model_path, 'wb') as f:
             pickle.dump({
                 'model': model,
@@ -314,6 +369,13 @@ def main():
                 'alpha': args.alpha if args.model_type == 'ridge' else None,
             }, f)
         print(f"\nSaved model to {model_path}")
+        write_config_txt(
+            run_dir, args, args.model_type,
+            n_train=len(X_train), n_val=len(X_val),
+            metrics=metrics,
+            train_path=str(args.train_path), val_path=str(args.val_path),
+        )
+        print(f"Saved config to {run_dir / 'config.txt'}")
 
 
 if __name__ == '__main__':
