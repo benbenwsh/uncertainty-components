@@ -110,6 +110,9 @@ def get_parser(stages=['generate', 'compute']):
         parser.add_argument(
             "--confidence", default=False, action=argparse.BooleanOptionalAction,
             help="If true, the prompt also asks the model to output its confidence, and we record embeddings at every token position.")
+        parser.add_argument(
+            "--save_to_wandb", default=False, action=argparse.BooleanOptionalAction,
+            help="If true, save files to wandb. Default: False (files are saved locally but not uploaded to wandb).")
 
     if 'compute' in stages:
         parser.add_argument('--recompute_accuracy',
@@ -351,7 +354,26 @@ def get_metric(metric):
     return metric
 
 
-def save(object, file):
+def save(object, file, save_to_wandb=None):
+    """
+    Save object to pickle file in wandb run directory.
+    
+    Args:
+        object: Object to pickle
+        file: Filename (relative to wandb.run.dir)
+        save_to_wandb: If True, upload to wandb. If None, check wandb.run.config.save_to_wandb.
+                      Default: None (checks config)
+    """
     with open(f'{wandb.run.dir}/{file}', 'wb') as f:
         pickle.dump(object, f)
-    wandb.save(f'{wandb.run.dir}/{file}')
+    
+    # Check if we should save to wandb
+    if save_to_wandb is None:
+        # Check config if available
+        if hasattr(wandb.run, 'config') and 'save_to_wandb' in wandb.run.config:
+            save_to_wandb = wandb.run.config.get('save_to_wandb', False)
+        else:
+            save_to_wandb = False
+    
+    if save_to_wandb:
+        wandb.save(f'{wandb.run.dir}/{file}')

@@ -37,22 +37,33 @@ def main(args):
     experiment_details = {'args': args}
     random.seed(args.random_seed)
 
-    # Implement
-    user = os.environ['USER']
-    entity = os.environ['WANDB_ENT']
-    slurm_jobid = os.getenv('SLURM_JOB_ID', None)
-    scratch_dir = os.getenv('SCRATCH_DIR', '.')
-    if not os.path.exists(f"{scratch_dir}/{user}/uncertainty"):
-        os.makedirs(f"{scratch_dir}/{user}/uncertainty")
-
-    wandb.init(
-        entity=entity,
-        project="semantic_uncertainty" if not args.debug else "semantic_uncertainty_debug",
-        dir=f"{scratch_dir}/{user}/uncertainty",
-        config=args,
-        notes=f'slurm_id: {slurm_jobid}, experiment_lot: {args.experiment_lot}',
-    )
-    logging.info('Finished wandb init.')
+    # Choose output directory based on save_to_wandb
+    if args.save_to_wandb:
+        user = os.environ['USER']
+        scratch_dir = os.getenv('SCRATCH_DIR', '.')
+        output_dir = f"{scratch_dir}/{user}/uncertainty"
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        entity = os.environ['WANDB_ENT']
+        slurm_jobid = os.getenv('SLURM_JOB_ID', None)
+        wandb.init(
+            entity=entity,
+            project="semantic_uncertainty" if not args.debug else "semantic_uncertainty_debug",
+            dir=output_dir,
+            config=args,
+            notes=f'slurm_id: {slurm_jobid}, experiment_lot: {args.experiment_lot}',
+        )
+        run_output_dir = wandb.run.dir
+        logging.info('Finished wandb init.')
+    else:
+        # Save to generated_answers/n with n incrementing (1, 2, 3, ...)
+        base_dir = "generated_answers"
+        os.makedirs(base_dir, exist_ok=True)
+        existing = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d)) and d.isdigit()]
+        n = max((int(d) for d in existing), default=0) + 1
+        run_output_dir = os.path.join(base_dir, str(n))
+        os.makedirs(run_output_dir, exist_ok=True)
+        logging.info(f'Wandb disabled. Files will be saved to {run_output_dir}')
 
     metric = utils.get_metric(args.metric)
 
@@ -106,9 +117,10 @@ def main(args):
             brief_always=args.brief_always and args.enable_brief,
             make_prompt=make_prompt, num_generations=args.num_generations,
             metric=metric)
-        wandb.config.update(
-            {'p_true_num_fewshot': len_p_true}, allow_val_change=True)
-        wandb.log(dict(len_p_true=len_p_true))
+        if args.save_to_wandb:
+            wandb.config.update(
+                {'p_true_num_fewshot': len_p_true}, allow_val_change=True)
+            wandb.log(dict(len_p_true=len_p_true))
         experiment_details['p_true_indices'] = p_true_indices
         experiment_details['p_true_responses'] = p_true_responses
         experiment_details['p_true_few_shot_prompt'] = p_true_few_shot_prompt
@@ -160,16 +172,15 @@ def main(args):
 
         it = 0
         generations_filename = f'{dataset_split}_generations.pkl'
-        generations_filepath = f'{wandb.run.dir}/{generations_filename}'
+        generations_filepath = os.path.join(run_output_dir, generations_filename)
         
-        # Initialize the streaming pickle file (will append batches to it)
+        # Initialize/Create the streaming pickle file (will append batches to it)
         with open(generations_filepath, 'wb') as f:
             pass  # Create/clear the file
         
         for index in tqdm(indices):
             # Probably a typo
             if ((it + 1) % 10) == 0:
-                print("it has been run")
                 gc.collect()
                 torch.cuda.empty_cache()
             it += 1
@@ -237,7 +248,8 @@ def main(args):
                     # print out embeddings, but just the first 5
 
                     # These codes were for checking, but commented out for better performance
-                    # logging.info('emb_sec_last_token: '.ljust(15) + '\n' + str(emb_sec_last_token[0][0]))
+                    logging.info('emb_sec_last_token layer 0: '.ljust(15) + '\n' + str(emb_sec_last_token[0][0][:5]))
+                    logging.info('emb_sec_last_token layer 32: '.ljust(15) + '\n' + str(emb_sec_last_token[-1][0][:5]))
                     # logging.info('emb_tok_bef_gen: '.ljust(15) + '\n' + str(emb_tok_bef_gen[0][0]))
                     # n_all = len(all_embeddings) if hasattr(all_embeddings, '__len__') else (all_embeddings.shape[0] if hasattr(all_embeddings, 'shape') else 0)
                     # if n_all >= 2:
@@ -292,13 +304,15 @@ def main(args):
             logging.info(f'Streamed final batch of {len(generations)} examples to {generations_filename}')
             generations.clear()
         
-        # # Save wandb file reference
-        # wandb.save(generations_filepath)
+        # Save locally (always done above) and upload to wandb if enabled
+        if args.save_to_wandb:
+            wandb.save(generations_filepath)
 
         # Log overall accuracy.
         accuracy = np.mean(accuracies)
         print(f"Overall {dataset_split} split accuracy: {accuracy}")
-        wandb.log({f"{dataset_split}_accuracy": accuracy})
+        if args.save_to_wandb:
+            wandb.log({f"{dataset_split}_accuracy": accuracy})
 
         if dataset_split == 'validation':
             if args.compute_p_true:
@@ -306,9 +320,17 @@ def main(args):
                     'p_false':  [1 - p for p in p_trues],
                     'p_false_fixed':  [1 - np.exp(p) for p in p_trues],
                 }
-            utils.save(results_dict, 'uncertainty_measures.pkl')
+            if args.save_to_wandb:
+                utils.save(results_dict, 'uncertainty_measures.pkl', save_to_wandb=True)
+            else:
+                with open(os.path.join(run_output_dir, 'uncertainty_measures.pkl'), 'wb') as f:
+                    pickle.dump(results_dict, f)
 
-    utils.save(experiment_details, 'experiment_details.pkl')
+    if args.save_to_wandb:
+        utils.save(experiment_details, 'experiment_details.pkl', save_to_wandb=True)
+    else:
+        with open(os.path.join(run_output_dir, 'experiment_details.pkl'), 'wb') as f:
+            pickle.dump(experiment_details, f)
     logging.info('Run complete.')
     del model
 
