@@ -4,6 +4,7 @@ import os
 import logging
 import pickle
 import random
+import time
 from tqdm import tqdm
 
 import numpy as np
@@ -22,6 +23,10 @@ openai.api_key = os.getenv("a")  # Set up OpenAI API credentials.
 
 # Prompt template is from just_ask_for_calibration paper
 CONFIDENCE_PROMPT = "Provide your best guess and the probability that it is correct (0.0 to 1.0) for the following question. Give ONLY the guess and probability, no other words or explanation. For example:\n\nGuess: <most likely guess, as short as possible; not a complete sentence, just the guess!>\n Probability: <the probability between 0.0 and 1.0 that your guess is correct, without any extra commentary whatsoever; just the probability!>\n\nThe question is: "
+
+# The bigger this number is, the quicker pickle.load is, but the more RAM usage.
+STREAM_BATCH_SIZE = 100
+
 
 def main(args):
     logging.info('GPU: %s', torch.cuda.get_device_name())
@@ -281,11 +286,14 @@ def main(args):
             # Append all predictions for this example to `generations`.
             generations[example['id']]['responses'] = full_responses
 
-            # Stream batch to pickle file every 50 examples to reduce RAM usage
-            if len(generations) >= 50:
+            # Stream batch to pickle file every STREAM_BATCH_SIZE examples to reduce RAM usage
+            if len(generations) >= STREAM_BATCH_SIZE:
+                t0 = time.perf_counter()
                 with open(generations_filepath, 'ab') as f:
                     pickle.dump(generations, f)
-                logging.info(f'Streamed batch of {len(generations)} examples to {generations_filename}')
+                elapsed = time.perf_counter() - t0
+                n_examples = len(generations)
+                logging.info(f'Streamed batch of {n_examples} examples to {generations_filename} in {elapsed:.2f}s')
                 generations.clear()
 
             if args.compute_p_true and dataset_split == 'validation':
@@ -299,9 +307,11 @@ def main(args):
 
         # Stream any remaining examples in the final batch
         if len(generations) > 0:
+            t0 = time.perf_counter()
             with open(generations_filepath, 'ab') as f:
                 pickle.dump(generations, f)
-            logging.info(f'Streamed final batch of {len(generations)} examples to {generations_filename}')
+            elapsed = time.perf_counter() - t0
+            logging.info(f'Streamed final batch of {len(generations)} examples to {generations_filename} in {elapsed:.2f}s')
             generations.clear()
         
         # Save locally (always done above) and upload to wandb if enabled

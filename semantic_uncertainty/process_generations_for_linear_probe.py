@@ -19,6 +19,7 @@ import json
 import pickle
 import re
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -312,13 +313,15 @@ def main():
             while True:
                 try:
                     # Read one batch from input file
+                    t0 = time.perf_counter()
                     input_batch = pickle.load(input_file)
+                    load_elapsed = time.perf_counter() - t0
                     if not isinstance(input_batch, dict):
                         print(f"Warning: skipping non-dict batch {batch_num}")
                         continue
                     
                     batch_num += 1
-                    print(f"Processing input batch {batch_num} with {len(input_batch)} examples...")
+                    print(f"Processing input batch {batch_num} with {len(input_batch)} examples... (loaded in {load_elapsed:.2f}s)")
                     
                     # Process each example in this batch immediately
                     batch_pickle_result = {}
