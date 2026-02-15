@@ -110,7 +110,7 @@ def load_verbalised_confidence_data(train_path, val_path, layer_idx=32):
 
 
 def train_verbalised_confidence_probe(X_train, y_train, X_val, y_val, 
-                                       model_type='ridge', alpha=1.0):
+                                       model_type='ridge', alpha=1.0, verbose=True):
     """
     Train a regressor to predict verbalised confidence.
     
@@ -121,6 +121,7 @@ def train_verbalised_confidence_probe(X_train, y_train, X_val, y_val,
         y_val: Validation confidence values (n_samples,)
         model_type: 'ridge' or 'linear'.
         alpha: Regularization strength for Ridge (how much to penalise large weights) (ignored for linear).
+        verbose: If True, print training message and metrics (default: True).
     
     Returns:
         Trained model and metrics dictionary
@@ -134,7 +135,8 @@ def train_verbalised_confidence_probe(X_train, y_train, X_val, y_val,
         raise ValueError(f"Unknown model_type: {model_type}. Use 'ridge' or 'linear'")
     
     # Train model
-    print(f"\nTraining {model_type} regressor...")
+    if verbose:
+        print(f"\nTraining {model_type} regressor...")
     model.fit(X_train, y_train)
     
     # Predictions
@@ -167,16 +169,15 @@ def train_verbalised_confidence_probe(X_train, y_train, X_val, y_val,
         }
     }
     
-    # Print metrics
-    print("\nTraining Metrics:")
-    print(f"  MSE:  {train_mse:.6f}")
-    print(f"  MAE:  {train_mae:.6f}")
-    print(f"  R²:   {train_r2:.6f}")
-    
-    print("\nValidation Metrics:")
-    print(f"  MSE:  {val_mse:.6f}")
-    print(f"  MAE:  {val_mae:.6f}")
-    print(f"  R²:   {val_r2:.6f}")
+    if verbose:
+        print("\nTraining Metrics:")
+        print(f"  MSE:  {train_mse:.6f}")
+        print(f"  MAE:  {train_mae:.6f}")
+        print(f"  R²:   {train_r2:.6f}")
+        print("\nValidation Metrics:")
+        print(f"  MSE:  {val_mse:.6f}")
+        print(f"  MAE:  {val_mae:.6f}")
+        print(f"  R²:   {val_r2:.6f}")
 
     return model, metrics
 
