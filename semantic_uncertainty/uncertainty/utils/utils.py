@@ -364,9 +364,6 @@ def save(object, file, save_to_wandb=None):
         save_to_wandb: If True, upload to wandb. If None, check wandb.run.config.save_to_wandb.
                       Default: None (checks config)
     """
-    with open(f'{wandb.run.dir}/{file}', 'wb') as f:
-        pickle.dump(object, f)
-    
     # Check if we should save to wandb
     if save_to_wandb is None:
         # Check config if available
@@ -376,4 +373,6 @@ def save(object, file, save_to_wandb=None):
             save_to_wandb = False
     
     if save_to_wandb:
+        with open(f'{wandb.run.dir}/{file}', 'wb') as f:
+            pickle.dump(object, f)
         wandb.save(f'{wandb.run.dir}/{file}')
