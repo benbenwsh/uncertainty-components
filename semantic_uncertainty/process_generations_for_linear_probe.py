@@ -386,6 +386,12 @@ def main():
     print(f"Wrote {pickle_path}")
     print(f"Wrote {json_path}")
 
+    # Write sample count to a txt file
+    samples_txt_path = run_dir / "samples.txt"
+    with open(samples_txt_path, "w") as f:
+        f.write(f"{n_ok} samples\n")
+    print(f"Wrote {samples_txt_path}")
+
 
 if __name__ == "__main__":
     main()
