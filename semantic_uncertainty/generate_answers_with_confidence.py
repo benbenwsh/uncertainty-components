@@ -68,6 +68,14 @@ def main(args):
         n = max((int(d) for d in existing), default=0) + 1
         run_output_dir = os.path.join(base_dir, str(n))
         os.makedirs(run_output_dir, exist_ok=True)
+        # Mirror console logs to output.log in this run folder (similar to wandb's output.log)
+        output_log_path = os.path.join(run_output_dir, 'output.log')
+        file_handler = logging.FileHandler(output_log_path, mode='w')
+        file_handler.setFormatter(logging.Formatter(
+            '%(asctime)s %(levelname)-8s %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        ))
+        logging.getLogger().addHandler(file_handler)
         logging.info(f'Wandb disabled. Files will be saved to {run_output_dir}')
 
     metric = utils.get_metric(args.metric)
