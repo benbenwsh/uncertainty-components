@@ -146,3 +146,5 @@ bhw22/
 out/
 results/
 *.pkl
+# TODO: probably need to put them all in a out/ folder
+processed_generations/
