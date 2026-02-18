@@ -1,13 +1,14 @@
 """
-Process train_generations.pkl or validation_generations.pkl for linear probe training.
+Process train_generations.pkl or validation_generations.pkl to extract emb_tok_bef_gen embeddings.
 
 Reads a single generations pickle, extracts verbalised confidence (probability in [0,1])
 from each response string via rule-based parsing, supports interactive fallback and
-rejecting examples on parse failure. Writes JSON + pickle in a linear-probe-friendly format.
+rejecting examples on parse failure. Writes JSON + pickle with emb_tok_bef_gen embeddings
+for probe training.
 
 Usage:
-  python -m semantic_uncertainty.process_generations_for_linear_probe --input train_generations.pkl
-  python -m semantic_uncertainty.process_generations_for_linear_probe --input validation_generations.pkl --output_dir ./out
+  python -m semantic_uncertainty.process_generations_tok_bef_gen --input train_generations.pkl
+  python -m semantic_uncertainty.process_generations_tok_bef_gen --input validation_generations.pkl --output_dir ./out
 
 Output:
   - Pickle: full data (embeddings as numpy arrays). Use this for training.
@@ -32,18 +33,19 @@ def parse_probability_from_response(response_str: str) -> float | None:
     Extract probability in [0, 1] from a response string.
 
     Expected format: 'Guess: <...>\\nProbability:<number>' (case-insensitive, flexible whitespace).
-    Allows . or , as decimal separator. If number > 1 (e.g. 80 or 80%), treats as percentage.
-    Returns None if parsing fails.
+    Uses the **last** occurrence of "probability:" so that if the guess text contains
+    "Probability: ...", we still take the final number. Allows . or , as decimal separator.
+    If number > 1 (e.g. 80 or 80%), treats as percentage. Returns None if parsing fails.
     """
     if not response_str or not isinstance(response_str, str):
         return None
-    # Case-insensitive find "probability:" then take the next number
-    match = re.search(r'probability\s*:\s*([0-9]+[.,]?[0-9]*)\s*%?', response_str, re.IGNORECASE)
-    if not match:
-        # Fallback: any number in [0,1] or percentage-like after "probability"
-        match = re.search(r'probability\s*:\s*(\d+(?:[.,]\d+)?)', response_str, re.IGNORECASE)
-    if not match:
+    # Case-insensitive: use last occurrence of "probability:" then take the next number
+    matches = list(re.finditer(r'probability\s*:\s*([0-9]+[.,]?[0-9]*)\s*%?', response_str, re.IGNORECASE))
+    if not matches:
+        matches = list(re.finditer(r'probability\s*:\s*(\d+(?:[.,]\d+)?)', response_str, re.IGNORECASE))
+    if not matches:
         return None
+    match = matches[-1]
     raw = match.group(1).strip().replace(',', '.')
     try:
         value = float(raw)
@@ -253,7 +255,7 @@ def process_example(example_id, example: dict) -> dict | None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Process generations pickle for linear probe (extract verbalised confidence)."
+        description="Process generations pickle to extract emb_tok_bef_gen embeddings (extract verbalised confidence)."
     )
     parser.add_argument(
         "--input",
