@@ -146,5 +146,7 @@ bhw22/
 out/
 results/
 *.pkl
+*.h5
 # TODO: probably need to put them all in a out/ folder
 processed_generations/
+processed_generations_h5/
