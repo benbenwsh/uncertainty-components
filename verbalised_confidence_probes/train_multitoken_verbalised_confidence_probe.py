@@ -566,7 +566,7 @@ def main():
         '--more_graphs',
         action='store_true',
         default=False,
-        help='If set, also generate MAE and R2 plots (default: only MSE plots).',
+        help='If set, also generate MAE/R2 plots and per-layer train/val regression plots (default: only MSE plots).',
     )
     parser.add_argument(
         '--plots_only',
@@ -693,7 +693,7 @@ def main():
                 val_r2.append(metrics['val']['r2'])
 
                 # Save plots if requested
-                if args.plot:
+                if args.plot and args.more_graphs:
                     plot_results(y_train, model.predict(X_train_l), 'train', str(layer_dir))
                     plot_results(y_val, model.predict(X_val_l), 'val', str(layer_dir))
 
