@@ -15,4 +15,4 @@ source /vol/cuda/13.0.0/setup.sh
 /usr/bin/nvidia-smi
 uptime
 
-python3 ./logit_lens/logit_lens_guess_all_layers.py --train_path ./semantic_uncertainty/processed_generations/4/train_verbalised_embeddings.pkl --val_path ./semantic_uncertainty/processed_generations/5/validation_verbalised_embeddings.pkl --plot --device cuda:0 --top_n 5
+python3 ./logit_lens/h5_logit_lens_guess_all_layers.py --train_path ./semantic_uncertainty/processed_generations_h5/1_train_200_samples/train_verbalised_embeddings.h5 --val_path ./semantic_uncertainty/processed_generations_h5/2_val_200_samples/validation_verbalised_embeddings.h5 --plot --device cuda:0

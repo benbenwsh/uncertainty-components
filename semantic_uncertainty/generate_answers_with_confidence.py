@@ -5,6 +5,7 @@ import logging
 import pickle
 import random
 import time
+from urllib.parse import quote
 from tqdm import tqdm
 
 import numpy as np
@@ -26,6 +27,11 @@ CONFIDENCE_PROMPT = "Provide your best guess and the probability that it is corr
 
 # The bigger this number is, the quicker pickle.load is, but the more RAM usage.
 STREAM_BATCH_SIZE = 50
+
+
+def encode_example_id(example_id) -> str:
+    """URL-encode example IDs for consistent key handling."""
+    return quote(str(example_id), safe="")
 
 
 def main(args):
@@ -168,13 +174,13 @@ def main(args):
         # indices = random.sample(possible_indices, min(args.num_samples, len(dataset)))
         # 9:1 split of total num_samples between train (90%) and validation (10%).
         TRAIN_RATIO = 0.9
-        num_samples = int(args.num_samples * TRAIN_RATIO) if dataset_split == 'train' else int(args.num_samples * (1 - TRAIN_RATIO))
+        num_samples = round(args.num_samples * TRAIN_RATIO) if dataset_split == 'train' else round(args.num_samples * (1 - TRAIN_RATIO))
         # I changed it to become not random
         # indices = random.sample(possible_indices, min(num_samples, len(dataset)))
         indices = possible_indices[:min(num_samples, len(dataset))]
 
-        logging.info('Size of dataset split:', len(dataset))
-        logging.info('Number of samples to generate:', len(indices))
+        logging.info('Size of dataset split: %d', len(dataset))
+        logging.info('Number of samples to generate: %d', len(indices))
 
         # # Evaluate over random subset of the datasets.
         # indices = random.sample(possible_indices, min(args.num_samples, len(dataset)))
@@ -201,7 +207,8 @@ def main(args):
             # Grab example at index.
             example = dataset[index]
             question, context = example["question"], example['context']
-            generations[example['id']] = {'question': question, 'context': context}
+            example_key = encode_example_id(example["id"])
+            generations[example_key] = {'question': question, 'context': context}
             correct_answer = example['answers']['text']
 
             # current_input = make_prompt(
@@ -281,7 +288,7 @@ def main(args):
                         'all_embeddings': all_embeddings,
                         'decoded_tokens': decoded_tokens,
                     }
-                    generations[example['id']].update({
+                    generations[example_key].update({
                         'most_likely_answer': most_likely_answer_dict,
                         'reference': utils.get_reference(example),
                     })
@@ -292,7 +299,7 @@ def main(args):
                         (predicted_answer, token_log_likelihoods, all_embeddings, acc))
 
             # Append all predictions for this example to `generations`.
-            generations[example['id']]['responses'] = full_responses
+            generations[example_key]['responses'] = full_responses
 
             # Stream batch to pickle file every STREAM_BATCH_SIZE examples to reduce RAM usage
             if len(generations) >= STREAM_BATCH_SIZE:
