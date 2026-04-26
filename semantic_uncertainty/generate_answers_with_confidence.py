@@ -34,6 +34,22 @@ def encode_example_id(example_id) -> str:
     return quote(str(example_id), safe="")
 
 
+def write_config_txt(run_output_dir: str, args) -> None:
+    """Write a human-readable run configuration snapshot."""
+    config_path = os.path.join(run_output_dir, "config.txt")
+    args_dict = vars(args)
+    with open(config_path, "w", encoding="utf-8") as f:
+        f.write("Experiment Configuration\n")
+        f.write("========================\n")
+        f.write(f"timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"temperature: {args.temperature}\n")
+        f.write(f"num_generations: {args.num_generations}\n")
+        f.write("\nAll arguments:\n")
+        for key in sorted(args_dict):
+            f.write(f"{key}: {args_dict[key]}\n")
+    logging.info("Wrote config file to %s", config_path)
+
+
 def main(args):
     logging.info('GPU: %s', torch.cuda.get_device_name())
     if args.dataset == 'svamp':
@@ -83,6 +99,8 @@ def main(args):
         ))
         logging.getLogger().addHandler(file_handler)
         logging.info(f'Wandb disabled. Files will be saved to {run_output_dir}')
+
+    write_config_txt(run_output_dir, args)
 
     metric = utils.get_metric(args.metric)
 

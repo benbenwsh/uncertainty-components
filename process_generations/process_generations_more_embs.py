@@ -350,7 +350,7 @@ def main():
     )
     parser.add_argument(
         "--output_dir",
-        default="./processed_generations_h5",
+        default="./processed_generations_more_h5",
         help="Output directory for HDF5 and JSON (default: ./processed_generations_h5)",
     )
     parser.add_argument(

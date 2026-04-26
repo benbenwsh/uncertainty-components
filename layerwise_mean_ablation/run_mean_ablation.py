@@ -24,6 +24,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 import h5py
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from datasets import Dataset, load_dataset
@@ -143,27 +144,6 @@ def parse_guess_and_probability_indices(
         return None
 
     return (last_guess_token_index, first_prob_token_index, end_prob_token_index)
-
-
-def first_probability_value_token_index(
-    decoded_tokens: List[str],
-    full_str: str,
-) -> Optional[int]:
-    """First completion token index for the numeric probability (after ``PROBABILITY_MARKER``).
-
-    If the marker is complete but no digit has been generated yet, returns
-    ``len(decoded_tokens)`` so that ``len(decoded_tokens) >= i0`` holds on the
-    forward pass that predicts the first value token.
-    """
-    if parse_guess_and_probability_indices(decoded_tokens) is None:
-        return None
-    rfind_start = full_str.rfind(PROBABILITY_MARKER)
-    if rfind_start < 0:
-        return None
-    value_char_start = rfind_start + len(PROBABILITY_MARKER)
-    if value_char_start >= len(full_str):
-        return len(decoded_tokens)
-    return _token_index_for_char_offset(decoded_tokens, value_char_start)
 
 
 # ---------------------------------------------------------------------------
@@ -322,8 +302,6 @@ def mode_to_output_key(mode: str) -> str:
         return "no_replacement"
     if mode == "probability_tokens_mean_replace":
         return "probability_tokens_mean_replace"
-    if mode == "probability_value_prefix_mean_replace":
-        return "probability_value_prefix_mean_replace"
     raise ValueError(f"Unknown ablation mode: {mode!r}")
 
 
@@ -469,7 +447,7 @@ def _as_layer_hidden(arr_like: np.ndarray) -> np.ndarray:
     raise ValueError(f"Unexpected embedding tensor shape: {arr.shape}; expected 4D or 2D.")
 
 
-def compute_low_confidence_means(
+def compute_confidence_group_means(
     examples_h5: Dict[str, dict],
     ablate_layers: Sequence[int],
     *,
@@ -626,35 +604,6 @@ def build_mean_replace_hooks(
     )
 
 
-def build_prefix_mean_replace_hooks(
-    layer_to_mean_vectors: Dict[int, torch.Tensor],
-    prompt_len: int,
-    seq_len_provider: Callable[[], int],
-    decoded_tokens_provider: Callable[[], List[str]],
-) -> List[Tuple[str, Callable]]:
-    """
-    After the numeric probability region starts, replace ``hook_resid_post`` at the
-    same absolute positions as ``_absolute_prob_positions`` (completion indices
-    ``first_prob`` … ``end_prob`` inclusive). Until that span is fully present in
-    the sequence, hooks no-op (non-strict length).
-    """
-
-    def _abs_positions() -> List[int]:
-        decoded = decoded_tokens_provider()
-        full_str = "".join(decoded)
-        i0 = first_probability_value_token_index(decoded, full_str)
-        if i0 is None or len(decoded) < i0:
-            return []
-        return _absolute_prob_positions(prompt_len, decoded)
-
-    return _build_resid_post_mean_replace_hooks(
-        layer_to_mean_vectors,
-        seq_len_provider=seq_len_provider,
-        abs_positions_provider=_abs_positions,
-        strict_num_prob_positions=False,
-    )
-
-
 def _generation_contains_stop(decoded_completion: str) -> bool:
     return any(s in decoded_completion for s in STOP_SEQUENCES)
 
@@ -781,31 +730,6 @@ def greedy_generate_mean_replaced(
     return _greedy_extend_with_fwd_hooks(model, local_prompt, max_new_tokens, tokens, decoded_tokens, hooks)
 
 
-def greedy_generate_value_prefix_mean_replaced(
-    model: HookedTransformer,
-    local_prompt: str,
-    max_new_tokens: int,
-    layer_to_mean_vectors: Dict[int, torch.Tensor],
-) -> Tuple[str, List[str]]:
-    tokens = model.to_tokens(local_prompt)
-    prompt_len = int(tokens.shape[1])
-    decoded_tokens: List[str] = []
-
-    def _seq_len() -> int:
-        return int(tokens.shape[1])
-
-    def _decoded_tokens() -> List[str]:
-        return decoded_tokens
-
-    hooks = build_prefix_mean_replace_hooks(
-        layer_to_mean_vectors=layer_to_mean_vectors,
-        prompt_len=prompt_len,
-        seq_len_provider=_seq_len,
-        decoded_tokens_provider=_decoded_tokens,
-    )
-    return _greedy_extend_with_fwd_hooks(model, local_prompt, max_new_tokens, tokens, decoded_tokens, hooks)
-
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -840,12 +764,10 @@ def main() -> None:
         choices=[
             "none",
             "probability_tokens_mean_replace",
-            "probability_value_prefix_mean_replace",
         ],
         help=(
-            "One or more modes to run. none: no hooks. probability_tokens_mean_replace: replace resid at H5 "
-            "probability span. probability_value_prefix_mean_replace: gated mean replace on the H5 span after "
-            "the numeric probability starts."
+            "One or more modes to run. none: no hooks. probability_tokens_mean_replace: "
+            "replace resid at H5 probability span."
         ),
     )
     parser.add_argument("--low_conf_threshold", type=float, default=0.1)
@@ -876,6 +798,15 @@ def main() -> None:
         help=(
             "Optional output path. If unset, saves to "
             "layerwise_mean_ablation/results/<incrementing_run_id>/ablation_results.json"
+        ),
+    )
+    parser.add_argument(
+        "--individual_layers",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If true, ignore --ablate_layers and run a separate ablation for each layer. "
+            "Outputs are written under results/individual_layers/<run_id>/<layer_idx>/."
         ),
     )
     args = parser.parse_args()
@@ -909,11 +840,12 @@ def main() -> None:
     logging.info("Loading HookedTransformer: %s", args.model_name)
     model = load_hooked_transformer(args.model_name, device=device, torch_dtype=torch_dtype)
     ablate_layers = parse_ablate_layers(args.ablate_layers, model.cfg.n_layers)
+    run_layers = list(range(model.cfg.n_layers)) if args.individual_layers else ablate_layers
 
     examples_h5 = load_examples_h5(Path(args.input_h5))
-    mean_vectors, low_ids, high_ids = compute_low_confidence_means(
+    mean_vectors, low_ids, high_ids = compute_confidence_group_means(
         examples_h5,
-        ablate_layers,
+        run_layers,
         low_conf_threshold=args.low_conf_threshold,
         high_conf_threshold=args.high_conf_threshold,
         expected_probability_tokens=args.expected_probability_tokens,
@@ -923,14 +855,15 @@ def main() -> None:
     logging.info("Low-confidence example IDs: %s", low_ids)
     logging.info("High-confidence example IDs: %s", high_ids)
     logging.info(
-        "Loaded %d H5 examples. low_conf=%d (<=%.3f), high_conf=%d (>=%.3f), layers=%s, mean_from_low_confidence=%s",
+        "Loaded %d H5 examples. low_conf=%d (<=%.3f), high_conf=%d (>=%.3f), layers=%s, mean_from_low_confidence=%s, individual_layers=%s",
         len(examples_h5),
         len(low_ids),
         args.low_conf_threshold,
         len(high_ids),
         args.high_conf_threshold,
-        ablate_layers,
+        run_layers,
         args.mean_from_low_confidence,
+        args.individual_layers,
     )
 
     mean_source_ids = low_ids if args.mean_from_low_confidence else high_ids
@@ -945,151 +878,341 @@ def main() -> None:
 
     layer_to_mean_vectors = {
         layer_idx: torch.tensor(mean_vectors[i], device=device, dtype=torch_dtype)
-        for i, layer_idx in enumerate(ablate_layers)
+        for i, layer_idx in enumerate(run_layers)
     }
 
-    results = {"train": {}, "validation": {}}
-    mini_results = {"train": {}, "validation": {}}
-    mode_confidence_values: Dict[str, List[float]] = {mode_name: [] for mode_name in args.ablation_mode}
+    def run_one_evaluation(
+        layer_to_mean_vectors: Dict[int, torch.Tensor],
+        cached_none: Optional[Dict[str, Dict[str, Dict[str, object]]]] = None,
+    ) -> Tuple[Dict[str, dict], Dict[str, dict], Dict[str, Optional[float]], Dict[str, Dict[str, Dict[str, object]]]]:
+        results = {"train": {}, "validation": {}}
+        mini_results = {"train": {}, "validation": {}}
+        mode_confidence_values: Dict[str, List[float]] = {mode_name: [] for mode_name in args.ablation_mode}
 
-    modes = args.ablation_mode
-    has_none_and_other_modes = ("none" in modes) and (len(modes) > 1)
+        modes = args.ablation_mode
+        has_none_and_other_modes = ("none" in modes) and (len(modes) > 1)
+        used_none_cache: Dict[str, Dict[str, Dict[str, object]]] = {"train": {}, "validation": {}}
 
-    for split_name, eval_ds in [("train", train_ds), ("validation", val_ds)]:
-        split_target = (
-            round(args.num_samples * TRAIN_RATIO) if split_name == "train" else round(args.num_samples * (1 - TRAIN_RATIO))
-        )
-        id_to_index = {encode_example_id(ex["id"]): i for i, ex in enumerate(eval_ds)}
-        split_target_ids = sorted(ex_id for ex_id in ablation_target_ids if ex_id in id_to_index)
-
-        if split_target > 0 and not split_target_ids:
-            # Here because my input path is all train_data
-            logging.warning(
-                "No ablation target IDs available for %s split (mean_from_low_confidence=%s).",
-                split_name,
-                args.mean_from_low_confidence,
+        for split_name, eval_ds in [("train", train_ds), ("validation", val_ds)]:
+            split_target = (
+                round(args.num_samples * TRAIN_RATIO) if split_name == "train" else round(args.num_samples * (1 - TRAIN_RATIO))
             )
-            continue
+            id_to_index = {encode_example_id(ex["id"]): i for i, ex in enumerate(eval_ds)}
+            split_target_ids = sorted(ex_id for ex_id in ablation_target_ids if ex_id in id_to_index)
 
-        selected_ids = split_target_ids[: min(split_target, len(split_target_ids))]
-        logging.info(
-            "Generating for %d examples (%s split, target confidence subset).",
-            len(selected_ids),
-            split_name,
-        )
+            if split_target > 0 and not split_target_ids:
+                logging.warning(
+                    "No ablation target IDs available for %s split (mean_from_low_confidence=%s).",
+                    split_name,
+                    args.mean_from_low_confidence,
+                )
+                continue
 
-        for i, ex_id in enumerate(selected_ids):
-            ds_idx = id_to_index.get(ex_id)
-            if ds_idx is None:
-                raise ValueError(f"Example id {ex_id} selected from H5 but not found in {split_name} split.")
-            example = eval_ds[int(ds_idx)]
-            question = example["question"]
-            local_prompt = fewshot_prefix + CONFIDENCE_PROMPT + question
+            selected_ids = split_target_ids[: min(split_target, len(split_target_ids))]
+            logging.info(
+                "Generating for %d examples (%s split, target confidence subset).",
+                len(selected_ids),
+                split_name,
+            )
 
-            entry = {"question": question}
-            mini_entry = {"question": question}
+            for i, ex_id in enumerate(selected_ids):
+                ds_idx = id_to_index.get(ex_id)
+                if ds_idx is None:
+                    raise ValueError(f"Example id {ex_id} selected from H5 but not found in {split_name} split.")
+                example = eval_ds[int(ds_idx)]
+                question = example["question"]
+                local_prompt = fewshot_prefix + CONFIDENCE_PROMPT + question
 
-            for mode in modes:
-                if mode == "none":
+                entry = {"question": question}
+                mini_entry = {"question": question}
+
+                for mode in modes:
                     key = mode_to_output_key(mode)
-                    response, decoded_tokens = greedy_generate(
-                        model=model,
-                        local_prompt=local_prompt,
-                        max_new_tokens=args.model_max_new_tokens,
-                        fwd_hooks=None,
-                    )
-                elif mode == "probability_tokens_mean_replace":
-                    key = mode_to_output_key(mode)
-                    response, decoded_tokens = greedy_generate_mean_replaced(
-                        model=model,
-                        local_prompt=local_prompt,
-                        max_new_tokens=args.model_max_new_tokens,
-                        layer_to_mean_vectors=layer_to_mean_vectors,
-                    )
-                elif mode == "probability_value_prefix_mean_replace":
-                    key = mode_to_output_key(mode)
-                    response, decoded_tokens = greedy_generate_value_prefix_mean_replaced(
-                        model=model,
-                        local_prompt=local_prompt,
-                        max_new_tokens=args.model_max_new_tokens,
-                        layer_to_mean_vectors=layer_to_mean_vectors,
-                    )
-                else:
-                    raise ValueError(f"Unknown ablation mode: {mode!r}")
+                    if mode == "none" and cached_none is not None and ex_id in cached_none[split_name]:
+                        cached = cached_none[split_name][ex_id]
+                        response = str(cached["response"])
+                        decoded_tokens = list(cached["decoded_tokens"])
+                        mode_confidence = cached.get("verbalised_confidence")
+                    elif mode == "none":
+                        # Generate baseline none mode response
+                        response, decoded_tokens = greedy_generate(
+                            model=model,
+                            local_prompt=local_prompt,
+                            max_new_tokens=args.model_max_new_tokens,
+                            fwd_hooks=None,
+                        )
+                        mode_confidence = (
+                            parse_mode_confidence_from_response(response)
+                            if args.parse_mode_verbalised_confidence
+                            else None
+                        )
+                        used_none_cache[split_name][ex_id] = {
+                            "response": response,
+                            "decoded_tokens": decoded_tokens,
+                            "verbalised_confidence": mode_confidence,
+                        }
+                    elif mode == "probability_tokens_mean_replace":
+                        response, decoded_tokens = greedy_generate_mean_replaced(
+                            model=model,
+                            local_prompt=local_prompt,
+                            max_new_tokens=args.model_max_new_tokens,
+                            layer_to_mean_vectors=layer_to_mean_vectors,
+                        )
+                        mode_confidence = (
+                            parse_mode_confidence_from_response(response)
+                            if args.parse_mode_verbalised_confidence
+                            else None
+                        )
+                    else:
+                        raise ValueError(f"Unknown ablation mode: {mode!r}")
 
-                entry[key] = {"response": response, "decoded_tokens": decoded_tokens}
-                mini_entry[key] = {"response": response}
-                if args.parse_mode_verbalised_confidence:
-                    mode_confidence = parse_mode_confidence_from_response(response)
-                    entry[key]["verbalised_confidence"] = mode_confidence
-                    mini_entry[key]["verbalised_confidence"] = mode_confidence
-                    if mode_confidence is not None:
-                        mode_confidence_values[mode].append(mode_confidence)
-                logging.info("[%s %d/%d] %s %s first line: %r", split_name, i + 1, len(selected_ids), ex_id, key, response[:120])
+                    entry[key] = {"response": response, "decoded_tokens": decoded_tokens}
+                    mini_entry[key] = {"response": response}
+                    if args.parse_mode_verbalised_confidence:
+                        entry[key]["verbalised_confidence"] = mode_confidence
+                        mini_entry[key]["verbalised_confidence"] = mode_confidence
+                        if mode_confidence is not None:
+                            mode_confidence_values[mode].append(float(mode_confidence))
+                    logging.info(
+                        "[%s %d/%d] %s %s first line: %r",
+                        split_name,
+                        i + 1,
+                        len(selected_ids),
+                        ex_id,
+                        key,
+                        response[:120],
+                    )
 
-            if has_none_and_other_modes:
-                baseline_key = mode_to_output_key("none")
-                baseline_response = entry[baseline_key]["response"]
-                baseline_confidence = (
-                    entry[baseline_key].get("verbalised_confidence")
+                if has_none_and_other_modes:
+                    baseline_key = mode_to_output_key("none")
+                    baseline_response = entry[baseline_key]["response"]
+                    baseline_confidence = (
+                        entry[baseline_key].get("verbalised_confidence")
+                        if args.parse_mode_verbalised_confidence
+                        else None
+                    )
+                    for mode in modes:
+                        if mode == "none":
+                            continue
+                        mode_key = mode_to_output_key(mode)
+                        responses_identical = entry[mode_key]["response"] == baseline_response
+                        entry[mode_key]["responses_identical"] = responses_identical
+                        mini_entry[mode_key]["responses_identical"] = responses_identical
+
+                        if args.parse_mode_verbalised_confidence:
+                            mode_confidence = entry[mode_key].get("verbalised_confidence")
+                            if mode_confidence is None or baseline_confidence is None:
+                                meets_none_confidence_direction = None
+                            elif args.mean_from_low_confidence:
+                                meets_none_confidence_direction = mode_confidence < baseline_confidence
+                            else:
+                                meets_none_confidence_direction = mode_confidence > baseline_confidence
+                            entry[mode_key]["meets_none_confidence_direction"] = meets_none_confidence_direction
+                            mini_entry[mode_key]["meets_none_confidence_direction"] = meets_none_confidence_direction
+
+                results[split_name][ex_id] = entry
+                mini_results[split_name][ex_id] = mini_entry
+
+        mode_confidence_means: Dict[str, Optional[float]] = {}
+        for mode_name in modes:
+            values = mode_confidence_values[mode_name]
+            mode_confidence_means[mode_name] = float(np.mean(values)) if values else None
+        return results, mini_results, mode_confidence_means, used_none_cache
+
+    # Compute the output for baseline none mode (no ablation) so individual-layer runs can reuse the same baseline.
+    def build_none_cache() -> Dict[str, Dict[str, Dict[str, object]]]:
+        none_cache: Dict[str, Dict[str, Dict[str, object]]] = {"train": {}, "validation": {}}
+        for split_name, eval_ds in [("train", train_ds), ("validation", val_ds)]:
+            split_target = (
+                round(args.num_samples * TRAIN_RATIO) if split_name == "train" else round(args.num_samples * (1 - TRAIN_RATIO))
+            )
+            id_to_index = {encode_example_id(ex["id"]): i for i, ex in enumerate(eval_ds)}
+            split_target_ids = sorted(ex_id for ex_id in ablation_target_ids if ex_id in id_to_index)
+            selected_ids = split_target_ids[: min(split_target, len(split_target_ids))]
+            for ex_id in selected_ids:
+                ds_idx = id_to_index.get(ex_id)
+                if ds_idx is None:
+                    continue
+                example = eval_ds[int(ds_idx)]
+                question = example["question"]
+                local_prompt = fewshot_prefix + CONFIDENCE_PROMPT + question
+                response, decoded_tokens = greedy_generate(
+                    model=model,
+                    local_prompt=local_prompt,
+                    max_new_tokens=args.model_max_new_tokens,
+                    fwd_hooks=None,
+                )
+                mode_confidence = (
+                    parse_mode_confidence_from_response(response)
                     if args.parse_mode_verbalised_confidence
                     else None
                 )
-                for mode in modes:
-                    if mode == "none":
-                        continue
-                    mode_key = mode_to_output_key(mode)
-                    responses_identical = entry[mode_key]["response"] == baseline_response
-                    entry[mode_key]["responses_identical"] = responses_identical
-                    mini_entry[mode_key]["responses_identical"] = responses_identical
-
-                    if args.parse_mode_verbalised_confidence:
-                        mode_confidence = entry[mode_key].get("verbalised_confidence")
-                        if mode_confidence is None or baseline_confidence is None:
-                            meets_none_confidence_direction = None
-                        elif args.mean_from_low_confidence:
-                            meets_none_confidence_direction = mode_confidence < baseline_confidence
-                        else:
-                            meets_none_confidence_direction = mode_confidence > baseline_confidence
-                        entry[mode_key]["meets_none_confidence_direction"] = meets_none_confidence_direction
-                        mini_entry[mode_key]["meets_none_confidence_direction"] = meets_none_confidence_direction
-
-            results[split_name][ex_id] = entry
-            mini_results[split_name][ex_id] = mini_entry
-
-    mode_confidence_means: Dict[str, Optional[float]] = {}
-    for mode_name in modes:
-        values = mode_confidence_values[mode_name]
-        mode_confidence_means[mode_name] = float(np.mean(values)) if values else None
+                none_cache[split_name][ex_id] = {
+                    "response": response,
+                    "decoded_tokens": decoded_tokens,
+                    "verbalised_confidence": mode_confidence,
+                }
+        return none_cache
 
     out_path = resolve_output_json_path(args.output_json)
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
-    logging.info("Wrote %s", out_path)
+    run_root = os.path.dirname(out_path)
 
-    mini_out_path = mini_output_json_path(out_path)
-    with open(mini_out_path, "w", encoding="utf-8") as f:
-        json.dump(mini_results, f, ensure_ascii=False, indent=2)
-    logging.info("Wrote %s", mini_out_path)
+    if not args.individual_layers:
+        results, mini_results, mode_confidence_means, _ = run_one_evaluation(layer_to_mean_vectors, cached_none=None)
 
-    config_out_path = config_txt_path(out_path)
-    finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
-    write_config_txt(
-        config_out_path,
-        args=args,
-        device=device,
-        model_n_layers=model.cfg.n_layers,
-        ablate_layers=ablate_layers,
-        prompt_indices=prompt_indices,
-        low_conf_count=len(low_ids),
-        high_conf_count=len(high_ids),
-        h5_example_count=len(examples_h5),
-        mean_from_low_confidence=args.mean_from_low_confidence,
-        parse_mode_verbalised_confidence=args.parse_mode_verbalised_confidence,
-        mode_confidence_means=mode_confidence_means,
-        finished_at=finished_at,
-    )
-    logging.info("Wrote %s", config_out_path)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        logging.info("Wrote %s", out_path)
+
+        mini_out_path = mini_output_json_path(out_path)
+        with open(mini_out_path, "w", encoding="utf-8") as f:
+            json.dump(mini_results, f, ensure_ascii=False, indent=2)
+        logging.info("Wrote %s", mini_out_path)
+
+        config_out_path = config_txt_path(out_path)
+        finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        write_config_txt(
+            config_out_path,
+            args=args,
+            device=device,
+            model_n_layers=model.cfg.n_layers,
+            ablate_layers=ablate_layers,
+            prompt_indices=prompt_indices,
+            low_conf_count=len(low_ids),
+            high_conf_count=len(high_ids),
+            h5_example_count=len(examples_h5),
+            mean_from_low_confidence=args.mean_from_low_confidence,
+            parse_mode_verbalised_confidence=args.parse_mode_verbalised_confidence,
+            mode_confidence_means=mode_confidence_means,
+            finished_at=finished_at,
+        )
+        logging.info("Wrote %s", config_out_path)
+        return
+
+    run_root_norm = run_root.rstrip(os.sep)
+    run_id = os.path.basename(run_root_norm)
+    results_root = os.path.dirname(run_root_norm)
+    individual_root = os.path.join(results_root, "individual_layers", run_id)
+    os.makedirs(individual_root, exist_ok=True)
+
+    cached_none: Optional[Dict[str, Dict[str, Dict[str, object]]]] = None
+    if "none" in args.ablation_mode:
+        logging.info("Computing baseline none-mode once for individual layer sweep.")
+        cached_none = build_none_cache()
+
+    per_layer_mode_means: Dict[int, Dict[str, Optional[float]]] = {}
+    for layer_idx in run_layers:
+        logging.info("Running individual-layer ablation for layer %d", layer_idx)
+        layer_dir = os.path.join(individual_root, str(layer_idx))
+        os.makedirs(layer_dir, exist_ok=True)
+        layer_map = {layer_idx: layer_to_mean_vectors[layer_idx]}
+        results, mini_results, mode_confidence_means, _ = run_one_evaluation(layer_map, cached_none=cached_none)
+        per_layer_mode_means[layer_idx] = mode_confidence_means
+
+        layer_out_path = os.path.join(layer_dir, "ablation_results.json")
+        with open(layer_out_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        logging.info("Wrote %s", layer_out_path)
+
+        layer_mini_path = os.path.join(layer_dir, "ablation_results_mini.json")
+        with open(layer_mini_path, "w", encoding="utf-8") as f:
+            json.dump(mini_results, f, ensure_ascii=False, indent=2)
+        logging.info("Wrote %s", layer_mini_path)
+
+        layer_config_path = os.path.join(layer_dir, "config.txt")
+        finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        write_config_txt(
+            layer_config_path,
+            args=args,
+            device=device,
+            model_n_layers=model.cfg.n_layers,
+            ablate_layers=[layer_idx],
+            prompt_indices=prompt_indices,
+            low_conf_count=len(low_ids),
+            high_conf_count=len(high_ids),
+            h5_example_count=len(examples_h5),
+            mean_from_low_confidence=args.mean_from_low_confidence,
+            parse_mode_verbalised_confidence=args.parse_mode_verbalised_confidence,
+            mode_confidence_means=mode_confidence_means,
+            finished_at=finished_at,
+        )
+        logging.info("Wrote %s", layer_config_path)
+
+    summary_path = os.path.join(individual_root, "summary.txt")
+    modes_non_none = [mode for mode in args.ablation_mode if mode != "none"]
+    baseline_none_mean = None
+    if "none" in args.ablation_mode and per_layer_mode_means:
+        first_layer = run_layers[0]
+        baseline_none_mean = per_layer_mode_means[first_layer].get("none")
+
+    summary_lines = [
+        "Individual Layer Mean Ablation Summary",
+        "=====================================",
+        "",
+        "[Setup]",
+        f"model_name={args.model_name}",
+        f"input_h5={args.input_h5}",
+        f"ablation_mode={args.ablation_mode}",
+        f"num_layers={model.cfg.n_layers}",
+        f"run_layers={','.join(str(layer) for layer in run_layers)}",
+        f"num_samples={args.num_samples}",
+        f"num_few_shot={args.num_few_shot}",
+        f"model_max_new_tokens={args.model_max_new_tokens}",
+        f"mean_from_low_confidence={args.mean_from_low_confidence}",
+        f"mean_source_group={'low_confidence' if args.mean_from_low_confidence else 'high_confidence'}",
+        f"ablation_target_group={'high_confidence' if args.mean_from_low_confidence else 'low_confidence'}",
+        f"parse_mode_verbalised_confidence={args.parse_mode_verbalised_confidence}",
+        "",
+    ]
+    if "none" in args.ablation_mode:
+        if baseline_none_mean is None:
+            summary_lines.append("none_mean_verbalised_confidence=None")
+        else:
+            summary_lines.append(f"none_mean_verbalised_confidence={baseline_none_mean:.6f}")
+        summary_lines.append("")
+
+    summary_lines.append("[Per-layer verbalised confidence]")
+    if modes_non_none:
+        header = "layer\t" + "\t".join(modes_non_none)
+        summary_lines.append(header)
+        for layer_idx in run_layers:
+            row_vals = []
+            for mode in modes_non_none:
+                val = per_layer_mode_means[layer_idx].get(mode)
+                row_vals.append("None" if val is None else f"{val:.6f}")
+            summary_lines.append(f"{layer_idx}\t" + "\t".join(row_vals))
+    else:
+        summary_lines.append("No non-none modes selected.")
+    summary_lines.append("")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(summary_lines))
+    logging.info("Wrote %s", summary_path)
+
+    plot_path = os.path.join(individual_root, "verbalised_confidence_by_layer.png")
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for mode in modes_non_none:
+        ys: List[float] = []
+        xs: List[int] = []
+        for layer_idx in run_layers:
+            y_val = per_layer_mode_means[layer_idx].get(mode)
+            if y_val is not None:
+                xs.append(layer_idx)
+                ys.append(float(y_val))
+        if ys:
+            ax.plot(xs, ys, marker="o", label=mode)
+    if baseline_none_mean is not None:
+        ax.axhline(y=float(baseline_none_mean), linestyle="--", label="none (baseline)")
+    ax.set_xlabel("Layer")
+    ax.set_ylabel("Verbalised confidence")
+    ax.set_ylim(0.0, 1.0)
+    ax.set_title("Individual layer verbalised confidence")
+    ax.grid(True, alpha=0.3)
+    if modes_non_none or baseline_none_mean is not None:
+        ax.legend()
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logging.info("Wrote %s", plot_path)
 
 
 if __name__ == "__main__":

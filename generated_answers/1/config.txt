@@ -1,0 +1,57 @@
+Experiment Configuration
+========================
+timestamp: 2026-04-26 15:40:08
+temperature: 1.0
+num_generations: 0
+
+All arguments:
+analyze_run: True
+answerable_only: True
+assign_new_wandb_id: True
+brief_always: False
+brief_prompt: default
+compute_accuracy_at_all_temps: False
+compute_context_entails_response: False
+compute_p_ik: True
+compute_p_ik_answerable: False
+compute_p_true: False
+compute_p_true_in_compute_stage: False
+compute_predictive_entropy: True
+compute_uncertainties: False
+condition_on_question: True
+confidence: True
+dataset: trivia_qa
+debug: False
+enable_brief: False
+entailment_cache_id: None
+entailment_cache_only: False
+entailment_model: deberta
+entity: None
+eval_wandb_runid: None
+experiment_lot: Unnamed Experiment
+get_training_set_generations: True
+get_training_set_generations_most_likely_only: True
+metric: squad
+model_max_new_tokens: 50
+model_name: Mistral-7B-Instruct-v0.1
+num_eval_samples: 10000000000000000000
+num_few_shot: 0
+num_generations: 0
+num_samples: 200
+ood_train_dataset: None
+p_true_hint: False
+p_true_num_fewshot: 20
+prompt_type: default
+random_seed: 10
+recompute_accuracy: False
+restore_entity_eval: None
+restore_entity_train: None
+reuse_entailment_model: False
+save_to_wandb: False
+strict_entailment: True
+temperature: 1.0
+train_wandb_runid: None
+use_all_generations: True
+use_context: False
+use_mc_options: True
+use_num_generations: -1

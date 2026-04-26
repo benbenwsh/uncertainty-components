@@ -540,7 +540,9 @@ def main():
         raise ValueError(f"Input file does not end with '_generations': {input_path}")
 
     out_base = f"{base}{args.output_suffix}"
-    output_dir = Path(args.output_dir)
+    script_dir = Path(__file__).resolve().parent
+    output_dir_arg = Path(args.output_dir)
+    output_dir = output_dir_arg if output_dir_arg.is_absolute() else (script_dir / output_dir_arg)
     output_dir.mkdir(parents=True, exist_ok=True)
     existing = [d.name for d in output_dir.iterdir() if d.is_dir() and d.name.isdigit()]
     run_number = max((int(n) for n in existing), default=0) + 1
