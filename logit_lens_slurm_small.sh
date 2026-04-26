@@ -15,4 +15,4 @@ source /vol/cuda/13.0.0/setup.sh
 /usr/bin/nvidia-smi
 uptime
 
-python3 ./semantic_uncertainty/generate_answers_with_confidence_h5.py --confidence --model_name Mistral-7B-Instruct-v0.1 --no-compute_p_true --num_samples 200 --num_generations 0 --answerable_only --no-compute_accuracy_at_all_temps --num_few_shot 0 --no-enable_brief --no-compute_uncertainties
+python3 ./logit_lens/h5_logit_lens_guess_all_layers.py --train_path ./semantic_uncertainty/processed_generations_h5/1_train_200_samples/train_verbalised_embeddings.h5 --val_path ./semantic_uncertainty/processed_generations_h5/2_val_200_samples/validation_verbalised_embeddings.h5 --plot --device cuda:0
