@@ -1,6 +1,7 @@
 """
 Train a linear probe for each layer to predict verbalised confidence from embeddings.
 
+This file only looks at one token position: TBG; train_multitoken_verbalised_confidence_probe.py looks at more token positions.
 This script loads pickle files, extracts all layers from emb_tok_bef_gen,
 trains one independent probe per layer with the same configuration (model type, hyperparameters,
 same train/val data), and saves under results/all_layers/<run_id>/layer_1/, layer_2/, ...

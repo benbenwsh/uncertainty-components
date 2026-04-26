@@ -241,8 +241,8 @@ def main(args):
 
             for i in range(num_generations):
 
-                # Temperature for first generation is always `0.1`.
-                temperature = 0.1 if i == 0 else args.temperature
+                # Temperature for first generation is zero for deterministic greedy decoding.
+                temperature = 0.0 if i == 0 else args.temperature
 
                 predicted_answer, token_log_likelihoods, (emb_sec_last_token, emb_tok_bef_gen, all_embeddings), decoded_tokens = model.predict(local_prompt, temperature, return_latent=True) 
                 

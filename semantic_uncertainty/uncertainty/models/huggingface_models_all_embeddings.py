@@ -260,18 +260,29 @@ class HuggingfaceModelAllEmbeddings(BaseModel):
         else:
             stopping_criteria = None
 
-        logging.debug('temperature: %f', temperature)
+        logging.info('temperature: %f', temperature)
+        use_greedy = temperature == 0
+        generation_kwargs = {
+            "max_new_tokens": self.max_new_tokens,
+            "return_dict_in_generate": True,
+            "output_scores": True,
+            "output_hidden_states": True,
+            "do_sample": not use_greedy,
+            "num_beams": 1,
+            "stopping_criteria": stopping_criteria,
+            "pad_token_id": pad_token_id,
+        }
+        if not use_greedy:
+            generation_kwargs["temperature"] = temperature
+        logged_generation_kwargs = dict(generation_kwargs)
+        logged_generation_kwargs["stopping_criteria"] = (
+            "set" if stopping_criteria is not None else None
+        )
+        logging.info("Generation settings: %s", logged_generation_kwargs)
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
-                max_new_tokens=self.max_new_tokens,
-                return_dict_in_generate=True,
-                output_scores=True,
-                output_hidden_states=True,
-                temperature=temperature,
-                do_sample=True,
-                stopping_criteria=stopping_criteria,
-                pad_token_id=pad_token_id,
+                **generation_kwargs,
             )
 
         if len(outputs.sequences[0]) > self.token_limit:

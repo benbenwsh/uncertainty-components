@@ -158,7 +158,7 @@ def load_multitoken_verbalised_confidence_data(train_path, val_path):
                 
                 emb_array = _tensor_to_numpy(emb)
                 # emb_array shape: (num_layers, batch_size, sequence_length, hidden_dim)
-                layer_embs = emb_array[:, 0, -1, :]
+                layer_embs = emb_array[:, 0, -1, :] # For the first token, take the token before generation only (do not include the entire prompt)
                 
                 # Validate shape
                 if layer_embs.shape[0] != n_layers or layer_embs.shape[1] != hidden_dim:

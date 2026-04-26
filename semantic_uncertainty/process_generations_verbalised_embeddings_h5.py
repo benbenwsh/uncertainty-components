@@ -228,19 +228,18 @@ PROBABILITY_MARKER = "\nProbability:"
 
 def parse_guess_and_probability_indices(
     decoded_tokens: list,
-    full_str: str,
-    example_id,
 ) -> tuple[int, int, int] | None:
     """
-    Compute token indices for the two embedding subsets.
+    Compute token indices for the two embedding subsets (Guess and Probability).
 
-    Guess span: token 0 through the token right after the token containing
-    "\\n\\nGuess:". Probability span: tokens for the literal last
-    "\\nProbability:" plus one following token.
+    last_guess_token_index: token after "Guess:" (first token of answer)
+    first_prob_token_index: "\n" token before "Probability:"
+    end_prob_token_index: token after "Probability:\s" (first token of prob value)
 
     Returns (last_guess_token_index, first_prob_token_index, end_prob_token_index)
     or None on failure.
     """
+    full_str = "".join(decoded_tokens)
     if not full_str.startswith(GUESS_PREFIX):
         return None
 
@@ -251,9 +250,14 @@ def parse_guess_and_probability_indices(
         return None
 
     first_prob_token_index = _token_index_for_char_offset(decoded_tokens, rfind_start)
-    end_prob_token_index = _token_index_for_char_offset(
+    prob_whitespace_token_index = _token_index_for_char_offset(
         decoded_tokens, rfind_start + len(PROBABILITY_MARKER) - 1
     ) + 1
+    if prob_whitespace_token_index >= len(decoded_tokens):
+        return None
+    if decoded_tokens[prob_whitespace_token_index].strip() != "":
+        return None
+    end_prob_token_index = prob_whitespace_token_index + 1
 
     if (
         last_guess_token_index <= 0
@@ -414,7 +418,7 @@ def process_example(
         else:
             prob = float(prob)
 
-        indices = parse_guess_and_probability_indices(decoded_tokens, full_str, example_id)
+        indices = parse_guess_and_probability_indices(decoded_tokens)
         if indices is None:
             if not prompt_on_parse_failure:
                 logging.debug(
@@ -426,7 +430,7 @@ def process_example(
             if user_val == REJECT_KEYWORD:
                 return None
             prob = user_val
-            indices = parse_guess_and_probability_indices(decoded_tokens, full_str, example_id)
+            indices = parse_guess_and_probability_indices(decoded_tokens)
             if indices is None:
                 logging.debug(
                     f"Skipping response for example {example_id}: structure invalid, "

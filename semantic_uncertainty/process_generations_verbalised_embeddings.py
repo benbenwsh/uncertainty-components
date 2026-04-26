@@ -104,19 +104,19 @@ PROBABILITY_MARKER = "\nProbability:"
 
 def parse_guess_and_probability_indices(
     decoded_tokens: list,
-    full_str: str,
     example_id,
 ) -> tuple[int, int, int] | None:
     """
-    Compute token indices for the two embedding subsets.
+    Compute token indices for the two embedding subsets (Guess and Probability).
 
-    Guess span: tokens for the literal prefix "\\n\\nGuess:" only (token 0 through
-    the token containing the colon). Probability span: tokens for the literal
-    last "\\nProbability:" only (not the number after it).
+    last_guess_token_index: token after "Guess:" (first token of answer)
+    first_prob_token_index: "\n" token before "Probability:"
+    end_prob_token_index: token after "Probability:\s" (first token of prob value)
 
     Returns (last_guess_token_index, first_prob_token_index, end_prob_token_index)
     or None on failure.
     """
+    full_str = "".join(decoded_tokens)
     if not full_str.startswith(GUESS_PREFIX):
         return None
 
@@ -129,9 +129,14 @@ def parse_guess_and_probability_indices(
         return None
 
     first_prob_token_index = _token_index_for_char_offset(decoded_tokens, rfind_start)
-    end_prob_token_index = _token_index_for_char_offset(
+    prob_whitespace_token_index = _token_index_for_char_offset(
         decoded_tokens, rfind_start + len(PROBABILITY_MARKER) - 1
-    )
+    ) + 1
+    if prob_whitespace_token_index >= len(decoded_tokens):
+        return None
+    if decoded_tokens[prob_whitespace_token_index].strip() != "":
+        return None
+    end_prob_token_index = prob_whitespace_token_index
 
     if last_guess_token_index < 0 or end_prob_token_index < first_prob_token_index:
         return None
@@ -288,7 +293,7 @@ def process_example(
             prob = float(prob)
 
         indices = parse_guess_and_probability_indices(
-            decoded_tokens, full_str, example_id
+            decoded_tokens, example_id
         )
         if indices is None:
             if not prompt_on_parse_failure:
@@ -304,7 +309,7 @@ def process_example(
                 return None
             prob = user_val
             indices = parse_guess_and_probability_indices(
-                decoded_tokens, full_str, example_id
+                decoded_tokens, example_id
             )
             if indices is None:
                 logging.debug(

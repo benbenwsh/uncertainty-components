@@ -77,47 +77,134 @@ def _read_h5_node(node):
     return out
 
 
-def _load_h5_examples_multitoken(path: str) -> dict:
-    """
-    Load HDF5 file with root group ``examples``. Each example should have
-    responses[0] with verbalised_confidence, embeddings_guess, embeddings_probability
-    (same semantics as the pickle multitoken loader).
-    """
-    data: dict = {}
-    with h5py.File(path, "r") as h5_file:
-        if "examples" not in h5_file:
-            raise ValueError(f"HDF5 file has no 'examples' group: {path}")
-        examples_group = h5_file["examples"]
-        for example_id in examples_group.keys():
-            example_id = str(example_id)
-            example_group = examples_group[example_id]
-            example_data = _read_h5_node(example_group)
-            if not isinstance(example_data, dict):
-                logging.warning("Skipping example %s: not a dict after read", example_id)
-                continue
-            responses = example_data.get("responses", [])
-            if not responses:
-                continue
-            r = responses[0]
-            if not isinstance(r, dict):
-                logging.warning("Skipping example %s: responses[0] not a dict", example_id)
-                continue
-            vc = r.get("verbalised_confidence")
-            emb_guess = r.get("embeddings_guess")
-            emb_prob = r.get("embeddings_probability")
-            if vc is None or emb_guess is None or emb_prob is None:
-                logging.warning("ERROR: Missing data for example %s", example_id)
-                continue
-            data[example_id] = {
-                "responses": [
-                    {
-                        "verbalised_confidence": vc,
-                        "embeddings_guess": emb_guess,
-                        "embeddings_probability": emb_prob,
-                    }
-                ]
-            }
-    return data
+def _embeddings_h5_key(embedding_type: str) -> str:
+    if embedding_type == "guess":
+        return "embeddings_guess"
+    if embedding_type == "probability":
+        return "embeddings_probability"
+    raise ValueError(f"Unknown embedding_type: {embedding_type}")
+
+
+def _h5_response0_group(example_group: h5py.Group) -> h5py.Group | None:
+    responses = example_group.get("responses")
+    if responses is None or not isinstance(responses, h5py.Group):
+        return None
+    r0 = responses.get("0")
+    if r0 is None or not isinstance(r0, h5py.Group):
+        return None
+    return r0
+
+
+def _read_verbalised_confidence_scalar(r0: h5py.Group) -> float | None:
+    ds = r0.get("verbalised_confidence")
+    if ds is None or not isinstance(ds, h5py.Dataset):
+        return None
+    try:
+        v = ds[()]
+        if isinstance(v, np.ndarray):
+            return float(np.asarray(v).reshape(-1)[0])
+        return float(v)
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _read_token_embedding_dataset(
+    r0: h5py.Group, embedding_type: str, token_pos: int
+) -> h5py.Dataset | None:
+    key = _embeddings_h5_key(embedding_type)
+    emb_grp = r0.get(key)
+    if emb_grp is None or not isinstance(emb_grp, h5py.Group):
+        return None
+    ds = emb_grp.get(str(token_pos))
+    if ds is None or not isinstance(ds, h5py.Dataset):
+        return None
+    return ds
+
+
+def _embedding_list_len(emb_grp: h5py.Group) -> int:
+    return int(emb_grp.attrs.get("__len__", len(emb_grp.keys())))
+
+
+def _try_verbalised_row_fast(
+    example_group: h5py.Group,
+    embedding_type: str,
+    token_pos: int,
+    layer_idx: int,
+    example_id: str,
+) -> tuple[float, np.ndarray, int, int] | None:
+    r0 = _h5_response0_group(example_group)
+    if r0 is None:
+        return None
+    vc = _read_verbalised_confidence_scalar(r0)
+    if vc is None:
+        return None
+    ds = _read_token_embedding_dataset(r0, embedding_type, token_pos)
+    if ds is None or ds.ndim != 4:
+        return None
+    n_layers = int(ds.shape[0])
+    hidden_dim = int(ds.shape[-1])
+    if layer_idx < 0 or layer_idx >= n_layers:
+        return None
+    h = np.asarray(ds[layer_idx, 0, -1, :], dtype=np.float64)
+    if h.shape[0] != hidden_dim:
+        logging.warning(
+            "Hidden dim mismatch for example %s: expected %s, got %s",
+            example_id,
+            hidden_dim,
+            h.shape[0],
+        )
+        return None
+    return (vc, h, n_layers, hidden_dim)
+
+
+def _try_verbalised_row_slow(
+    example_group: h5py.Group,
+    embedding_type: str,
+    token_pos: int,
+    layer_idx: int,
+    example_id: str,
+) -> tuple[float, np.ndarray, int, int] | None:
+    try:
+        example_data = _read_h5_node(example_group)
+    except Exception as exc:
+        logging.warning("Failed to read example %s: %s", example_id, exc)
+        return None
+    if not isinstance(example_data, dict):
+        return None
+    responses = example_data.get("responses", [])
+    if not responses:
+        return None
+    response = responses[0]
+    if not isinstance(response, dict):
+        return None
+    verbalised_confidence = response.get("verbalised_confidence")
+    emb_list = response.get(f"embeddings_{embedding_type}")
+    if verbalised_confidence is None or emb_list is None or len(emb_list) <= token_pos:
+        return None
+    emb_array = _tensor_to_numpy(emb_list[token_pos])
+    layer_embs = emb_array[:, 0, -1, :]
+    n_layers, hidden_dim = layer_embs.shape[0], layer_embs.shape[1]
+    if layer_idx < 0 or layer_idx >= n_layers:
+        return None
+    h = np.asarray(layer_embs[layer_idx], dtype=np.float64)
+    return (float(verbalised_confidence), h, n_layers, hidden_dim)
+
+
+def _extract_verbalised_row_for_layer(
+    example_group: h5py.Group,
+    embedding_type: str,
+    token_pos: int,
+    layer_idx: int,
+    example_id: str,
+) -> tuple[float, np.ndarray, int, int] | None:
+    row = _try_verbalised_row_fast(
+        example_group, embedding_type, token_pos, layer_idx, example_id
+    )
+    if row is not None:
+        return row
+    return _try_verbalised_row_slow(
+        example_group, embedding_type, token_pos, layer_idx, example_id
+    )
 
 
 def _tensor_to_numpy(obj):
@@ -131,146 +218,115 @@ def _tensor_to_numpy(obj):
     return np.asarray(obj)
 
 
-def load_multitoken_verbalised_confidence_data(train_path, val_path):
+def _scan_token_positions_one_file(path: str, embedding_type: str) -> set[int]:
+    """Token indices that appear in at least one example with verbalised confidence and embedding list."""
+    positions: set[int] = set()
+    with h5py.File(path, "r") as h5_file:
+        if "examples" not in h5_file:
+            raise ValueError(f"HDF5 file has no 'examples' group: {path}")
+        for _example_id in h5_file["examples"].keys():
+            example_group = h5_file["examples"][_example_id]
+            r0 = _h5_response0_group(example_group)
+            if r0 is None:
+                continue
+            if _read_verbalised_confidence_scalar(r0) is None:
+                continue
+            emb_grp = r0.get(_embeddings_h5_key(embedding_type))
+            if emb_grp is None or not isinstance(emb_grp, h5py.Group):
+                continue
+            n_tok = _embedding_list_len(emb_grp)
+            if n_tok <= 0:
+                continue
+            positions.update(range(n_tok))
+    return positions
+
+
+def scan_common_token_positions(train_path: str, val_path: str) -> dict[str, list[int]]:
+    """Train ∩ val token indices per embedding kind (metadata only, no embedding tensor reads)."""
+    out: dict[str, list[int]] = {}
+    for embedding_type in ("guess", "probability"):
+        common = _scan_token_positions_one_file(train_path, embedding_type) & _scan_token_positions_one_file(
+            val_path, embedding_type
+        )
+        if not common:
+            logging.warning("No common token positions found for %s embeddings", embedding_type)
+            out[embedding_type] = []
+        else:
+            out[embedding_type] = sorted(common)
+    return out
+
+
+def _peek_n_layers_hidden_dim(path: str, embedding_type: str, token_pos: int) -> tuple[int, int] | None:
+    """First 4D token embedding dataset shape along examples (shape read only)."""
+    with h5py.File(path, "r") as h5_file:
+        if "examples" not in h5_file:
+            return None
+        for _example_id in h5_file["examples"].keys():
+            example_group = h5_file["examples"][_example_id]
+            r0 = _h5_response0_group(example_group)
+            if r0 is None:
+                continue
+            ds = _read_token_embedding_dataset(r0, embedding_type, token_pos)
+            if ds is None or ds.ndim != 4:
+                continue
+            return int(ds.shape[0]), int(ds.shape[-1])
+    return None
+
+
+def build_xy_verbalised_for_layer(
+    h5_path: str,
+    embedding_type: str,
+    token_pos: int,
+    layer_idx: int,
+) -> tuple[np.ndarray, np.ndarray, int, int]:
     """
-    Load HDF5 train/val files and extract verbalised confidence and embeddings for all token positions.
+    Stream one HDF5 file and build X, y for a single layer (hidden states only).
 
     Returns:
-        dict: {
-            'guess': {
-                token_pos: (X_train, X_val, y_train, y_val, n_layers)
-            },
-            'probability': {
-                token_pos: (X_train, X_val, y_train, y_val, n_layers)
-            }
-        }
+        X: (n_samples, hidden_dim), y: (n_samples,), n_layers, hidden_dim.
+        If no valid rows, returns (empty 2D array with second dim 0), empty y, 0, 0.
     """
-    train_data = _load_h5_examples_multitoken(train_path)
-    val_data = _load_h5_examples_multitoken(val_path)
+    X_list: list[np.ndarray] = []
+    y_list: list[float] = []
+    n_layers: int | None = None
+    hidden_dim: int | None = None
 
-    def extract_token_positions_and_labels(data_dict, embedding_type):
-        """
-        Extract embeddings for all token positions from embeddings_guess or embeddings_probability.
-
-        Returns:
-            dict: {token_pos: (X_array, y_array)} where X_array shape is (n_examples, n_layers, hidden_dim)
-        """
-        max_token_pos = -1
-        n_layers = None
-        hidden_dim = None
-
-        for example_id, example_data in data_dict.items():
-            responses = example_data.get("responses", [])
-            if len(responses) == 0:
-                continue
-            response = responses[0]
-            emb_list = response.get(f"embeddings_{embedding_type}")
-            if emb_list is None or len(emb_list) == 0:
-                continue
-
-            first_emb = _tensor_to_numpy(emb_list[0])
-            if n_layers is None:
-                n_layers = first_emb.shape[0]
-                hidden_dim = (
-                    first_emb.shape[3]
-                    if len(first_emb.shape) >= 4
-                    else (first_emb.shape[2] if len(first_emb.shape) >= 3 else first_emb.shape[1])
-                )
-
-            max_token_pos = max(max_token_pos, len(emb_list) - 1)
-
-        if max_token_pos < 0:
-            return {}
-
-        token_data = {pos: {"X": [], "y": []} for pos in range(max_token_pos + 1)}
-
-        for example_id, example_data in data_dict.items():
-            responses = example_data.get("responses", [])
-            if len(responses) == 0:
-                continue
-            response = responses[0]
-            verbalised_confidence = response.get("verbalised_confidence")
-            emb_list = response.get(f"embeddings_{embedding_type}")
-
-            if verbalised_confidence is None or emb_list is None:
-                continue
-
-            for token_pos, emb in enumerate(emb_list):
-                if token_pos > max_token_pos:
-                    break
-
-                emb_array = _tensor_to_numpy(emb)
-                layer_embs = emb_array[:, 0, -1, :]
-
-                if layer_embs.shape[0] != n_layers or layer_embs.shape[1] != hidden_dim:
-                    logging.warning(
-                        "Shape mismatch for example %s, token %s: expected (%s, %s), got %s",
-                        example_id,
-                        token_pos,
-                        n_layers,
-                        hidden_dim,
-                        layer_embs.shape,
-                    )
-                    continue
-
-                token_data[token_pos]["X"].append(layer_embs)
-                token_data[token_pos]["y"].append(float(verbalised_confidence))
-
-        result = {}
-        for token_pos in range(max_token_pos + 1):
-            if len(token_data[token_pos]["X"]) == 0:
-                continue
-            X_array = np.array(token_data[token_pos]["X"])
-            y_array = np.array(token_data[token_pos]["y"])
-            result[token_pos] = (X_array, y_array, n_layers)
-
-        return result
-
-    train_guess = extract_token_positions_and_labels(train_data, "guess")
-    train_prob = extract_token_positions_and_labels(train_data, "probability")
-    val_guess = extract_token_positions_and_labels(val_data, "guess")
-    val_prob = extract_token_positions_and_labels(val_data, "probability")
-
-    result = {"guess": {}, "probability": {}}
-
-    for embedding_type, train_dict, val_dict in [
-        ("guess", train_guess, val_guess),
-        ("probability", train_prob, val_prob),
-    ]:
-        common_positions = set(train_dict.keys()) & set(val_dict.keys())
-        if len(common_positions) == 0:
-            logging.warning("No common token positions found for %s embeddings", embedding_type)
-            continue
-
-        for token_pos in sorted(common_positions):
-            X_train, y_train, n_layers_train = train_dict[token_pos]
-            X_val, y_val, n_layers_val = val_dict[token_pos]
-
-            if n_layers_train != n_layers_val:
-                logging.warning(
-                    "Layer count mismatch for %s token %s: train=%s, val=%s",
-                    embedding_type,
-                    token_pos,
-                    n_layers_train,
-                    n_layers_val,
-                )
-                continue
-
-            if len(X_train) == 0 or len(X_val) == 0:
-                logging.warning("No examples for %s token %s", embedding_type, token_pos)
-                continue
-
-            result[embedding_type][token_pos] = (X_train, X_val, y_train, y_val, n_layers_train)
-            logging.info(
-                "Loaded %s token %s: %s train, %s val, %s layers",
-                embedding_type,
-                token_pos,
-                len(X_train),
-                len(X_val),
-                n_layers_train,
+    with h5py.File(h5_path, "r") as h5_file:
+        if "examples" not in h5_file:
+            raise ValueError(f"HDF5 file has no 'examples' group: {h5_path}")
+        examples_group = h5_file["examples"]
+        for example_id in examples_group.keys():
+            example_id_str = str(example_id)
+            example_group = examples_group[example_id]
+            row = _extract_verbalised_row_for_layer(
+                example_group, embedding_type, token_pos, layer_idx, example_id_str
             )
+            if row is None:
+                continue
+            y_val, h_vec, nl, hd = row
+            if n_layers is None:
+                n_layers, hidden_dim = nl, hd
+            elif nl != n_layers or h_vec.shape[0] != hidden_dim:
+                logging.warning(
+                    "Shape mismatch for example %s, token %s, layer %s: expected nl=%s hd=%s, got nl=%s h.shape=%s",
+                    example_id_str,
+                    token_pos,
+                    layer_idx,
+                    n_layers,
+                    hidden_dim,
+                    nl,
+                    h_vec.shape,
+                )
+                continue
+            X_list.append(h_vec)
+            y_list.append(y_val)
 
-    return result
+    if not X_list or n_layers is None or hidden_dim is None:
+        return np.zeros((0, 0), dtype=np.float64), np.zeros(0, dtype=np.float64), 0, 0
+
+    X = np.stack(X_list, axis=0)
+    y = np.asarray(y_list, dtype=np.float64)
+    return X, y, n_layers, hidden_dim
 
 
 def _get_run_base_dir(output_dir: Path) -> Path:
@@ -688,18 +744,18 @@ def main():
         logging.info("Done. Regenerated plots in %s", run_base)
         return
 
-    logging.info("Loading HDF5 data from %s and %s", args.train_path, args.val_path)
+    logging.info("Scanning HDF5 metadata (token positions) from %s and %s", args.train_path, args.val_path)
+    common_by_kind = scan_common_token_positions(args.train_path, args.val_path)
 
-    data_dict = load_multitoken_verbalised_confidence_data(args.train_path, args.val_path)
-
-    if len(data_dict["guess"]) == 0 and len(data_dict["probability"]) == 0:
-        logging.error("No valid data loaded. Exiting.")
+    if not common_by_kind.get("guess") and not common_by_kind.get("probability"):
+        logging.error("No valid data (no common token positions). Exiting.")
         return
 
     all_token_metrics = {}
 
     for embedding_type in ["guess", "probability"]:
-        if embedding_type not in data_dict or len(data_dict[embedding_type]) == 0:
+        token_positions = common_by_kind.get(embedding_type) or []
+        if not token_positions:
             logging.info("No data for %s embeddings, skipping...", embedding_type)
             continue
 
@@ -707,14 +763,38 @@ def main():
         logging.info("Processing %s embeddings", embedding_type)
         logging.info("%s", "=" * 60)
 
-        for token_pos in sorted(data_dict[embedding_type].keys()):
-            X_train, X_val, y_train, y_val, n_layers = data_dict[embedding_type][token_pos]
+        for token_pos in token_positions:
+            peek_tr = _peek_n_layers_hidden_dim(args.train_path, embedding_type, token_pos)
+            peek_va = _peek_n_layers_hidden_dim(args.val_path, embedding_type, token_pos)
+            if peek_tr is None or peek_va is None:
+                logging.warning(
+                    "Could not read layer/hidden shape for %s token %s (train=%s val=%s); skipping token.",
+                    embedding_type,
+                    token_pos,
+                    peek_tr,
+                    peek_va,
+                )
+                continue
+            n_layers_tr, hidden_dim_tr = peek_tr
+            n_layers_va, hidden_dim_va = peek_va
+            if n_layers_tr != n_layers_va or hidden_dim_tr != hidden_dim_va:
+                logging.warning(
+                    "Layer/hidden mismatch for %s token %s: train (%s, %s) vs val (%s, %s); skipping token.",
+                    embedding_type,
+                    token_pos,
+                    n_layers_tr,
+                    hidden_dim_tr,
+                    n_layers_va,
+                    hidden_dim_va,
+                )
+                continue
+            n_layers, hidden_dim = n_layers_tr, hidden_dim_tr
 
             token_dir_name = f"tok_{token_pos}_{embedding_type}"
             token_dir = run_base / token_dir_name
             token_dir.mkdir(parents=True, exist_ok=True)
 
-            logging.info("\nTraining probes for %s (%s layers)", token_dir_name, n_layers)
+            logging.info("\nTraining probes for %s (%s layers, hidden_dim=%s)", token_dir_name, n_layers, hidden_dim)
 
             layer_numbers = []
             train_mse, train_mae, train_r2 = [], [], []
@@ -725,8 +805,35 @@ def main():
                 layer_dir = token_dir / layer_name
                 layer_dir.mkdir(parents=True, exist_ok=True)
 
-                X_train_l = X_train[:, layer_idx, :]
-                X_val_l = X_val[:, layer_idx, :]
+                X_train, y_train, nl_tr, hd_tr = build_xy_verbalised_for_layer(
+                    args.train_path, embedding_type, token_pos, layer_idx
+                )
+                X_val, y_val, nl_va, hd_va = build_xy_verbalised_for_layer(
+                    args.val_path, embedding_type, token_pos, layer_idx
+                )
+
+                if nl_tr != n_layers or nl_va != n_layers or hd_tr != hidden_dim or hd_va != hidden_dim:
+                    logging.warning(
+                        "Streaming build shape mismatch for %s token %s layer %s: skipping layer.",
+                        embedding_type,
+                        token_pos,
+                        layer_idx + 1,
+                    )
+                    continue
+
+                if X_train.shape[0] == 0 or X_val.shape[0] == 0:
+                    logging.warning(
+                        "No examples for %s token %s layer %s (train=%s val=%s); skipping layer.",
+                        embedding_type,
+                        token_pos,
+                        layer_idx + 1,
+                        X_train.shape[0],
+                        X_val.shape[0],
+                    )
+                    continue
+
+                X_train_l = X_train
+                X_val_l = X_val
 
                 model, metrics = train_verbalised_confidence_probe(
                     X_train_l,
@@ -778,6 +885,12 @@ def main():
                         val_path=str(args.val_path),
                     )
                     logging.debug("Saved model and config to %s", layer_dir)
+
+                del X_train, y_train, X_val, y_val, X_train_l, X_val_l, model
+
+            if not layer_numbers:
+                logging.warning("No layers trained for %s; skipping per-token and aggregate metrics for this token.", token_dir_name)
+                continue
 
             logging.info("Generating per-token graphs for %s...", token_dir_name)
             _plot_all_metrics_by_layer(

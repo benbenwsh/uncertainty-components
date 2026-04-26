@@ -261,17 +261,23 @@ class HuggingfaceModel(BaseModel):
             stopping_criteria = None
 
         logging.debug('temperature: %f', temperature)
+        use_greedy = temperature == 0
+        generation_kwargs = {
+            "max_new_tokens": self.max_new_tokens,
+            "return_dict_in_generate": True,
+            "output_scores": True,
+            "output_hidden_states": True,
+            "do_sample": not use_greedy,
+            "num_beams": 1,
+            "stopping_criteria": stopping_criteria,
+            "pad_token_id": pad_token_id,
+        }
+        if not use_greedy:
+            generation_kwargs["temperature"] = temperature
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
-                max_new_tokens=self.max_new_tokens,
-                return_dict_in_generate=True,
-                output_scores=True,
-                output_hidden_states=True,
-                temperature=temperature,
-                do_sample=True,
-                stopping_criteria=stopping_criteria,
-                pad_token_id=pad_token_id,
+                **generation_kwargs,
             )
 
         if len(outputs.sequences[0]) > self.token_limit:

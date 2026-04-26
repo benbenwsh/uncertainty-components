@@ -129,7 +129,7 @@ def process_example_gpu(
         else:
             prob = float(prob)
 
-        indices = parse_guess_and_probability_indices(decoded_tokens, full_str, example_id)
+        indices = parse_guess_and_probability_indices(decoded_tokens)
         if indices is None:
             if not prompt_on_parse_failure:
                 logging.debug(
@@ -143,7 +143,7 @@ def process_example_gpu(
             if user_val == REJECT_KEYWORD:
                 return None
             prob = user_val
-            indices = parse_guess_and_probability_indices(decoded_tokens, full_str, example_id)
+            indices = parse_guess_and_probability_indices(decoded_tokens)
             if indices is None:
                 logging.debug(
                     f"Skipping response for example {example_id}: structure invalid, "
