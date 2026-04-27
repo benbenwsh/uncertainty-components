@@ -407,7 +407,8 @@ def process_example(
         if not has_guess or not has_prob or prob is None:
             if not prompt_on_parse_failure:
                 logging.debug(
-                    f"Skipping response for example {example_id}: parse failed (no Guess/Probability or no number), --no_prompt set."
+                    f"Skipping response for example {example_id}: parse failed (no Guess/Probability or no number), --no_prompt set. "
+                    f"response={response_str!r}"
                 )
                 _print_decoded_tokens_neatly(decoded_tokens, example_id)
                 continue
@@ -422,7 +423,8 @@ def process_example(
         if indices is None:
             if not prompt_on_parse_failure:
                 logging.debug(
-                    f"Skipping response for example {example_id}: cannot compute token indices, --no_prompt set."
+                    f"Skipping response for example {example_id}: cannot compute token indices, --no_prompt set. "
+                    f"response={response_str!r}"
                 )
                 _print_decoded_tokens_neatly(decoded_tokens, example_id)
                 continue
@@ -434,7 +436,8 @@ def process_example(
             if indices is None:
                 logging.debug(
                     f"Skipping response for example {example_id}: structure invalid, "
-                    "cannot compute token indices for embedding subsets (user provided probability)."
+                    "cannot compute token indices for embedding subsets (user provided probability). "
+                    f"response={response_str!r}"
                 )
                 _print_decoded_tokens_neatly(decoded_tokens, example_id)
                 continue
@@ -495,6 +498,27 @@ def process_example(
     }
 
 
+def write_config_txt(run_dir: Path, args, input_path: Path, out_base: str, output_paths: dict[str, Path]) -> Path:
+    config_path = run_dir / "config.txt"
+    lines = [
+        f"script: {Path(__file__).name}",
+        f"timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"input_path: {input_path.resolve()}",
+        f"output_base: {out_base}",
+        f"run_dir: {run_dir.resolve()}",
+        "arguments:",
+    ]
+    for key, value in sorted(vars(args).items()):
+        lines.append(f"  {key}: {value}")
+    lines.append("outputs:")
+    for key, path in output_paths.items():
+        lines.append(f"  {key}: {path.resolve()}")
+
+    with open(config_path, "w", encoding="utf-8") as config_file:
+        config_file.write("\n".join(lines) + "\n")
+    return config_path
+
+
 def main():
     logging.info("Starting process_generations_verbalised_embeddings_h5.py...")
     parser = argparse.ArgumentParser(
@@ -550,6 +574,18 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     h5_path = run_dir / f"{out_base}.h5"
     json_path = run_dir / f"{out_base}.json"
+    samples_txt_path = run_dir / "samples.txt"
+    config_path = write_config_txt(
+        run_dir=run_dir,
+        args=args,
+        input_path=input_path,
+        out_base=out_base,
+        output_paths={
+            "h5": h5_path,
+            "json": json_path,
+            "samples_txt": samples_txt_path,
+        },
+    )
 
     # Initialize HDF5 output
     with h5py.File(h5_path, "w") as h5_file:
@@ -560,8 +596,12 @@ def main():
     output_log_path = run_dir / "output.log"
     file_handler = logging.FileHandler(output_log_path, mode="w")
     file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-8s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
-    logging.getLogger().addHandler(file_handler)
+    file_handler.setLevel(logging.INFO)
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(file_handler)
     logging.info(f"Files will be saved to {run_dir}")
+    logging.info(f"Wrote {config_path}")
 
     n_ok = 0
     n_reject = 0
@@ -635,7 +675,6 @@ def main():
     logging.info(f"Wrote {h5_path}")
     logging.info(f"Wrote {json_path}")
 
-    samples_txt_path = run_dir / "samples.txt"
     with open(samples_txt_path, "w") as f:
         f.write(f"{n_ok} samples\n")
     logging.info(f"Wrote {samples_txt_path}")

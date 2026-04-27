@@ -150,3 +150,5 @@ results/
 # TODO: probably need to put them all in a out/ folder
 processed_generations/
 processed_generations_h5/
+processed_generations_more_h5/
+generated_answers/

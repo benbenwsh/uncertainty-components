@@ -25,12 +25,9 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from uncertainty.utils import utils
 from process_generations_tok_bef_gen import (
     parse_probability_from_response,
 )
-
-utils.setup_logger()
 
 _EMBEDDING_KEYS = frozenset(
     {
@@ -103,19 +100,14 @@ def parse_guess_and_probability_indices(decoded_tokens: list) -> tuple[int, int,
     return (last_guess_token_index, first_prob_token_index, end_prob_token_index)
 
 
-def _first_minus_last_position(arr: np.ndarray) -> np.ndarray:
-    """Return first-seq-position minus last-seq-position, preserving seq dim of 1."""
-    if arr.ndim < 4 or arr.shape[2] < 1:
-        raise ValueError(f"Expected embedding rank>=4 with seq axis, got shape {arr.shape}")
-    return arr[:, :, 0:1, :] - arr[:, :, -1:, :]
+def _mean_across_tokens(token_embeddings: list[np.ndarray]) -> np.ndarray:
+    """Average token embeddings across token dimension.
 
-
-def _mean_first_minus_last_across_tokens(token_embeddings: list[np.ndarray]) -> np.ndarray:
-    """Apply first-minus-last per token embedding, then average over token dimension."""
+    Input is conceptually (n_tokens, *embedding_shape), output is (*embedding_shape).
+    """
     if not token_embeddings:
         raise ValueError("Cannot mean over empty token embedding list")
-    transformed = [_first_minus_last_position(_tensor_to_numpy(e)) for e in token_embeddings]
-    stacked = np.stack(transformed, axis=0)
+    stacked = np.stack([_tensor_to_numpy(e) for e in token_embeddings], axis=0)
     return np.mean(stacked, axis=0)
 
 
@@ -274,7 +266,13 @@ def convert_for_json(obj, parent_key=None):
     return obj
 
 
-def process_example(example_id, example: dict) -> dict | None:
+def process_example(
+    example_id,
+    example: dict,
+    *,
+    expected_guess_tokens: int,
+    expected_probability_tokens: int,
+) -> dict | None:
     most_likely = example.get("most_likely_answer")
     question = example.get("question")
     if not isinstance(most_likely, dict):
@@ -303,32 +301,91 @@ def process_example(example_id, example: dict) -> dict | None:
     full_str = "".join(decoded_tokens)
     prob = parse_probability_from_response(full_str)
     if prob is None:
-        logging.warning("Skipping example %s: could not parse probability from response", example_id)
+        logging.warning(
+            "Skipping example %s: could not parse probability from response. response=%r",
+            example_id,
+            response_str,
+        )
         return None
 
     indices = parse_guess_and_probability_indices(decoded_tokens)
     if indices is None:
-        logging.warning("Skipping example %s: could not parse Guess/Probability token spans", example_id)
+        logging.warning(
+            "Skipping example %s: could not parse Guess/Probability token spans. response=%r",
+            example_id,
+            response_str,
+        )
         return None
     last_guess_token_index, first_prob_token_index, end_prob_token_index = indices
 
-    # Guess span: first generated token through token before Probability marker.
-    guess_token_indices = range(0, first_prob_token_index)
+    # Prompt mean: all_embeddings[0] corresponds to the first generated token and contains
+    # [layers, batch, prompt_len + 1, hidden_dim]. Mean over prompt tokens only (exclude final +1 token).
+    prompt_plus_first_gen = _tensor_to_numpy(all_embeddings[0])
+    logging.info(
+        "Shape of prompt_plus_first_gen: %s (expected [num_layers, batch_size, prompt_len + 1, hidden_dim])",
+        prompt_plus_first_gen.shape,
+    )
+    if prompt_plus_first_gen.ndim != 4:
+        logging.warning(
+            "Skipping example %s: prompt_plus_first_gen has wrong shape: %s",
+            example_id,
+            prompt_plus_first_gen.shape,
+        )
+        return None
+    if prompt_plus_first_gen.shape[2] <= 1:
+        logging.warning("Skipping example %s: prompt has zero tokens", example_id)
+        return None
+    prompt_only_embeddings = prompt_plus_first_gen[:, :, :-1, :]
+    embeddings_mean_prompt = np.mean(prompt_only_embeddings, axis=2, keepdims=True)
+    logging.info("Shape of embeddings_mean_prompt: %s", embeddings_mean_prompt.shape)
+
+    # Guess token embeddings:
+    # - start from the last sequence position of all_embeddings[0] (first generated token state),
+    # - add remaining guess-token position embeddings.
+    guess_token_indices = range(0, last_guess_token_index)
     embeddings_guess = []
     for token_idx in guess_token_indices:
+        emb = _tensor_to_numpy(all_embeddings[token_idx])
+        if emb.ndim != 4:
+            logging.warning("Skipping example %s: all_embeddings[%d] has wrong rank: %s", example_id, token_idx, emb.shape)
+            return None
         if token_idx == 0:
+            if emb.shape[2] <= 1:
+                logging.warning(
+                    "Skipping example %s: all_embeddings[0] has seq_len <= 1: %s",
+                    example_id,
+                    emb.shape,
+                )
+                return None
+            embeddings_guess.append(_last_token_position(emb))
             continue
-        embeddings_guess.append(_last_token_position(all_embeddings[token_idx - 1]))
 
-    # Prompt mean: use all available pre-generation token embeddings from all_embeddings[:-1].
-    prompt_token_embeddings = all_embeddings[:-1]
-    if len(prompt_token_embeddings) == 0:
-        logging.warning("Skipping example %s: empty prompt-token embedding list", example_id)
+        if emb.shape[2] != 1:
+            logging.warning(
+                "Skipping example %s: all_embeddings[%d] expected seq_len=1, got shape %s",
+                example_id,
+                token_idx,
+                emb.shape,
+            )
+            return None
+        embeddings_guess.append(emb)
+
+    if len(embeddings_guess) == 0:
+        logging.warning("Skipping example %s: empty guess token embedding list", example_id)
         return None
-    embeddings_mean_prompt = _mean_first_minus_last_across_tokens(prompt_token_embeddings)
+    expected_guess_count = expected_guess_tokens - 1
+    if len(embeddings_guess) != expected_guess_count:
+        logging.warning(
+            "Skipping example %s: got %d guess embeddings, expected %d",
+            example_id,
+            len(embeddings_guess),
+            expected_guess_count,
+        )
+        return None
+    logging.info("Length of embeddings_guess: %d", len(embeddings_guess))
 
     # Semantic answer mean over (last_guess_token_index, first_prob_token_index), exclusive-exclusive.
-    sem_answer_slice_start = last_guess_token_index + 1
+    sem_answer_slice_start = last_guess_token_index
     sem_answer_slice_end = first_prob_token_index
     sem_answer_token_embeddings = all_embeddings[sem_answer_slice_start:sem_answer_slice_end]
     if len(sem_answer_token_embeddings) == 0:
@@ -339,10 +396,21 @@ def process_example(example_id, example: dict) -> dict | None:
             first_prob_token_index,
         )
         return None
-    embeddings_mean_sem_answer = _mean_first_minus_last_across_tokens(sem_answer_token_embeddings)
+    embeddings_mean_sem_answer = _mean_across_tokens(sem_answer_token_embeddings)
+    logging.info(f"Shape of embeddings_mean_sem_answer: {embeddings_mean_sem_answer.shape} (Should be just one token pos)")
 
     # Probability span as in prior script.
-    embeddings_probability = all_embeddings[first_prob_token_index : end_prob_token_index + 1]
+    embeddings_probability = all_embeddings[first_prob_token_index : end_prob_token_index]
+    expected_probability_count = expected_probability_tokens - 1
+    if len(embeddings_probability) != expected_probability_count:
+        logging.warning(
+            "Skipping example %s: got %d probability embeddings, expected %d",
+            example_id,
+            len(embeddings_probability),
+            expected_probability_count,
+        )
+        return None
+    logging.info("Length of embeddings_probability: %d", len(embeddings_probability))
     embeddings_probability = [_tensor_to_numpy(e) for e in embeddings_probability]
 
     processed_response = {
@@ -368,6 +436,27 @@ def iter_h5_examples(path: Path):
             yield example_id, _read_h5_node(examples_group[example_id])
 
 
+def write_config_txt(run_dir: Path, args, input_path: Path, out_base: str, output_paths: dict[str, Path]) -> Path:
+    config_path = run_dir / "config.txt"
+    lines = [
+        f"script: {Path(__file__).name}",
+        f"timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"input_path: {input_path.resolve()}",
+        f"output_base: {out_base}",
+        f"run_dir: {run_dir.resolve()}",
+        "arguments:",
+    ]
+    for key, value in sorted(vars(args).items()):
+        lines.append(f"  {key}: {value}")
+    lines.append("outputs:")
+    for key, path in output_paths.items():
+        lines.append(f"  {key}: {path.resolve()}")
+
+    with open(config_path, "w", encoding="utf-8") as config_file:
+        config_file.write("\n".join(lines) + "\n")
+    return config_path
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Process HDF5 generations into verbalised-confidence embedding HDF5."
@@ -386,6 +475,18 @@ def main():
         "--output_suffix",
         default="_verbalised_embeddings",
         help="Suffix for output filenames (default: _verbalised_embeddings)",
+    )
+    parser.add_argument(
+        "--expected_guess_tokens",
+        type=int,
+        default=6,
+        help="Expected total guess tokens before preprocessing (stored guess embeddings count is this value minus 1).",
+    )
+    parser.add_argument(
+        "--expected_probability_tokens",
+        type=int,
+        default=7,
+        help="Expected total probability tokens before preprocessing (stored probability embeddings count is this value minus 1).",
     )
     args = parser.parse_args()
 
@@ -409,6 +510,18 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     h5_path = run_dir / f"{out_base}.h5"
     json_path = run_dir / f"{out_base}.json"
+    samples_txt_path = run_dir / "samples.txt"
+    config_path = write_config_txt(
+        run_dir=run_dir,
+        args=args,
+        input_path=input_path,
+        out_base=out_base,
+        output_paths={
+            "h5": h5_path,
+            "json": json_path,
+            "samples_txt": samples_txt_path,
+        },
+    )
 
     with h5py.File(h5_path, "w") as h5_file:
         h5_file.attrs["format"] = "native_examples_v1"
@@ -419,8 +532,12 @@ def main():
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)-8s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     )
-    logging.getLogger().addHandler(file_handler)
+    file_handler.setLevel(logging.INFO)
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(file_handler)
     logging.info("Files will be saved to %s", run_dir)
+    logging.info("Wrote %s", config_path)
 
     n_ok = 0
     n_reject = 0
@@ -431,7 +548,12 @@ def main():
         out_examples = out_h5["examples"]
         json_file.write("{\n")
         for example_id, example in iter_h5_examples(input_path):
-            out = process_example(example_id, example)
+            out = process_example(
+                example_id,
+                example,
+                expected_guess_tokens=args.expected_guess_tokens,
+                expected_probability_tokens=args.expected_probability_tokens,
+            )
             if out is None:
                 n_reject += 1
                 continue
@@ -463,7 +585,6 @@ def main():
     logging.info("Wrote %s", json_path)
     logging.info("Processed %d valid and rejected %d examples in %.2fs", n_ok, n_reject, elapsed)
 
-    samples_txt_path = run_dir / "samples.txt"
     with open(samples_txt_path, "w", encoding="utf-8") as f:
         f.write(f"{n_ok} samples\n")
     logging.info("Wrote %s", samples_txt_path)

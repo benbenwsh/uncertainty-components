@@ -253,6 +253,27 @@ def process_example(example_id, example: dict) -> dict | None:
     }
 
 
+def write_config_txt(run_dir: Path, args, input_path: Path, out_base: str, output_paths: dict[str, Path]) -> Path:
+    config_path = run_dir / "config.txt"
+    lines = [
+        f"script: {Path(__file__).name}",
+        f"timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"input_path: {input_path.resolve()}",
+        f"output_base: {out_base}",
+        f"run_dir: {run_dir.resolve()}",
+        "arguments:",
+    ]
+    for key, value in sorted(vars(args).items()):
+        lines.append(f"  {key}: {value}")
+    lines.append("outputs:")
+    for key, path in output_paths.items():
+        lines.append(f"  {key}: {path.resolve()}")
+
+    with open(config_path, "w", encoding="utf-8") as config_file:
+        config_file.write("\n".join(lines) + "\n")
+    return config_path
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Process generations pickle to extract emb_tok_bef_gen embeddings (extract verbalised confidence)."
@@ -295,6 +316,19 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     pickle_path = run_dir / f"{out_base}.pkl"
     json_path = run_dir / f"{out_base}.json"
+    samples_txt_path = run_dir / "samples.txt"
+    config_path = write_config_txt(
+        run_dir=run_dir,
+        args=args,
+        input_path=input_path,
+        out_base=out_base,
+        output_paths={
+            "pickle": pickle_path,
+            "json": json_path,
+            "samples_txt": samples_txt_path,
+        },
+    )
+    print(f"Wrote {config_path}")
 
     n_ok = 0
     n_reject = 0
@@ -392,7 +426,6 @@ def main():
     print(f"Wrote {json_path}")
 
     # Write sample count to a txt file
-    samples_txt_path = run_dir / "samples.txt"
     with open(samples_txt_path, "w") as f:
         f.write(f"{n_ok} samples\n")
     print(f"Wrote {samples_txt_path}")
