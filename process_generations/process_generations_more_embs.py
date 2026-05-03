@@ -286,10 +286,6 @@ def process_example(
     # Prompt mean: all_embeddings[0] corresponds to the first generated token and contains
     # [layers, batch, prompt_len + 1, hidden_dim]. Mean over prompt tokens only (exclude final +1 token).
     prompt_plus_first_gen = _tensor_to_numpy(all_embeddings[0])
-    logging.info(
-        "Shape of prompt_plus_first_gen: %s (expected [num_layers, batch_size, prompt_len + 1, hidden_dim])",
-        prompt_plus_first_gen.shape,
-    )
     if prompt_plus_first_gen.ndim != 4:
         logging.warning(
             "Skipping example %s: prompt_plus_first_gen has wrong shape: %s",
@@ -302,7 +298,6 @@ def process_example(
         return None
     prompt_only_embeddings = prompt_plus_first_gen[:, :, :-1, :]
     embeddings_mean_prompt = np.mean(prompt_only_embeddings, axis=2, keepdims=True)
-    logging.info("Shape of embeddings_mean_prompt: %s", embeddings_mean_prompt.shape)
 
     # Guess token embeddings:
     # - start from the last sequence position of all_embeddings[0] (first generated token state),
@@ -347,7 +342,6 @@ def process_example(
             expected_guess_count,
         )
         return None
-    logging.info("Length of embeddings_guess: %d", len(embeddings_guess))
 
     # Semantic answer mean over (last_guess_token_index, first_prob_token_index), exclusive-exclusive.
     sem_answer_slice_start = last_guess_token_index
@@ -362,7 +356,6 @@ def process_example(
         )
         return None
     embeddings_mean_sem_answer = _mean_across_tokens(sem_answer_token_embeddings)
-    logging.info(f"Shape of embeddings_mean_sem_answer: {embeddings_mean_sem_answer.shape} (Should be just one token pos)")
 
     # Probability span as in prior script.
     embeddings_probability = all_embeddings[first_prob_token_index : end_prob_token_index]
@@ -375,7 +368,6 @@ def process_example(
             expected_probability_count,
         )
         return None
-    logging.info("Length of embeddings_probability: %d", len(embeddings_probability))
     embeddings_probability = [_tensor_to_numpy(e) for e in embeddings_probability]
 
     processed_response = {
