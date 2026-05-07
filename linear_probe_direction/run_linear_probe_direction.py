@@ -181,8 +181,6 @@ def parse_probability_from_response(response_str: str) -> float | None:
         value = float(raw)
     except ValueError:
         return None
-    if value > 1:
-        value /= 100.0
     if value < 0 or value > 1:
         return None
     return value

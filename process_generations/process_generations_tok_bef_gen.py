@@ -35,7 +35,7 @@ def parse_probability_from_response(response_str: str) -> float | None:
     Expected format: 'Guess: <...>\\nProbability:<number>' (case-insensitive, flexible whitespace).
     Uses the **last** occurrence of "probability:" so that if the guess text contains
     "Probability: ...", we still take the final number. Allows . or , as decimal separator.
-    If number > 1 (e.g. 80 or 80%), treats as percentage. Returns None if parsing fails.
+    Returns None if the value is outside [0, 1] or parsing fails.
     """
     if not response_str or not isinstance(response_str, str):
         return None
@@ -51,9 +51,6 @@ def parse_probability_from_response(response_str: str) -> float | None:
         value = float(raw)
     except ValueError:
         return None
-    # Percentage: e.g. 80 -> 0.8
-    if value > 1:
-        value = value / 100.0
     if value < 0 or value > 1:
         return None
     return value

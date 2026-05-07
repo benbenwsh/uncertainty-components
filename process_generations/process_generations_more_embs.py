@@ -333,7 +333,7 @@ def process_example(
     if len(embeddings_guess) == 0:
         logging.warning("Skipping example %s: empty guess token embedding list", example_id)
         return None
-    expected_guess_count = expected_guess_tokens - 1
+    expected_guess_count = expected_guess_tokens
     if len(embeddings_guess) != expected_guess_count:
         logging.warning(
             "Skipping example %s: got %d guess embeddings, expected %d",
@@ -359,7 +359,7 @@ def process_example(
 
     # Probability span as in prior script.
     embeddings_probability = all_embeddings[first_prob_token_index : end_prob_token_index]
-    expected_probability_count = expected_probability_tokens - 1
+    expected_probability_count = expected_probability_tokens
     if len(embeddings_probability) != expected_probability_count:
         logging.warning(
             "Skipping example %s: got %d probability embeddings, expected %d",
@@ -421,7 +421,13 @@ def write_config_txt(run_dir: Path, args, input_path: Path, out_base: str, outpu
     return config_path
 
 
+def append_total_duration_to_config(config_path: Path, total_duration_seconds: float) -> None:
+    with open(config_path, "a", encoding="utf-8") as config_file:
+        config_file.write(f"total_duration_seconds: {total_duration_seconds:.2f}\n")
+
+
 def main():
+    total_start = time.perf_counter()
     parser = argparse.ArgumentParser(
         description="Process pickle generations into verbalised-confidence embedding HDF5."
     )
@@ -443,14 +449,14 @@ def main():
     parser.add_argument(
         "--expected_guess_tokens",
         type=int,
-        default=6,
-        help="Expected total guess tokens before preprocessing (stored guess embeddings count is this value minus 1).",
+        default=5,
+        help="Expected guess embedding count after preprocessing.",
     )
     parser.add_argument(
         "--expected_probability_tokens",
         type=int,
-        default=7,
-        help="Expected total probability tokens before preprocessing (stored probability embeddings count is this value minus 1).",
+        default=6,
+        help="Expected probability embedding count after preprocessing.",
     )
     args = parser.parse_args()
 
@@ -552,6 +558,9 @@ def main():
     with open(samples_txt_path, "w") as f:
         f.write(f"{n_ok} samples\n")
     logging.info("Wrote %s", samples_txt_path)
+    total_elapsed = time.perf_counter() - total_start
+    append_total_duration_to_config(config_path, total_elapsed)
+    logging.info("Updated %s with total_duration_seconds=%.2f", config_path, total_elapsed)
 
 
 if __name__ == "__main__":

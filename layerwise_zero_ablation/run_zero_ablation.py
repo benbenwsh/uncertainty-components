@@ -15,7 +15,8 @@ import json
 import logging
 import os
 import random
-from typing import Callable, List, Optional, Sequence, Tuple
+import re
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 import torch
@@ -104,6 +105,25 @@ def parse_guess_and_probability_indices(
         return None
 
     return (last_guess_token_index, first_prob_token_index, end_prob_token_index)
+
+
+def parse_probability_from_response(response_str: str) -> float | None:
+    """Extract probability in [0, 1] from a response string (last ``probability:`` match)."""
+    if not response_str or not isinstance(response_str, str):
+        return None
+    matches = list(re.finditer(r"probability\s*:\s*([0-9]+[.,]?[0-9]*)\s*%?", response_str, re.IGNORECASE))
+    if not matches:
+        matches = list(re.finditer(r"probability\s*:\s*(\d+(?:[.,]\d+)?)", response_str, re.IGNORECASE))
+    if not matches:
+        return None
+    raw = matches[-1].group(1).strip().replace(",", ".")
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if value < 0 or value > 1:
+        return None
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +222,8 @@ def write_config_txt(
     model_n_layers: int,
     ablate_layers: Sequence[int],
     prompt_indices: Sequence[int],
+    mode_confidence_means: Dict[str, Optional[float]],
+    mode_confidence_counts: Dict[str, int],
     finished_at: str,
 ) -> None:
     lines = [
@@ -234,9 +256,22 @@ def write_config_txt(
         f"ablate_layers_resolved={','.join(str(layer) for layer in ablate_layers)}",
         f"num_ablated_layers={len(ablate_layers)}",
         "",
-        "[Run]",
-        f"finished_at={finished_at}",
+        "[Summary: Mean Parsed Verbalised Confidence]",
     ]
+    for out_key in sorted(mode_confidence_means.keys()):
+        mode_mean = mode_confidence_means[out_key]
+        count_val = int(mode_confidence_counts.get(out_key, 0))
+        if mode_mean is None:
+            lines.append(f"{out_key}=None ({count_val})")
+        else:
+            lines.append(f"{out_key}={mode_mean:.6f} ({count_val})")
+    lines.extend(
+        [
+            "",
+            "[Run]",
+            f"finished_at={finished_at}",
+        ]
+    )
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -577,6 +612,12 @@ def main() -> None:
     else:
         modes = [args.ablation_mode]
 
+    def _json_key_for_ablation_mode(mode: str) -> str:
+        return "all_positions" if mode == "all" else "probability_tokens"
+
+    summary_keys = list(dict.fromkeys(_json_key_for_ablation_mode(m) for m in modes))
+    mode_confidence_values: Dict[str, List[float]] = {k: [] for k in summary_keys}
+
     for split_name, eval_ds in [("train", train_ds), ("validation", val_ds)]:
         split_target = (
             round(args.num_samples * TRAIN_RATIO)
@@ -610,6 +651,9 @@ def main() -> None:
                 )
                 entry[key] = {"response": response, "decoded_tokens": decoded_tokens}
                 mini_entry[key] = {"response": response}
+                parsed_conf = parse_probability_from_response(response)
+                if parsed_conf is not None:
+                    mode_confidence_values[key].append(float(parsed_conf))
                 logging.info("[%s %d/%d] %s %s first line: %r", split_name, i + 1, n, ex_id, key, response[:120])
 
             results[split_name][ex_id] = entry
@@ -625,6 +669,13 @@ def main() -> None:
         json.dump(mini_results, f, ensure_ascii=False, indent=2)
     logging.info("Wrote %s", mini_out_path)
 
+    mode_confidence_means: Dict[str, Optional[float]] = {}
+    mode_confidence_counts: Dict[str, int] = {}
+    for summary_key in summary_keys:
+        vals = mode_confidence_values[summary_key]
+        mode_confidence_means[summary_key] = (sum(vals) / len(vals)) if vals else None
+        mode_confidence_counts[summary_key] = len(vals)
+
     config_out_path = config_txt_path(out_path)
     finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
     write_config_txt(
@@ -634,6 +685,8 @@ def main() -> None:
         model_n_layers=model.cfg.n_layers,
         ablate_layers=ablate_layers,
         prompt_indices=prompt_indices,
+        mode_confidence_means=mode_confidence_means,
+        mode_confidence_counts=mode_confidence_counts,
         finished_at=finished_at,
     )
     logging.info("Wrote %s", config_out_path)

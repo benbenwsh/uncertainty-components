@@ -290,17 +290,16 @@ def write_config_txt(
         f"low_conf_selected_count={low_conf_count}",
         f"high_conf_selected_count={high_conf_count}",
         "",
-        "[Mode Confidence Metrics]",
+        "[Summary: Mean Parsed Verbalised Confidence]",
     ]
     for mode_name in args.ablation_mode:
         mode_mean = mode_confidence_means.get(mode_name)
+        count_val = int(mode_confidence_counts.get(mode_name, 0))
+        out_key = mode_to_output_key(mode_name)
         if mode_mean is None:
-            lines.append(f"{mode_name}_mean_verbalised_confidence=None")
+            lines.append(f"{out_key}=None ({count_val})")
         else:
-            lines.append(f"{mode_name}_mean_verbalised_confidence={mode_mean:.6f}")
-        lines.append(
-            f"{mode_name}_verbalised_confidence_sample_count={int(mode_confidence_counts.get(mode_name, 0))}"
-        )
+            lines.append(f"{out_key}={mode_mean:.6f} ({count_val})")
     lines.extend(
         [
             "",
@@ -340,7 +339,7 @@ def parse_mode_confidence_from_response(response: str) -> Optional[float]:
 def parse_probability_from_response(response_str: str) -> float | None:
     """
     Extract probability in [0,1] from a response string.
-    Uses the last occurrence of "probability:" and supports percentages.
+    Uses the last occurrence of "probability:".
     """
     if not response_str or not isinstance(response_str, str):
         return None
@@ -354,8 +353,6 @@ def parse_probability_from_response(response_str: str) -> float | None:
         value = float(raw)
     except ValueError:
         return None
-    if value > 1:
-        value = value / 100.0
     if value < 0 or value > 1:
         return None
     return value
@@ -526,7 +523,7 @@ def compute_confidence_group_means(
         emb_prob = emb_prob[:expected_probability_tokens]
 
         token_vectors: List[np.ndarray] = []
-        for tok_arr in emb_prob[:-1]:
+        for tok_arr in emb_prob:
             layer_hidden = _as_layer_hidden(tok_arr)  # [n_layers, hidden_dim]
             selected = layer_hidden[np.asarray(ablate_layers), :]  # [num_selected_layers, hidden_dim]
             token_vectors.append(selected)

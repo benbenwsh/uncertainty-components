@@ -177,6 +177,7 @@ def write_config_txt(
     ablate_low_confidence_samples: bool,
     mode_confidence_means: Dict[str, Dict[str, Optional[float]]],
     mode_confidence_counts: Dict[str, Dict[str, int]],
+    mode_responses_identical_true: Dict[str, Dict[str, int]],
     finished_at: str,
 ) -> None:
     non_ablated_group = "high_confidence" if ablate_low_confidence_samples else "low_confidence"
@@ -231,10 +232,23 @@ def write_config_txt(
             mode_mean = per_subblock.get(subblock)
             valid_count = int(per_subblock_counts.get(subblock, 0))
             metric_key = f"{mode_name}__{subblock}_mean_verbalised_confidence"
-            if mode_mean is None:
-                lines.append(f"{metric_key}=None ({valid_count})")
+            if mode_name == "none":
+                if mode_mean is None:
+                    lines.append(f"{metric_key}=None ({valid_count})")
+                else:
+                    lines.append(f"{metric_key}={mode_mean:.6f} ({valid_count})")
             else:
-                lines.append(f"{metric_key}={mode_mean:.6f} ({valid_count})")
+                identical_n = int(
+                    mode_responses_identical_true.get(mode_name, {}).get(subblock, 0)
+                )
+                if mode_mean is None:
+                    lines.append(
+                        f"{metric_key}=None ({valid_count}) [responses_identical: {identical_n}]"
+                    )
+                else:
+                    lines.append(
+                        f"{metric_key}={mode_mean:.6f} ({valid_count}) [responses_identical: {identical_n}]"
+                    )
     lines.extend(["", "[Run]", f"finished_at={finished_at}"])
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -273,8 +287,6 @@ def parse_probability_from_response(response_str: str) -> float | None:
         value = float(raw)
     except ValueError:
         return None
-    if value > 1:
-        value /= 100.0
     if value < 0 or value > 1:
         return None
     return value
@@ -408,7 +420,6 @@ def _absolute_prob_positions(
     if not _is_expected_or_plus_one(len(rel_positions), expected_probability_tokens):
         return []
     rel_positions = rel_positions[:expected_probability_tokens]
-    logging.info(f"Got to here: {rel_positions}")
     return [prompt_len + pos for pos in rel_positions]
 
 
@@ -507,7 +518,7 @@ def _absolute_probability_value_autoregressive_positions(
     current_rel = len(decoded_tokens)
     if current_rel < probability_value_start_rel:
         return []
-    return [prompt_len + k for k in range(probability_value_start_rel, current_rel)]
+    return [prompt_len + k for k in range(probability_value_start_rel, current_rel+1)]
 
 
 def _generation_contains_stop(decoded_completion: str) -> bool:
@@ -549,6 +560,9 @@ def greedy_generate(
     eos_id = model.tokenizer.eos_token_id
     with torch.inference_mode():
         for _ in range(max_new_tokens):
+            if fwd_hooks:
+                logging.info(f"Decoded tokens in non-none ablation mode: {decoded_tokens}")
+                logging.info(f"Prompt shape: {tokens.shape}; decoded tokens length: {len(decoded_tokens)}")
             out = model.run_with_hooks(tokens, return_type="logits", fwd_hooks=fwd_hooks or [])
             logits = out[0] if isinstance(out, tuple) else out
             next_id = int(logits[0, -1].argmax(dim=-1).item())
@@ -571,6 +585,8 @@ def build_subblock_zero_hooks(
 ) -> List[Tuple[str, Callable]]:
     hook_suffix = SUBBLOCK_TO_HOOK[subblock]
     hooks: List[Tuple[str, Callable]] = []
+    logging.info(f"Layer indices: {layer_indices}")
+    logging.info(f"Subblock: {subblock}")
     for layer in layer_indices:
         hook_name = f"blocks.{layer}.{hook_suffix}"
 
@@ -579,6 +595,7 @@ def build_subblock_zero_hooks(
                 # Activation shape: [1, seq_len, hidden_dim]
                 del hook
                 positions = positions_provider()
+                logging.info(f"Ablating a layer in subblock {subblock} at token positions: {positions}")
                 if not positions:
                     return activation
                 for abs_pos in positions:
@@ -589,7 +606,7 @@ def build_subblock_zero_hooks(
             return hook_fn
 
         hooks.append((hook_name, _make_hook()))
-    logging.info(f"Hooks built for layer indices: {layer_indices} and subblock: {subblock} at token positions: {positions_provider()}")
+    logging.info(f"All hook names: {hooks}")
     return hooks
 
 
@@ -906,13 +923,6 @@ def main() -> None:
             "If false (default), target high-confidence examples."
         ),
     )
-    parser.add_argument(
-        "--mean_from_low_confidence",
-        dest="ablate_low_confidence_samples",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=argparse.SUPPRESS,
-    )
     parser.add_argument("--expected_probability_tokens", type=int, default=6)
     parser.add_argument("--expected_guess_tokens", type=int, default=5)
     parser.add_argument(
@@ -1066,11 +1076,17 @@ def main() -> None:
         Dict[str, Dict[str, Optional[float]]],
         Dict[str, Dict[str, int]],
         Dict[str, Dict[str, Dict[str, object]]],
+        Dict[str, Dict[str, int]],
     ]:
         results = {"train": {}, "validation": {}}
         mini_results = {"train": {}, "validation": {}}
         mode_confidence_values: Dict[str, Dict[str, List[float]]] = {
             mode_name: {subblock: [] for subblock in args.ablate_subblocks} for mode_name in args.ablation_mode
+        }
+        mode_responses_identical_true: Dict[str, Dict[str, int]] = {
+            mode_name: {subblock: 0 for subblock in args.ablate_subblocks}
+            for mode_name in args.ablation_mode
+            if mode_name != "none"
         }
         used_none_cache: Dict[str, Dict[str, Dict[str, object]]] = {"train": {}, "validation": {}}
 
@@ -1121,6 +1137,7 @@ def main() -> None:
                         }
 
                 for mode in args.ablation_mode:
+                    logging.info(f"Running ablation mode: {mode}")
                     key = mode_to_output_key(mode)
                     entry[key] = {}
                     mini_entry[key] = {}
@@ -1164,6 +1181,8 @@ def main() -> None:
                             responses_identical = response == baseline_response
                             entry[key][subblock]["responses_identical"] = responses_identical
                             mini_entry[key][subblock]["responses_identical"] = responses_identical
+                            if responses_identical:
+                                mode_responses_identical_true[mode][subblock] += 1
                             if args.parse_mode_verbalised_confidence:
                                 if mode_confidence is None or baseline_mode_confidence is None:
                                     meets_none_confidence_direction = None
@@ -1197,7 +1216,14 @@ def main() -> None:
                 vals = mode_confidence_values[mode_name][subblock]
                 mode_confidence_means[mode_name][subblock] = float(np.mean(vals)) if vals else None
                 mode_confidence_counts[mode_name][subblock] = len(vals)
-        return results, mini_results, mode_confidence_means, mode_confidence_counts, used_none_cache
+        return (
+            results,
+            mini_results,
+            mode_confidence_means,
+            mode_confidence_counts,
+            used_none_cache,
+            mode_responses_identical_true,
+        )
 
     def build_none_cache() -> Dict[str, Dict[str, Dict[str, object]]]:
         none_cache: Dict[str, Dict[str, Dict[str, object]]] = {"train": {}, "validation": {}}
@@ -1231,9 +1257,14 @@ def main() -> None:
         return none_cache
 
     if not args.individual_layers:
-        results, mini_results, mode_confidence_means, mode_confidence_counts, _ = run_one_evaluation(
-            run_layers, cached_none=None
-        )
+        (
+            results,
+            mini_results,
+            mode_confidence_means,
+            mode_confidence_counts,
+            _,
+            mode_responses_identical_true,
+        ) = run_one_evaluation(run_layers, cached_none=None)
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
         mini_out_path = mini_output_json_path(out_path)
@@ -1254,6 +1285,7 @@ def main() -> None:
             ablate_low_confidence_samples=args.ablate_low_confidence_samples,
             mode_confidence_means=mode_confidence_means,
             mode_confidence_counts=mode_confidence_counts,
+            mode_responses_identical_true=mode_responses_identical_true,
             finished_at=datetime.now().astimezone().isoformat(timespec="seconds"),
         )
         logging.info("Wrote %s", out_path)
@@ -1273,9 +1305,14 @@ def main() -> None:
         logging.info("Running individual-layer ablation for layer %d", layer_idx)
         layer_dir = os.path.join(individual_root, str(layer_idx))
         os.makedirs(layer_dir, exist_ok=True)
-        results, mini_results, mode_confidence_means, mode_confidence_counts, _ = run_one_evaluation(
-            [layer_idx], cached_none=cached_none
-        )
+        (
+            results,
+            mini_results,
+            mode_confidence_means,
+            mode_confidence_counts,
+            _,
+            mode_responses_identical_true,
+        ) = run_one_evaluation([layer_idx], cached_none=cached_none)
         per_layer_mode_means[layer_idx] = mode_confidence_means
 
         layer_out_path = os.path.join(layer_dir, "ablation_results.json")
@@ -1298,6 +1335,7 @@ def main() -> None:
             ablate_low_confidence_samples=args.ablate_low_confidence_samples,
             mode_confidence_means=mode_confidence_means,
             mode_confidence_counts=mode_confidence_counts,
+            mode_responses_identical_true=mode_responses_identical_true,
             finished_at=datetime.now().astimezone().isoformat(timespec="seconds"),
         )
         logging.info("Wrote %s", layer_out_path)

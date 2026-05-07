@@ -25,6 +25,7 @@ from datetime import datetime
 import json
 import logging
 import os
+import pickle
 import random
 import re
 from pathlib import Path
@@ -98,6 +99,16 @@ def parse_guess_and_probability_indices(decoded_tokens: List[str]) -> tuple[int,
     return (last_guess_token_index, first_prob_token_index, end_prob_token_index)
 
 
+def parse_guess_start_index(decoded_tokens: List[str]) -> Optional[int]:
+    full_str = "".join(decoded_tokens)
+    if not full_str.startswith(GUESS_PREFIX):
+        return None
+    last_guess_token_index = _token_index_for_char_offset(decoded_tokens, len(GUESS_PREFIX) - 1) + 1
+    if last_guess_token_index <= 0 or last_guess_token_index > len(decoded_tokens):
+        return None
+    return last_guess_token_index
+
+
 def load_trivia_qa(seed: int) -> Tuple[Dataset, Dataset]:
     raw = load_dataset("TimoImhof/TriviaQA-in-SQuAD-format")["unmodified"]
     split = raw.train_test_split(test_size=0.2, seed=seed)
@@ -161,8 +172,14 @@ def config_txt_path(full_output_path: str) -> str:
 def mode_to_output_key(mode: str) -> str:
     if mode == "none":
         return "no_replacement"
-    if mode == "probability_tokens_mean_replace":
-        return "probability_tokens_mean_replace"
+    if mode in {
+        "probability_tokens_mean_replace",
+        "all_pre_probability_tokens_mean_replace",
+        "guess_tokens_mean_replace",
+        "all_pre_guess_tokens_mean_replace",
+        "guess_then_guess_probability_zero_ablate",
+    }:
+        return mode
     raise ValueError(f"Unknown mode: {mode}")
 
 
@@ -191,8 +208,6 @@ def parse_probability_from_response(response_str: str) -> float | None:
         value = float(raw)
     except ValueError:
         return None
-    if value > 1:
-        value /= 100.0
     if value < 0 or value > 1:
         return None
     return value
@@ -242,7 +257,7 @@ def write_config_txt(
         f"ablation_mode={args.ablation_mode}",
         f"ablation_targets={args.ablation_targets}",
         f"alpha={args.alpha}",
-        "probability_tokens_mean_replace_behavior=additive_direction_perturbation",
+        "non_none_mode_behavior=additive_direction_perturbation",
         "direction_definition=high_mean_minus_low_mean",
         "confidence_direction_expectation_for_low_targets=perturbed_confidence_gt_none",
         "confidence_direction_expectation_for_high_targets=perturbed_confidence_lt_none",
@@ -250,6 +265,7 @@ def write_config_txt(
         f"ablate_layers_resolved={','.join(str(layer) for layer in ablate_layers)}",
         f"num_ablated_layers={len(ablate_layers)}",
         f"expected_probability_tokens={args.expected_probability_tokens}",
+        f"expected_guess_tokens={args.expected_guess_tokens}",
         f"parse_mode_verbalised_confidence={args.parse_mode_verbalised_confidence}",
         f"low_conf_threshold={args.low_conf_threshold}",
         f"high_conf_threshold={args.high_conf_threshold}",
@@ -387,6 +403,68 @@ def _absolute_prob_positions(
     return [prompt_len + pos for pos in rel_positions]
 
 
+def _absolute_guess_span_positions(
+    prompt_len: int,
+    decoded_tokens: List[str],
+    *,
+    expected_guess_tokens: int,
+) -> List[int]:
+    last_guess_token_index = parse_guess_start_index(decoded_tokens)
+    if last_guess_token_index is None:
+        return []
+    guess_positions_rel = list(range(0, last_guess_token_index))
+    if not _is_expected_or_plus_one(len(guess_positions_rel), expected_guess_tokens):
+        return []
+    guess_positions_rel = guess_positions_rel[:expected_guess_tokens]
+    return [prompt_len + k for k in guess_positions_rel]
+
+
+def _absolute_pre_probability_positions(
+    prompt_len: int,
+    decoded_tokens: List[str],
+    *,
+    expected_guess_tokens: int,
+    expected_probability_tokens: int,
+) -> Optional[Dict[str, List[int]]]:
+    parsed = parse_guess_and_probability_indices(decoded_tokens)
+    if parsed is None:
+        return None
+    last_guess_token_index, first_prob_token_index, end_prob_token_index = parsed
+
+    guess_positions_rel = list(range(0, last_guess_token_index))
+    if not _is_expected_or_plus_one(len(guess_positions_rel), expected_guess_tokens):
+        return None
+    guess_positions_rel = guess_positions_rel[:expected_guess_tokens]
+
+    probability_positions_rel = list(range(first_prob_token_index, end_prob_token_index))
+    if not _is_expected_or_plus_one(len(probability_positions_rel), expected_probability_tokens):
+        return None
+    probability_positions_rel = probability_positions_rel[:expected_probability_tokens]
+
+    return {
+        "prompt": list(range(0, prompt_len)),
+        "guess": [prompt_len + k for k in guess_positions_rel],
+        "sem_answer": [prompt_len + k for k in range(last_guess_token_index, first_prob_token_index)],
+        "probability": [prompt_len + k for k in probability_positions_rel],
+    }
+
+
+def _absolute_all_pre_guess_positions(
+    prompt_len: int,
+    decoded_tokens: List[str],
+    *,
+    expected_guess_tokens: int,
+) -> List[int]:
+    guess_positions = _absolute_guess_span_positions(
+        prompt_len,
+        decoded_tokens,
+        expected_guess_tokens=expected_guess_tokens,
+    )
+    if not guess_positions:
+        return []
+    return list(range(0, prompt_len)) + guess_positions
+
+
 def _generation_contains_stop(decoded_completion: str) -> bool:
     return any(s in decoded_completion for s in STOP_SEQUENCES)
 
@@ -439,39 +517,200 @@ def greedy_generate(
     return _postprocess_response_from_full_decode(model, tokens, local_prompt), decoded_tokens
 
 
-def build_direction_perturb_hooks(
-    layer_to_delta: Dict[int, torch.Tensor],
+def _direction_mode_activation_applier_builder(
+    mode: str,
     *,
+    expected_guess_tokens: int,
+    expected_probability_tokens: int,
+) -> Callable[[int, Callable[[], List[str]]], Callable[[torch.Tensor, Dict[str, torch.Tensor]], torch.Tensor]]:
+    def _builder(
+        prompt_len: int,
+        decoded_tokens_provider: Callable[[], List[str]],
+    ) -> Callable[[torch.Tensor, Dict[str, torch.Tensor]], torch.Tensor]:
+        if mode == "probability_tokens_mean_replace":
+            def _apply_probability_tokens_mean_replace(
+                activation: torch.Tensor,
+                layer_delta: Dict[str, torch.Tensor],
+            ) -> torch.Tensor:
+                prob_vecs = layer_delta["probability"].to(activation.dtype)
+                prob_positions = _absolute_prob_positions(
+                    prompt_len,
+                    decoded_tokens_provider(),
+                    expected_probability_tokens=expected_probability_tokens,
+                )
+                if not prob_positions:
+                    return activation
+                if len(prob_positions) != prob_vecs.shape[0]:
+                    raise ValueError(f"Expected {prob_vecs.shape[0]} probability tokens, got {len(prob_positions)}.")
+                for pos_i, abs_pos in enumerate(prob_positions):
+                    if 0 <= abs_pos < activation.shape[1]:
+                        activation[:, abs_pos, :] = activation[:, abs_pos, :] + prob_vecs[pos_i]
+                return activation
+
+            return _apply_probability_tokens_mean_replace
+
+        if mode == "guess_tokens_mean_replace":
+            def _apply_guess_tokens_mean_replace(
+                activation: torch.Tensor,
+                layer_delta: Dict[str, torch.Tensor],
+            ) -> torch.Tensor:
+                guess_vecs = layer_delta["guess"].to(activation.dtype)
+                guess_positions = _absolute_guess_span_positions(
+                    prompt_len,
+                    decoded_tokens_provider(),
+                    expected_guess_tokens=expected_guess_tokens,
+                )
+                if not guess_positions:
+                    return activation
+                if len(guess_positions) != guess_vecs.shape[0]:
+                    raise ValueError(f"Expected {guess_vecs.shape[0]} guess tokens, got {len(guess_positions)}.")
+                for pos_i, abs_pos in enumerate(guess_positions):
+                    if 0 <= abs_pos < activation.shape[1]:
+                        activation[:, abs_pos, :] = activation[:, abs_pos, :] + guess_vecs[pos_i]
+                return activation
+
+            return _apply_guess_tokens_mean_replace
+
+        if mode == "all_pre_probability_tokens_mean_replace":
+            def _apply_all_pre_probability_tokens_mean_replace(
+                activation: torch.Tensor,
+                layer_delta: Dict[str, torch.Tensor],
+            ) -> torch.Tensor:
+                prompt_vec = layer_delta["prompt_mean"].to(activation.dtype)
+                guess_vecs = layer_delta["guess"].to(activation.dtype)
+                sem_answer_vec = layer_delta["sem_answer_mean"].to(activation.dtype)
+                prob_vecs = layer_delta["probability"].to(activation.dtype)
+
+                positions = _absolute_pre_probability_positions(
+                    prompt_len,
+                    decoded_tokens_provider(),
+                    expected_guess_tokens=expected_guess_tokens,
+                    expected_probability_tokens=expected_probability_tokens,
+                )
+                if positions is None:
+                    return activation
+
+                for abs_pos in positions["prompt"]:
+                    if 0 <= abs_pos < activation.shape[1]:
+                        activation[:, abs_pos, :] = activation[:, abs_pos, :] + prompt_vec
+                if len(positions["guess"]) != guess_vecs.shape[0]:
+                    raise ValueError(
+                        f"Expected {guess_vecs.shape[0]} guess tokens, got {len(positions['guess'])}."
+                    )
+                for pos_i, abs_pos in enumerate(positions["guess"]):
+                    if 0 <= abs_pos < activation.shape[1]:
+                        activation[:, abs_pos, :] = activation[:, abs_pos, :] + guess_vecs[pos_i]
+                for abs_pos in positions["sem_answer"]:
+                    if 0 <= abs_pos < activation.shape[1]:
+                        activation[:, abs_pos, :] = activation[:, abs_pos, :] + sem_answer_vec
+                if len(positions["probability"]) != prob_vecs.shape[0]:
+                    raise ValueError(
+                        f"Expected {prob_vecs.shape[0]} probability tokens, got {len(positions['probability'])}."
+                    )
+                for pos_i, abs_pos in enumerate(positions["probability"]):
+                    if 0 <= abs_pos < activation.shape[1]:
+                        activation[:, abs_pos, :] = activation[:, abs_pos, :] + prob_vecs[pos_i]
+                return activation
+
+            return _apply_all_pre_probability_tokens_mean_replace
+
+        if mode == "all_pre_guess_tokens_mean_replace":
+            def _apply_all_pre_guess_tokens_mean_replace(
+                activation: torch.Tensor,
+                layer_delta: Dict[str, torch.Tensor],
+            ) -> torch.Tensor:
+                prompt_vec = layer_delta["prompt_mean"].to(activation.dtype)
+                guess_vecs = layer_delta["guess"].to(activation.dtype)
+
+                all_pre_guess_positions = _absolute_all_pre_guess_positions(
+                    prompt_len,
+                    decoded_tokens_provider(),
+                    expected_guess_tokens=expected_guess_tokens,
+                )
+                if not all_pre_guess_positions:
+                    return activation
+
+                for abs_pos in all_pre_guess_positions[:prompt_len]:
+                    if 0 <= abs_pos < activation.shape[1]:
+                        activation[:, abs_pos, :] = activation[:, abs_pos, :] + prompt_vec
+                guess_positions = all_pre_guess_positions[prompt_len:]
+                if len(guess_positions) != guess_vecs.shape[0]:
+                    raise ValueError(f"Expected {guess_vecs.shape[0]} guess tokens, got {len(guess_positions)}.")
+                for pos_i, abs_pos in enumerate(guess_positions):
+                    if 0 <= abs_pos < activation.shape[1]:
+                        activation[:, abs_pos, :] = activation[:, abs_pos, :] + guess_vecs[pos_i]
+                return activation
+
+            return _apply_all_pre_guess_tokens_mean_replace
+
+        if mode == "guess_then_guess_probability_zero_ablate":
+            def _apply_guess_then_guess_probability_zero_ablate(
+                activation: torch.Tensor,
+                layer_delta: Dict[str, torch.Tensor],
+            ) -> torch.Tensor:
+                guess_vecs = layer_delta["guess"].to(activation.dtype)
+                prob_vecs = layer_delta["probability"].to(activation.dtype)
+
+                guess_positions = _absolute_guess_span_positions(
+                    prompt_len,
+                    decoded_tokens_provider(),
+                    expected_guess_tokens=expected_guess_tokens,
+                )
+                if guess_positions:
+                    if len(guess_positions) != guess_vecs.shape[0]:
+                        raise ValueError(
+                            f"Expected {guess_vecs.shape[0]} guess tokens, got {len(guess_positions)}."
+                        )
+                    for pos_i, abs_pos in enumerate(guess_positions):
+                        if 0 <= abs_pos < activation.shape[1]:
+                            activation[:, abs_pos, :] = activation[:, abs_pos, :] + guess_vecs[pos_i]
+
+                prob_positions = _absolute_prob_positions(
+                    prompt_len,
+                    decoded_tokens_provider(),
+                    expected_probability_tokens=expected_probability_tokens,
+                )
+                if prob_positions:
+                    if len(prob_positions) != prob_vecs.shape[0]:
+                        raise ValueError(
+                            f"Expected {prob_vecs.shape[0]} probability tokens, got {len(prob_positions)}."
+                        )
+                    for pos_i, abs_pos in enumerate(prob_positions):
+                        if 0 <= abs_pos < activation.shape[1]:
+                            activation[:, abs_pos, :] = activation[:, abs_pos, :] + prob_vecs[pos_i]
+                return activation
+
+            return _apply_guess_then_guess_probability_zero_ablate
+
+        raise ValueError(f"Unknown ablation mode for perturb hooks: {mode!r}")
+
+    return _builder
+
+
+def build_direction_perturb_hooks(
+    layer_to_span_delta: Dict[int, Dict[str, torch.Tensor]],
+    *,
+    mode: str,
     prompt_len: int,
     decoded_tokens_provider: Callable[[], List[str]],
+    expected_guess_tokens: int,
     expected_probability_tokens: int,
 ) -> List[Tuple[str, Callable]]:
-    num_prob_tokens = next(iter(layer_to_delta.values())).shape[0]
     hooks: List[Tuple[str, Callable]] = []
-    logging.info(f"Layer to delta: {layer_to_delta}")
-    for layer in layer_to_delta:
+    activation_applier_builder = _direction_mode_activation_applier_builder(
+        mode,
+        expected_guess_tokens=expected_guess_tokens,
+        expected_probability_tokens=expected_probability_tokens,
+    )
+    activation_applier = activation_applier_builder(prompt_len, decoded_tokens_provider)
+    for layer in layer_to_span_delta:
         hook_name = f"blocks.{layer}.hook_resid_post"
 
         def _make_hook(layer_idx: int):
             def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
                 del hook
-                logging.info(f"Decoded tokens: {decoded_tokens_provider()}")
-                abs_positions = _absolute_prob_positions(
-                    prompt_len,
-                    decoded_tokens_provider(),
-                    expected_probability_tokens=expected_probability_tokens,
-                )
-                logging.info(f"Abs positions: {abs_positions}, num_prob_tokens: {num_prob_tokens}")
-                if not abs_positions:
-                    return activation
-                if len(abs_positions) != num_prob_tokens:
-                    return activation
-                delta = layer_to_delta[layer_idx].to(activation.dtype)
-                logging.info(f"Delta: {delta.shape}")
-                for pos_i, abs_pos in enumerate(abs_positions):
-                    if 0 <= abs_pos < activation.shape[1]:
-                        activation[:, abs_pos, :] = activation[:, abs_pos, :] + delta[pos_i]
-                return activation
+                layer_delta = layer_to_span_delta[layer_idx]
+                return activation_applier(activation, layer_delta)
 
             return hook_fn
 
@@ -484,7 +723,9 @@ def greedy_generate_direction_perturbed(
     local_prompt: str,
     max_new_tokens: int,
     *,
-    layer_to_delta: Dict[int, torch.Tensor],
+    layer_to_span_delta: Dict[int, Dict[str, torch.Tensor]],
+    mode: str,
+    expected_guess_tokens: int,
     expected_probability_tokens: int,
 ) -> Tuple[str, List[str]]:
     tokens = model.to_tokens(local_prompt)
@@ -496,9 +737,11 @@ def greedy_generate_direction_perturbed(
         return decoded_tokens
 
     hooks = build_direction_perturb_hooks(
-        layer_to_delta=layer_to_delta,
+        layer_to_span_delta=layer_to_span_delta,
+        mode=mode,
         prompt_len=prompt_len,
         decoded_tokens_provider=_decoded_tokens_provider,
+        expected_guess_tokens=expected_guess_tokens,
         expected_probability_tokens=expected_probability_tokens,
     )
     with torch.inference_mode():
@@ -517,18 +760,30 @@ def greedy_generate_direction_perturbed(
     return _postprocess_response_from_full_decode(model, tokens, local_prompt), decoded_tokens
 
 
-def compute_low_high_probability_means_and_direction(
+def compute_low_high_span_means_and_directions(
     examples_h5: Dict[str, dict],
     ablate_layers: Sequence[int],
     *,
     low_conf_threshold: float,
     high_conf_threshold: float,
     expected_probability_tokens: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, set[str], set[str]]:
-    low_vectors: List[np.ndarray] = []
-    high_vectors: List[np.ndarray] = []
+    expected_guess_tokens: int,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray], set[str], set[str]]:
+    low_vectors: Dict[str, List[np.ndarray]] = {
+        "prompt_mean": [],
+        "guess": [],
+        "sem_answer_mean": [],
+        "probability": [],
+    }
+    high_vectors: Dict[str, List[np.ndarray]] = {
+        "prompt_mean": [],
+        "guess": [],
+        "sem_answer_mean": [],
+        "probability": [],
+    }
     low_ids: set[str] = set()
     high_ids: set[str] = set()
+    layer_indices = np.asarray(ablate_layers)
 
     for ex_id, ex_obj in examples_h5.items():
         responses = ex_obj.get("responses")
@@ -548,7 +803,23 @@ def compute_low_high_probability_means_and_direction(
         if not (is_low or is_high):
             continue
 
+        emb_prompt = resp0.get("embeddings_mean_prompt")
+        emb_guess = resp0.get("embeddings_guess")
+        emb_sem_answer = resp0.get("embeddings_mean_sem_answer")
         emb_prob = resp0.get("embeddings_probability")
+        if emb_prompt is None or emb_guess is None or emb_sem_answer is None or emb_prob is None:
+            raise ValueError(
+                f"Example {ex_id} is missing one of required fields: "
+                "embeddings_mean_prompt, embeddings_guess, embeddings_mean_sem_answer, embeddings_probability."
+            )
+        if not isinstance(emb_guess, list):
+            raise ValueError(f"Example {ex_id} responses/0/embeddings_guess must be a list.")
+        if not _is_expected_or_plus_one(len(emb_guess), expected_guess_tokens):
+            raise ValueError(
+                f"Example {ex_id} embeddings_guess len={len(emb_guess)}; "
+                f"expected {expected_guess_tokens} or {expected_guess_tokens + 1}."
+            )
+        emb_guess = emb_guess[:expected_guess_tokens]
         if not isinstance(emb_prob, list):
             raise ValueError(f"Example {ex_id} responses/0/embeddings_probability must be a list.")
         if not _is_expected_or_plus_one(len(emb_prob), expected_probability_tokens):
@@ -558,26 +829,61 @@ def compute_low_high_probability_means_and_direction(
             )
         emb_prob = emb_prob[:expected_probability_tokens]
 
-        token_vectors: List[np.ndarray] = []
-        for tok_arr in emb_prob[:-1]:
-            layer_hidden = _as_layer_hidden(tok_arr)
-            selected = layer_hidden[np.asarray(ablate_layers), :]
-            token_vectors.append(selected)
-        stacked = np.stack(token_vectors, axis=1)
+        prompt_selected = _as_layer_hidden(emb_prompt)[layer_indices, :]
+        sem_answer_selected = _as_layer_hidden(emb_sem_answer)[layer_indices, :]
+        guess_selected = np.stack([_as_layer_hidden(tok_arr)[layer_indices, :] for tok_arr in emb_guess], axis=1)
+        prob_selected = np.stack([_as_layer_hidden(tok_arr)[layer_indices, :] for tok_arr in emb_prob], axis=1)
         if is_low:
-            low_vectors.append(stacked)
+            low_vectors["prompt_mean"].append(prompt_selected)
+            low_vectors["guess"].append(guess_selected)
+            low_vectors["sem_answer_mean"].append(sem_answer_selected)
+            low_vectors["probability"].append(prob_selected)
         if is_high:
-            high_vectors.append(stacked)
+            high_vectors["prompt_mean"].append(prompt_selected)
+            high_vectors["guess"].append(guess_selected)
+            high_vectors["sem_answer_mean"].append(sem_answer_selected)
+            high_vectors["probability"].append(prob_selected)
 
-    if not low_vectors:
+    if not low_vectors["probability"]:
         raise ValueError(f"No low-confidence examples found at threshold <= {low_conf_threshold}.")
-    if not high_vectors:
+    if not high_vectors["probability"]:
         raise ValueError(f"No high-confidence examples found at threshold >= {high_conf_threshold}.")
 
-    mean_low = np.mean(np.stack(low_vectors, axis=0), axis=0).astype(np.float32)
-    mean_high = np.mean(np.stack(high_vectors, axis=0), axis=0).astype(np.float32)
-    direction = (mean_high - mean_low).astype(np.float32)
+    mean_low: Dict[str, np.ndarray] = {}
+    mean_high: Dict[str, np.ndarray] = {}
+    direction: Dict[str, np.ndarray] = {}
+    for key in ("prompt_mean", "guess", "sem_answer_mean", "probability"):
+        mean_low[key] = np.mean(np.stack(low_vectors[key], axis=0), axis=0).astype(np.float32)
+        mean_high[key] = np.mean(np.stack(high_vectors[key], axis=0), axis=0).astype(np.float32)
+        direction[key] = (mean_high[key] - mean_low[key]).astype(np.float32)
     return mean_low, mean_high, direction, low_ids, high_ids
+
+
+def write_layer_direction_pickles(
+    *,
+    output_json_path: str,
+    ablate_layers: Sequence[int],
+    direction_by_span: Dict[str, np.ndarray],
+    expected_guess_tokens: int,
+    expected_probability_tokens: int,
+) -> None:
+    out_dir = os.path.dirname(output_json_path)
+    for layer_i, layer_idx in enumerate(ablate_layers):
+        payload = {
+            "layer_idx": int(layer_idx),
+            "expected_guess_tokens": int(expected_guess_tokens),
+            "expected_probability_tokens": int(expected_probability_tokens),
+            "prompt_mean_direction": direction_by_span["prompt_mean"][layer_i],
+            "guess_prefix_directions": [direction_by_span["guess"][layer_i, tok_i] for tok_i in range(expected_guess_tokens)],
+            "semantic_answer_mean_direction": direction_by_span["sem_answer_mean"][layer_i],
+            "probability_prefix_directions": [
+                direction_by_span["probability"][layer_i, tok_i] for tok_i in range(expected_probability_tokens)
+            ],
+        }
+        pickle_path = os.path.join(out_dir, f"layer_{layer_idx}_directions.pkl")
+        with open(pickle_path, "wb") as f:
+            pickle.dump(payload, f)
+        logging.info("Wrote %s", pickle_path)
 
 
 def _dedupe_preserve_order(items: Sequence[str]) -> List[str]:
@@ -615,16 +921,30 @@ def main() -> None:
         "--ablation_mode",
         type=str,
         nargs="+",
-        default=["none", "probability_tokens_mean_replace"],
-        choices=["none", "probability_tokens_mean_replace"],
-        help="Only baseline none and probability_tokens_mean_replace are supported in this script.",
+        default=[
+            "none",
+            "probability_tokens_mean_replace",
+            "all_pre_probability_tokens_mean_replace",
+            "guess_tokens_mean_replace",
+            "all_pre_guess_tokens_mean_replace",
+            "guess_then_guess_probability_zero_ablate",
+        ],
+        choices=[
+            "none",
+            "probability_tokens_mean_replace",
+            "all_pre_probability_tokens_mean_replace",
+            "guess_tokens_mean_replace",
+            "all_pre_guess_tokens_mean_replace",
+            "guess_then_guess_probability_zero_ablate",
+        ],
+        help="Ablation mode(s) to run. Includes additional dynamic span perturbation modes.",
     )
     parser.add_argument(
         "--alpha",
         type=float,
         nargs="+",
         required=True,
-        help="One or more alpha values in [0, 1].",
+        help="One or more real-valued alpha scale factors (perturbation strength along the direction).",
     )
     parser.add_argument(
         "--ablation_targets",
@@ -637,6 +957,7 @@ def main() -> None:
     parser.add_argument("--low_conf_threshold", type=float, default=0.1)
     parser.add_argument("--high_conf_threshold", type=float, default=0.9)
     parser.add_argument("--expected_probability_tokens", type=int, default=6)
+    parser.add_argument("--expected_guess_tokens", type=int, default=5)
     parser.add_argument(
         "--parse_mode_verbalised_confidence",
         action=argparse.BooleanOptionalAction,
@@ -658,14 +979,16 @@ def main() -> None:
         raise ValueError(f"Duplicate ablation modes are not allowed: {args.ablation_mode}")
     if "none" not in args.ablation_mode:
         raise ValueError("Please include 'none' in --ablation_mode for baseline comparisons.")
-    if "probability_tokens_mean_replace" not in args.ablation_mode:
-        raise ValueError("Please include 'probability_tokens_mean_replace' in --ablation_mode.")
-    for alpha in args.alpha:
-        if alpha < 0.0 or alpha > 1.0:
-            raise ValueError(f"Alpha must be in [0, 1], got {alpha}.")
     args.ablation_targets = _dedupe_preserve_order(args.ablation_targets)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    alphas_outside_unit = [a for a in args.alpha if a < 0.0 or a > 1.0]
+    if alphas_outside_unit:
+        logging.warning(
+            "Alpha values outside [0, 1] will be used as-is: %s",
+            alphas_outside_unit,
+        )
 
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     torch_dtype = dtype_map[args.dtype]
@@ -693,16 +1016,17 @@ def main() -> None:
     ablate_layers = parse_ablate_layers(args.ablate_layers, model.cfg.n_layers)
 
     examples_h5 = load_examples_h5(Path(args.input_h5))
-    mean_low, mean_high, direction, low_ids, high_ids = compute_low_high_probability_means_and_direction(
+    mean_low, mean_high, direction, low_ids, high_ids = compute_low_high_span_means_and_directions(
         examples_h5,
         ablate_layers,
         low_conf_threshold=args.low_conf_threshold,
         high_conf_threshold=args.high_conf_threshold,
         expected_probability_tokens=args.expected_probability_tokens,
+        expected_guess_tokens=args.expected_guess_tokens,
     )
     del mean_low, mean_high
 
-    direction_flat_head = np.ravel(direction)[:5].tolist()
+    direction_flat_head = np.ravel(direction["probability"])[:5].tolist()
     logging.info(
         "Loaded %d H5 examples. low_conf=%d (<=%.3f), high_conf=%d (>=%.3f), layers=%s, "
         "direction.shape=%s direction.flat[:5]=%s alphas=%s",
@@ -712,7 +1036,7 @@ def main() -> None:
         len(high_ids),
         args.high_conf_threshold,
         ablate_layers,
-        direction.shape,
+        direction["probability"].shape,
         direction_flat_head,
         list(args.alpha),
     )
@@ -722,10 +1046,12 @@ def main() -> None:
     results = {"train": {}, "validation": {}}
     mini_results = {"train": {}, "validation": {}}
     mode_confidence_values: Dict[str, List[float]] = {"no_replacement": []}
-    for target in args.ablation_targets:
-        for alpha in args.alpha:
-            key = f"probability_tokens_mean_replace__target_{target}__alpha_{_format_alpha(alpha)}"
-            mode_confidence_values[key] = []
+    non_none_modes = [m for m in args.ablation_mode if m != "none"]
+    for mode in non_none_modes:
+        for target in args.ablation_targets:
+            for alpha in args.alpha:
+                key = f"{mode_to_output_key(mode)}__target_{target}__alpha_{_format_alpha(alpha)}"
+                mode_confidence_values[key] = []
 
     for split_name, eval_ds in [("train", train_ds), ("validation", val_ds)]:
         split_target = round(args.num_samples * TRAIN_RATIO) if split_name == "train" else round(args.num_samples * (1 - TRAIN_RATIO))
@@ -782,44 +1108,58 @@ def main() -> None:
                 if target == "high" and not ex_is_high:
                     continue
                 sign = 1.0 if target == "low" else -1.0
-                for alpha in args.alpha:
-                    layer_to_delta: Dict[int, torch.Tensor] = {}
-                    for layer_i, layer_idx in enumerate(ablate_layers):
-                        layer_to_delta[layer_idx] = torch.tensor(
-                            sign * alpha * direction[layer_i], device=device, dtype=torch_dtype
+                for mode in non_none_modes:
+                    for alpha in args.alpha:
+                        layer_to_span_delta: Dict[int, Dict[str, torch.Tensor]] = {}
+                        for layer_i, layer_idx in enumerate(ablate_layers):
+                            layer_to_span_delta[layer_idx] = {
+                                "prompt_mean": torch.tensor(
+                                    sign * alpha * direction["prompt_mean"][layer_i], device=device, dtype=torch_dtype
+                                ),
+                                "guess": torch.tensor(
+                                    sign * alpha * direction["guess"][layer_i], device=device, dtype=torch_dtype
+                                ),
+                                "sem_answer_mean": torch.tensor(
+                                    sign * alpha * direction["sem_answer_mean"][layer_i], device=device, dtype=torch_dtype
+                                ),
+                                "probability": torch.tensor(
+                                    sign * alpha * direction["probability"][layer_i], device=device, dtype=torch_dtype
+                                ),
+                            }
+                        response, decoded_tokens = greedy_generate_direction_perturbed(
+                            model=model,
+                            local_prompt=local_prompt,
+                            max_new_tokens=args.model_max_new_tokens,
+                            layer_to_span_delta=layer_to_span_delta,
+                            mode=mode,
+                            expected_guess_tokens=args.expected_guess_tokens,
+                            expected_probability_tokens=args.expected_probability_tokens,
                         )
-                    response, decoded_tokens = greedy_generate_direction_perturbed(
-                        model=model,
-                        local_prompt=local_prompt,
-                        max_new_tokens=args.model_max_new_tokens,
-                        layer_to_delta=layer_to_delta,
-                        expected_probability_tokens=args.expected_probability_tokens,
-                    )
-                    mode_confidence = (
-                        parse_mode_confidence_from_response(response)
-                        if args.parse_mode_verbalised_confidence
-                        else None
-                    )
+                        mode_confidence = (
+                            parse_mode_confidence_from_response(response)
+                            if args.parse_mode_verbalised_confidence
+                            else None
+                        )
 
-                    key = f"probability_tokens_mean_replace__target_{target}__alpha_{_format_alpha(alpha)}"
-                    entry[key] = {"response": response, "decoded_tokens": decoded_tokens}
-                    mini_entry[key] = {"response": response}
-                    responses_identical = response == baseline_response
-                    entry[key]["responses_identical"] = responses_identical
-                    mini_entry[key]["responses_identical"] = responses_identical
-                    if args.parse_mode_verbalised_confidence:
-                        entry[key]["verbalised_confidence"] = mode_confidence
-                        mini_entry[key]["verbalised_confidence"] = mode_confidence
-                        if mode_confidence is not None:
-                            mode_confidence_values[key].append(float(mode_confidence))
-                        if mode_confidence is None or baseline_confidence is None:
-                            meets_none_confidence_direction = None
-                        elif target == "low":
-                            meets_none_confidence_direction = mode_confidence > baseline_confidence
-                        else:
-                            meets_none_confidence_direction = mode_confidence < baseline_confidence
-                        entry[key]["meets_none_confidence_direction"] = meets_none_confidence_direction
-                        mini_entry[key]["meets_none_confidence_direction"] = meets_none_confidence_direction
+                        key = f"{mode_to_output_key(mode)}__target_{target}__alpha_{_format_alpha(alpha)}"
+                        entry[key] = {"response": response, "decoded_tokens": decoded_tokens}
+                        mini_entry[key] = {"response": response}
+                        responses_identical = response == baseline_response
+                        entry[key]["responses_identical"] = responses_identical
+                        mini_entry[key]["responses_identical"] = responses_identical
+                        if args.parse_mode_verbalised_confidence:
+                            entry[key]["verbalised_confidence"] = mode_confidence
+                            mini_entry[key]["verbalised_confidence"] = mode_confidence
+                            if mode_confidence is not None:
+                                mode_confidence_values[key].append(float(mode_confidence))
+                            if mode_confidence is None or baseline_confidence is None:
+                                meets_none_confidence_direction = None
+                            elif target == "low":
+                                meets_none_confidence_direction = mode_confidence > baseline_confidence
+                            else:
+                                meets_none_confidence_direction = mode_confidence < baseline_confidence
+                            entry[key]["meets_none_confidence_direction"] = meets_none_confidence_direction
+                            mini_entry[key]["meets_none_confidence_direction"] = meets_none_confidence_direction
 
             results[split_name][ex_id] = entry
             mini_results[split_name][ex_id] = mini_entry
@@ -836,6 +1176,13 @@ def main() -> None:
     mini_out_path = mini_output_json_path(out_path)
     with open(mini_out_path, "w", encoding="utf-8") as f:
         json.dump(mini_results, f, ensure_ascii=False, indent=2)
+    write_layer_direction_pickles(
+        output_json_path=out_path,
+        ablate_layers=ablate_layers,
+        direction_by_span=direction,
+        expected_guess_tokens=args.expected_guess_tokens,
+        expected_probability_tokens=args.expected_probability_tokens,
+    )
     config_out_path = config_txt_path(out_path)
     write_config_txt(
         config_out_path,

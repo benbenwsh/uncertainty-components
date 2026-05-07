@@ -449,7 +449,13 @@ def write_config_txt(run_dir: Path, args, input_path: Path, out_base: str, outpu
     return config_path
 
 
+def append_total_duration_to_config(config_path: Path, total_duration_seconds: float) -> None:
+    with open(config_path, "a", encoding="utf-8") as config_file:
+        config_file.write(f"total_duration_seconds: {total_duration_seconds:.2f}\n")
+
+
 def main():
+    total_start = time.perf_counter()
     parser = argparse.ArgumentParser(
         description="Process HDF5 generations into verbalised-confidence embedding HDF5."
     )
@@ -580,6 +586,9 @@ def main():
     with open(samples_txt_path, "w", encoding="utf-8") as f:
         f.write(f"{n_ok} samples\n")
     logging.info("Wrote %s", samples_txt_path)
+    total_elapsed = time.perf_counter() - total_start
+    append_total_duration_to_config(config_path, total_elapsed)
+    logging.info("Updated %s with total_duration_seconds=%.2f", config_path, total_elapsed)
 
 
 if __name__ == "__main__":
