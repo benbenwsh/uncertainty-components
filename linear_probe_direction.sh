@@ -20,11 +20,13 @@ uptime
 # Match --expected_probability_tokens to the number of tok_n_probability directories under --probe_dir.
 
 python3 ./linear_probe_direction/run_linear_probe_direction.py \
-  --input_h5 ./process_generations/processed_generations_more_h5/2/train_verbalised_embeddings.h5 \
+  --input_h5 ./process_generations/processed_generations_more_h5/2_200_train_temp_0/train_verbalised_embeddings.h5 \
   --probe_dir ./verbalised_confidence_probes/results/mult_toks_all_layers/7_200 \
   --num_samples 200 \
   --device cuda:0 \
   --ablation_mode none probability_tokens_mean_replace \
   --ablate_layers 10-16 \
-  --alpha 0 0.25 0.5 0.75 1.0 \
-  --ablation_targets low high
+  --alpha -1 -0.5 0.0 0.25 0.5 0.75 1.0 1.5 2.0 \
+  --ablation_targets low high \
+  --no-enable_brief \
+  --normalize_span_directions

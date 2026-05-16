@@ -182,13 +182,22 @@ class HuggingfaceModel(BaseModel):
                     model_id, device_map='auto', use_fast=False, token_type_ids=None,
                     clean_up_tokenization_spaces=False, cache_dir=HF_CACHE_DIR)
 
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                device_map='auto',
-                max_memory={0: '80GIB'},
-                cache_dir=HF_CACHE_DIR,
-                **kwargs,
-            )
+            if kwargs:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_id,
+                    device_map='auto',
+                    max_memory={0: '80GIB'},
+                    cache_dir=HF_CACHE_DIR,
+                    **kwargs,
+                )
+            else:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_id,
+                    device_map='auto',
+                    max_memory={0: '80GIB'},
+                    cache_dir=HF_CACHE_DIR,
+                    torch_dtype=torch.float32,
+                )
 
         elif 'falcon' in model_name:
             model_id = f'tiiuae/{model_name}'

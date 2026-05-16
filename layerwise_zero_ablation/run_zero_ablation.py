@@ -70,7 +70,7 @@ def parse_guess_and_probability_indices(
 
     last_guess_token_index: token after "Guess:" (first token of answer)
     first_prob_token_index: "\n" token before "Probability:"
-    end_prob_token_index: token after "Probability:\s" (first token of prob value)
+    end_prob_token_index: token after ``Probability:`` + whitespace (first token of prob value)
 
     Returns (last_guess_token_index, first_prob_token_index, end_prob_token_index)
     or None on failure.
@@ -336,6 +336,11 @@ def parse_ablate_layers(spec: str, n_layers: int) -> List[int]:
     return layers
 
 
+def _completion_token_index_to_abs_pos(prompt_len: int, completion_index: int) -> int:
+    """Map completion-relative token index (0 = first generated token) to full-sequence position."""
+    return prompt_len + completion_index - 1
+
+
 def _absolute_prob_positions(
     prompt_len: int,
     decoded_tokens: List[str],
@@ -349,8 +354,8 @@ def _absolute_prob_positions(
     seq_len = prompt_len + len(decoded_tokens)
     out = []
     for k in range(first_prob, end_prob):
-        p = prompt_len + k
-        if p < seq_len:
+        p = _completion_token_index_to_abs_pos(prompt_len, k)
+        if 0 <= p < seq_len:
             out.append(p)
     return out
 
@@ -375,9 +380,9 @@ def build_resid_post_hooks(
         dt = decoded_tokens_provider()
         abs_prob_positions = _absolute_prob_positions(prompt_len, dt)
         prob_tokens = [
-            dt[p - prompt_len]
+            dt[p - prompt_len + 1]
             for p in abs_prob_positions
-            if 0 <= (p - prompt_len) < len(dt)
+            if 0 <= p - prompt_len + 1 < len(dt)
         ]
         print(f"Decoded tokens at abs probability positions: {prob_tokens}")
 
@@ -533,7 +538,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Layerwise zero ablation inference (TransformerLens).")
     parser.add_argument("--model_name", type=str, default="mistralai/Mistral-7B-Instruct-v0.1")
     parser.add_argument("--device", type=str, default=None, help="e.g. cuda, cuda:0, cpu")
-    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    parser.add_argument("--dtype", type=str, default="float32", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--random_seed", type=int, default=10)
     parser.add_argument("--num_samples", type=int, default=400)
     parser.add_argument("--num_few_shot", type=int, default=0)

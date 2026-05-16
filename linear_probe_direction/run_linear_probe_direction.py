@@ -240,6 +240,7 @@ def write_config_txt(
         f"ablate_layers_resolved={','.join(str(layer) for layer in ablate_layers)}",
         f"num_ablated_layers={len(ablate_layers)}",
         f"expected_probability_tokens={args.expected_probability_tokens}",
+        f"normalize_span_directions={args.normalize_span_directions}",
         f"parse_mode_verbalised_confidence={args.parse_mode_verbalised_confidence}",
         f"low_conf_threshold={args.low_conf_threshold}",
         f"high_conf_threshold={args.high_conf_threshold}",
@@ -347,6 +348,15 @@ def parse_ablate_layers(spec: str, n_layers: int) -> List[int]:
     return layers
 
 
+def _completion_token_index_to_abs_pos(prompt_len: int, completion_index: int) -> int:
+    """Map completion-relative token index (0 = first generated token) to full-sequence position.
+
+    First generated token aligns with ``prompt_len - 1`` (same convention as
+    ``layerwise_mean_ablation.run_mean_ablation``).
+    """
+    return prompt_len + completion_index - 1
+
+
 def _absolute_prob_positions(
     prompt_len: int,
     decoded_tokens: List[str],
@@ -360,7 +370,9 @@ def _absolute_prob_positions(
     end_prob = first_prob + expected_probability_tokens
     if end_prob > len(decoded_tokens):
         return []
-    return [prompt_len + pos for pos in range(first_prob, end_prob)]
+    return [
+        _completion_token_index_to_abs_pos(prompt_len, pos) for pos in range(first_prob, end_prob)
+    ]
 
 
 def _generation_contains_stop(decoded_completion: str) -> bool:
@@ -603,6 +615,48 @@ def load_probe_directions(
     return layer_to_direction
 
 
+def normalize_probe_directions_to_unit_norm_budget(
+    probe_directions: Dict[int, np.ndarray],
+    *,
+    ablate_layers: Sequence[int],
+    expected_probability_tokens: int,
+) -> Dict[str, float]:
+    target_sum = float(len(ablate_layers) * expected_probability_tokens)
+
+    sum_before = 0.0
+    for layer_idx in ablate_layers:
+        layer_arr = probe_directions[layer_idx]
+        if layer_arr.ndim != 2 or layer_arr.shape[0] != expected_probability_tokens:
+            raise ValueError(
+                f"Expected probe_directions[{layer_idx}] shape "
+                f"({expected_probability_tokens}, hidden_dim), got {layer_arr.shape}."
+            )
+        sum_before += float(np.sum(np.linalg.norm(layer_arr, axis=-1)))
+
+    if sum_before <= 0.0:
+        logging.warning(
+            "Skipping probe direction normalization because sum of norms is zero."
+        )
+        scale = 1.0
+    else:
+        scale = target_sum / sum_before
+        for layer_idx in ablate_layers:
+            probe_directions[layer_idx] = (
+                probe_directions[layer_idx] * scale
+            ).astype(np.float32, copy=False)
+
+    sum_after = 0.0
+    for layer_idx in ablate_layers:
+        sum_after += float(np.sum(np.linalg.norm(probe_directions[layer_idx], axis=-1)))
+
+    return {
+        "target_sum": target_sum,
+        "sum_before": sum_before,
+        "sum_after": sum_after,
+        "scale": float(scale),
+    }
+
+
 def main() -> None:
     TRAIN_RATIO = 0.9
     parser = argparse.ArgumentParser(
@@ -617,7 +671,7 @@ def main() -> None:
         help="Directory containing tok_n_probability/layer_k/verbalised_confidence_probe.pkl files.",
     )
     parser.add_argument("--device", type=str, default=None, help="e.g. cuda, cuda:0, cpu")
-    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    parser.add_argument("--dtype", type=str, default="float32", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--random_seed", type=int, default=10)
     parser.add_argument("--num_samples", type=int, default=400)
     parser.add_argument("--num_few_shot", type=int, default=0)
@@ -645,7 +699,7 @@ def main() -> None:
         type=float,
         nargs="+",
         required=True,
-        help="One or more alpha values in [0, 1].",
+        help="One or more real-valued alpha scale factors (perturbation strength along the direction).",
     )
     parser.add_argument(
         "--ablation_targets",
@@ -658,6 +712,15 @@ def main() -> None:
     parser.add_argument("--low_conf_threshold", type=float, default=0.1)
     parser.add_argument("--high_conf_threshold", type=float, default=0.9)
     parser.add_argument("--expected_probability_tokens", type=int, default=6)
+    parser.add_argument(
+        "--normalize_span_directions",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If true, normalize probability-span probe directions so the summed per-(layer,token) "
+            "vector norms equals num_ablate_layers * expected_probability_tokens."
+        ),
+    )
     parser.add_argument(
         "--parse_mode_verbalised_confidence",
         action=argparse.BooleanOptionalAction,
@@ -681,12 +744,16 @@ def main() -> None:
         raise ValueError("Please include 'none' in --ablation_mode for baseline comparisons.")
     if "probability_tokens_mean_replace" not in args.ablation_mode:
         raise ValueError("Please include 'probability_tokens_mean_replace' in --ablation_mode.")
-    for alpha in args.alpha:
-        if alpha < 0.0 or alpha > 1.0:
-            raise ValueError(f"Alpha must be in [0, 1], got {alpha}.")
     args.ablation_targets = _dedupe_preserve_order(args.ablation_targets)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    alphas_outside_unit = [a for a in args.alpha if a < 0.0 or a > 1.0]
+    if alphas_outside_unit:
+        logging.warning(
+            "Alpha values outside [0, 1] will be used as-is: %s",
+            alphas_outside_unit,
+        )
 
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     torch_dtype = dtype_map[args.dtype]
@@ -726,6 +793,19 @@ def main() -> None:
         expected_probability_tokens=args.expected_probability_tokens,
         hidden_dim=hidden_dim,
     )
+    if args.normalize_span_directions:
+        normalization_stats = normalize_probe_directions_to_unit_norm_budget(
+            probe_directions,
+            ablate_layers=ablate_layers,
+            expected_probability_tokens=args.expected_probability_tokens,
+        )
+        logging.info(
+            "Normalized probability span directions: before=%.6f after=%.6f target=%.6f scale=%.6f",
+            normalization_stats["sum_before"],
+            normalization_stats["sum_after"],
+            normalization_stats["target_sum"],
+            normalization_stats["scale"],
+        )
 
     logging.info(
         "Loaded %d H5 examples. low_conf=%d (<=%.3f), high_conf=%d (>=%.3f), layers=%s",

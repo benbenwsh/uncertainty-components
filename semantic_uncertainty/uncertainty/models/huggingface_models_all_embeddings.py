@@ -182,13 +182,22 @@ class HuggingfaceModelAllEmbeddings(BaseModel):
                     model_id, device_map='auto', use_fast=False, token_type_ids=None,
                     clean_up_tokenization_spaces=False, cache_dir=HF_CACHE_DIR)
 
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                device_map='auto',
-                max_memory={0: '80GIB'},
-                cache_dir=HF_CACHE_DIR,
-                **kwargs,
-            )
+            if kwargs:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_id,
+                    device_map='auto',
+                    max_memory={0: '80GIB'},
+                    cache_dir=HF_CACHE_DIR,
+                    **kwargs,
+                )
+            else:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_id,
+                    device_map='auto',
+                    max_memory={0: '80GIB'},
+                    cache_dir=HF_CACHE_DIR,
+                    torch_dtype=torch.float32,
+                )
 
         elif 'falcon' in model_name:
             model_id = f'tiiuae/{model_name}'
@@ -237,7 +246,14 @@ class HuggingfaceModelAllEmbeddings(BaseModel):
         self.token_limit = 4096 if 'Llama-2' in model_name else 2048
 
     
-    def predict(self, input_data, temperature, return_full=False, return_latent=False):
+    def predict(
+            self,
+            input_data,
+            temperature,
+            return_full=False,
+            return_latent=False,
+            collect_attn_block_embeddings=False,
+            collect_mlp_block_embeddings=False):
 
         if isinstance(input_data, tuple):
             logging.WARNING("INPUT IS A TUPLE.")
@@ -279,11 +295,65 @@ class HuggingfaceModelAllEmbeddings(BaseModel):
             "set" if stopping_criteria is not None else None
         )
         logging.info("Generation settings: %s", logged_generation_kwargs)
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                **generation_kwargs,
-            )
+
+        attn_layer_outputs = []
+        mlp_layer_outputs = []
+        hook_handles = []
+
+        collect_attn = bool(return_latent and collect_attn_block_embeddings)
+        collect_mlp = bool(return_latent and collect_mlp_block_embeddings)
+        if collect_attn or collect_mlp:
+            layers = getattr(getattr(self.model, "model", None), "layers", None)
+            if layers is None:
+                logging.warning(
+                    "Model does not expose model.layers; skipping attn/mlp block embedding collection."
+                )
+                collect_attn = False
+                collect_mlp = False
+            else:
+                if collect_attn:
+                    attn_layer_outputs = [[] for _ in range(len(layers))]
+                if collect_mlp:
+                    mlp_layer_outputs = [[] for _ in range(len(layers))]
+
+                def _extract_hidden_tensor(module_output):
+                    if isinstance(module_output, (tuple, list)):
+                        if len(module_output) == 0:
+                            return None
+                        return module_output[0]
+                    return module_output
+
+                def _make_attn_hook(layer_idx):
+                    def _hook(_, __, module_output):
+                        tensor = _extract_hidden_tensor(module_output)
+                        if tensor is None:
+                            return
+                        attn_layer_outputs[layer_idx].append(tensor.detach())
+                    return _hook
+
+                def _make_mlp_hook(layer_idx):
+                    def _hook(_, __, module_output):
+                        tensor = _extract_hidden_tensor(module_output)
+                        if tensor is None:
+                            return
+                        mlp_layer_outputs[layer_idx].append(tensor.detach())
+                    return _hook
+
+                for layer_idx, layer in enumerate(layers):
+                    if collect_attn and hasattr(layer, "self_attn"):
+                        hook_handles.append(layer.self_attn.register_forward_hook(_make_attn_hook(layer_idx)))
+                    if collect_mlp and hasattr(layer, "mlp"):
+                        hook_handles.append(layer.mlp.register_forward_hook(_make_mlp_hook(layer_idx)))
+
+        try:
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    **generation_kwargs,
+                )
+        finally:
+            for handle in hook_handles:
+                handle.remove()
 
         if len(outputs.sequences[0]) > self.token_limit:
             raise ValueError(
@@ -396,6 +466,44 @@ class HuggingfaceModelAllEmbeddings(BaseModel):
             last_tok_bef_gen_input = hidden[0]
             emb_tok_bef_gen = torch.stack([layer[:, -1, :] for layer in last_tok_bef_gen_input]).cpu()
 
+            all_attn_embeddings = None
+            all_mlp_embeddings = None
+
+            def _pack_layerwise_outputs(layer_outputs, name):
+                if not layer_outputs:
+                    return None
+                if any(len(per_layer) == 0 for per_layer in layer_outputs):
+                    logging.warning(
+                        "No %s outputs captured for at least one layer; skipping %s collection.",
+                        name, name
+                    )
+                    return None
+
+                min_calls = min(len(per_layer) for per_layer in layer_outputs)
+                expected_calls = len(hidden)
+                if min_calls < expected_calls:
+                    logging.warning(
+                        "Captured %d %s calls but hidden has %d steps. Using %d captured steps.",
+                        min_calls, name, expected_calls, min_calls
+                    )
+                    use_calls = min_calls
+                    start_idx = 0
+                else:
+                    use_calls = expected_calls
+                    start_idx = min_calls - expected_calls
+
+                packed = []
+                for call_idx in range(start_idx, start_idx + use_calls):
+                    packed.append(torch.stack([
+                        per_layer[call_idx].cpu() for per_layer in layer_outputs
+                    ]))
+                return packed
+
+            if collect_attn:
+                all_attn_embeddings = _pack_layerwise_outputs(attn_layer_outputs, "attention")
+            if collect_mlp:
+                all_mlp_embeddings = _pack_layerwise_outputs(mlp_layer_outputs, "mlp")
+
         # Get log_likelihoods.
         transition_scores = self.model.compute_transition_scores(
             outputs.sequences, outputs.scores, normalize_logits=True)
@@ -415,9 +523,15 @@ class HuggingfaceModelAllEmbeddings(BaseModel):
         hidden_states = ()
 
         if return_latent:
-            hidden_states += (emb_sec_last_token, emb_tok_bef_gen, all_embeddings)
+            hidden_states += (
+                emb_sec_last_token,
+                emb_tok_bef_gen,
+                all_embeddings,
+                all_attn_embeddings,
+                all_mlp_embeddings,
+            )
         else:
-            hidden_states += (None, None, None)
+            hidden_states += (None, None, None, None, None)
 
         return_values = (sliced_answer, log_likelihoods, hidden_states, sliced_decoded_tokens)
 

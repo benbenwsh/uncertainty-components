@@ -109,7 +109,7 @@ def parse_guess_and_probability_indices(
 
     last_guess_token_index: token after "Guess:" (first token of answer)
     first_prob_token_index: "\n" token before "Probability:"
-    end_prob_token_index: token after "Probability:\s" (first token of prob value)
+    end_prob_token_index: token after ``Probability:`` + whitespace (first token of prob value)
 
     Returns (last_guess_token_index, first_prob_token_index, end_prob_token_index)
     or None on failure.
@@ -262,6 +262,7 @@ def write_config_txt(
         "",
         "[Data]",
         f"input_h5={args.input_h5}",
+        f"new_h5_format={args.new_h5_format}",
         f"h5_example_count={h5_example_count}",
         f"random_seed={args.random_seed}",
         f"num_samples={args.num_samples}",
@@ -316,6 +317,10 @@ def mode_to_output_key(mode: str) -> str:
         return "no_replacement"
     if mode == "probability_tokens_mean_replace":
         return "probability_tokens_mean_replace"
+    if mode == "probability_last_token_mean_replace":
+        return "probability_last_token_mean_replace"
+    if mode == "probability_span_except_last_token_mean_replace":
+        return "probability_span_except_last_token_mean_replace"
     if mode == "all_pre_probability_tokens_mean_replace":
         return "all_pre_probability_tokens_mean_replace"
     if mode == "guess_tokens_mean_replace":
@@ -433,6 +438,44 @@ def _read_h5_node(node):
     return out
 
 
+_NEW_H5_REQUIRED_COMPONENTS = ("res", "attn", "mlp")
+_NEW_H5_REQUIRED_EMBEDDING_FIELDS = (
+    "embeddings_mean_prompt",
+    "embeddings_guess",
+    "embeddings_mean_sem_answer",
+    "embeddings_probability",
+)
+
+
+def _extract_res_field(resp0: dict, ex_id: str, field_name: str, *, new_h5_format: bool):
+    """Return the embedding payload for ``field_name`` on ``resp0``.
+
+    When ``new_h5_format`` is set, every required embedding field is expected to be a
+    dict containing all of ``res``/``attn``/``mlp`` (non-null). Layerwise residual-stream
+    ablation only consumes ``res``; ``attn``/``mlp`` are validated-but-unused.
+    """
+    value = resp0.get(field_name)
+    if not new_h5_format:
+        return value
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"Example {ex_id} responses/0/{field_name} must be a dict with "
+            f"keys {_NEW_H5_REQUIRED_COMPONENTS} when --new_h5_format is set."
+        )
+    for component in _NEW_H5_REQUIRED_COMPONENTS:
+        if component not in value:
+            raise ValueError(
+                f"Example {ex_id} responses/0/{field_name} missing component '{component}' "
+                f"(required when --new_h5_format is set)."
+            )
+        if value[component] is None:
+            raise ValueError(
+                f"Example {ex_id} responses/0/{field_name}/{component} is null "
+                f"(must be populated when --new_h5_format is set)."
+            )
+    return value["res"]
+
+
 def load_examples_h5(path: Path) -> Dict[str, dict]:
     examples: Dict[str, dict] = {}
     with h5py.File(path, "r") as h5_file:
@@ -481,6 +524,7 @@ def compute_confidence_group_means(
     high_conf_threshold: float,
     expected_probability_tokens: int,
     mean_from_low_confidence: bool,
+    new_h5_format: bool = False,
 ) -> Tuple[np.ndarray, set[str], set[str]]:
     """
     Returns:
@@ -512,7 +556,9 @@ def compute_confidence_group_means(
         if not use_for_mean:
             continue
 
-        emb_prob = resp0.get("embeddings_probability")
+        emb_prob = _extract_res_field(
+            resp0, ex_id, "embeddings_probability", new_h5_format=new_h5_format
+        )
         if not isinstance(emb_prob, list):
             raise ValueError(f"Example {ex_id} responses/0/embeddings_probability must be a list.")
         if not _is_expected_or_plus_one(len(emb_prob), expected_probability_tokens):
@@ -577,6 +623,7 @@ def compute_pre_probability_group_means(
     expected_probability_tokens: int,
     expected_guess_tokens: int,
     mean_from_low_confidence: bool,
+    new_h5_format: bool = False,
 ) -> Tuple[Dict[str, np.ndarray], set[str], set[str]]:
     """Build per-layer mean replacement vectors for all pre-probability regions.
 
@@ -622,10 +669,18 @@ def compute_pre_probability_group_means(
         if not use_for_mean:
             continue
 
-        emb_prompt = resp0.get("embeddings_mean_prompt")
-        emb_guess = resp0.get("embeddings_guess")
-        emb_sem_answer = resp0.get("embeddings_mean_sem_answer")
-        emb_prob = resp0.get("embeddings_probability")
+        emb_prompt = _extract_res_field(
+            resp0, ex_id, "embeddings_mean_prompt", new_h5_format=new_h5_format
+        )
+        emb_guess = _extract_res_field(
+            resp0, ex_id, "embeddings_guess", new_h5_format=new_h5_format
+        )
+        emb_sem_answer = _extract_res_field(
+            resp0, ex_id, "embeddings_mean_sem_answer", new_h5_format=new_h5_format
+        )
+        emb_prob = _extract_res_field(
+            resp0, ex_id, "embeddings_probability", new_h5_format=new_h5_format
+        )
         if emb_prompt is None or emb_guess is None or emb_sem_answer is None or emb_prob is None:
             raise ValueError(
                 f"Example {ex_id} is missing one of required fields: "
@@ -693,8 +748,18 @@ def compute_pre_probability_group_means(
 # ---------------------------------------------------------------------------
 
 
+def _completion_token_index_to_abs_pos(prompt_len: int, completion_index: int) -> int:
+    """Map completion-relative token index (0 = first generated token) to full-sequence position.
+
+    First generated token is produced from the last prompt position, so index ``k`` maps to
+    ``prompt_len + k - 1`` (for ``k >= 1`` this is the usual prompt offset; for ``k == 0`` this is
+    ``prompt_len - 1``).
+    """
+    return prompt_len + completion_index - 1
+
+
 def _absolute_prob_positions(prompt_len: int, decoded_tokens: List[str]) -> List[int]:
-    """Absolute indices for completion tokens ``first_prob`` … ``end_prob`` inclusive (H5 span)."""
+    """Absolute indices for completion tokens ``first_prob`` … ``end_prob`` (H5 span; excludes value token)."""
     parsed = parse_guess_and_probability_indices(decoded_tokens)
     # TODO: remove this after checking
     if parsed is None:
@@ -703,9 +768,37 @@ def _absolute_prob_positions(prompt_len: int, decoded_tokens: List[str]) -> List
 
     seq_len = prompt_len + len(decoded_tokens)
     out: List[int] = []
-    for k in range(first_prob, end_prob): # Do not include the first token of the prob value
-        p = prompt_len + k
-        if p < seq_len:
+    for k in range(first_prob, end_prob+1):  # Do not include the first token of the prob value
+        p = _completion_token_index_to_abs_pos(prompt_len, k)
+        if 0 <= p < seq_len:
+            out.append(p)
+    return out
+
+
+def _absolute_prob_last_token_only(prompt_len: int, decoded_tokens: List[str]) -> List[int]:
+    """Absolute index for the last token in the ``Probability:`` marker span only (H5 last probability row)."""
+    parsed = parse_guess_and_probability_indices(decoded_tokens)
+    if parsed is None:
+        return []
+    _, _, end_prob = parsed
+    seq_len = prompt_len + len(decoded_tokens)
+    p = _completion_token_index_to_abs_pos(prompt_len, end_prob)
+    if 0 <= p < seq_len:
+        return [p]
+    return []
+
+
+def _absolute_prob_marker_except_last_token(prompt_len: int, decoded_tokens: List[str]) -> List[int]:
+    """Absolute indices for the ``Probability:`` marker span excluding the last token."""
+    parsed = parse_guess_and_probability_indices(decoded_tokens)
+    if parsed is None:
+        return []
+    _, first_prob, end_prob = parsed
+    seq_len = prompt_len + len(decoded_tokens)
+    out: List[int] = []
+    for k in range(first_prob, end_prob):
+        p = _completion_token_index_to_abs_pos(prompt_len, k)
+        if 0 <= p < seq_len:
             out.append(p)
     return out
 
@@ -717,6 +810,7 @@ def _absolute_pre_probability_positions(
     expected_guess_tokens: int,
     expected_probability_tokens: int,
 ) -> Optional[Dict[str, List[int]]]:
+    """Map parse result to absolute positions. ``prompt`` is ``0 .. prompt_len-2`` (exclude last prompt index)."""
     parsed = parse_guess_and_probability_indices(decoded_tokens)
     if parsed is None:
         return None
@@ -727,15 +821,20 @@ def _absolute_pre_probability_positions(
         return None
     guess_positions_rel = guess_positions_rel[:expected_guess_tokens]
 
-    probability_positions_rel = list(range(first_prob_token_index, end_prob_token_index))
+    probability_positions_rel = list(range(first_prob_token_index, end_prob_token_index+1))
     if not _is_expected_or_plus_one(len(probability_positions_rel), expected_probability_tokens):
         return None
     probability_positions_rel = probability_positions_rel[:expected_probability_tokens]
 
-    prompt_positions_abs = list(range(0, prompt_len))
-    guess_positions_abs = [prompt_len + k for k in guess_positions_rel]
-    sem_answer_positions_abs = [prompt_len + k for k in range(last_guess_token_index, first_prob_token_index)]
-    probability_positions_abs = [prompt_len + k for k in probability_positions_rel]
+    prompt_positions_abs = list(range(0, prompt_len - 1))
+    guess_positions_abs = [_completion_token_index_to_abs_pos(prompt_len, k) for k in guess_positions_rel]
+    sem_answer_positions_abs = [
+        _completion_token_index_to_abs_pos(prompt_len, k)
+        for k in range(last_guess_token_index, first_prob_token_index)
+    ]
+    probability_positions_abs = [
+        _completion_token_index_to_abs_pos(prompt_len, k) for k in probability_positions_rel
+    ]
     ans = {
         "prompt": prompt_positions_abs,
         "guess": guess_positions_abs,
@@ -759,7 +858,7 @@ def _absolute_guess_span_positions(
     if not _is_expected_or_plus_one(len(guess_positions_rel), expected_guess_tokens):
         return []
     guess_positions_rel = guess_positions_rel[:expected_guess_tokens]
-    return [prompt_len + k for k in guess_positions_rel]
+    return [_completion_token_index_to_abs_pos(prompt_len, k) for k in guess_positions_rel]
 
 
 def _build_resid_post_mean_replace_hooks(
@@ -818,6 +917,40 @@ def build_mean_replace_hooks(
 
     def _abs_positions() -> List[int]:
         return _absolute_prob_positions(prompt_len, decoded_tokens_provider())
+
+    return _build_resid_post_mean_replace_hooks(
+        layer_to_mean_vectors,
+        seq_len_provider=seq_len_provider,
+        abs_positions_provider=_abs_positions,
+        strict_num_prob_positions=True,
+    )
+
+
+def build_mean_replace_hooks_probability_last_token(
+    layer_to_mean_vectors: Dict[int, torch.Tensor],
+    prompt_len: int,
+    seq_len_provider: Callable[[], int],
+    decoded_tokens_provider: Callable[[], List[str]],
+) -> List[Tuple[str, Callable]]:
+    def _abs_positions() -> List[int]:
+        return _absolute_prob_last_token_only(prompt_len, decoded_tokens_provider())
+
+    return _build_resid_post_mean_replace_hooks(
+        layer_to_mean_vectors,
+        seq_len_provider=seq_len_provider,
+        abs_positions_provider=_abs_positions,
+        strict_num_prob_positions=True,
+    )
+
+
+def build_mean_replace_hooks_probability_span_except_last_token(
+    layer_to_mean_vectors: Dict[int, torch.Tensor],
+    prompt_len: int,
+    seq_len_provider: Callable[[], int],
+    decoded_tokens_provider: Callable[[], List[str]],
+) -> List[Tuple[str, Callable]]:
+    def _abs_positions() -> List[int]:
+        return _absolute_prob_marker_except_last_token(prompt_len, decoded_tokens_provider())
 
     return _build_resid_post_mean_replace_hooks(
         layer_to_mean_vectors,
@@ -950,6 +1083,45 @@ def greedy_generate_mean_replaced(
         seq_len_provider=_seq_len,
         decoded_tokens_provider=_decoded_tokens,
     )
+    return _greedy_extend_with_fwd_hooks(model, local_prompt, max_new_tokens, tokens, decoded_tokens, hooks)
+
+
+def greedy_generate_probability_span_subset_mean_replaced(
+    model: HookedTransformer,
+    local_prompt: str,
+    max_new_tokens: int,
+    layer_to_mean_vectors: Dict[int, torch.Tensor],
+    *,
+    subset: str,
+) -> Tuple[str, List[str]]:
+    """Greedy decode with mean replacement on a subset of the ``Probability:`` marker span (parse-gated)."""
+    tokens = model.to_tokens(local_prompt)
+    prompt_len = int(tokens.shape[1])
+    decoded_tokens: List[str] = []
+
+    def _seq_len() -> int:
+        return int(tokens.shape[1])
+
+    def _decoded_tokens() -> List[str]:
+        return decoded_tokens
+
+    if subset == "last_token":
+        hooks = build_mean_replace_hooks_probability_last_token(
+            layer_to_mean_vectors=layer_to_mean_vectors,
+            prompt_len=prompt_len,
+            seq_len_provider=_seq_len,
+            decoded_tokens_provider=_decoded_tokens,
+        )
+    elif subset == "except_last_token":
+        hooks = build_mean_replace_hooks_probability_span_except_last_token(
+            layer_to_mean_vectors=layer_to_mean_vectors,
+            prompt_len=prompt_len,
+            seq_len_provider=_seq_len,
+            decoded_tokens_provider=_decoded_tokens,
+        )
+    else:
+        raise ValueError(f"Unknown probability span subset: {subset!r}")
+
     return _greedy_extend_with_fwd_hooks(model, local_prompt, max_new_tokens, tokens, decoded_tokens, hooks)
 
 
@@ -1144,7 +1316,7 @@ def build_all_pre_guess_mean_replace_hooks(
                         f"replacement count {int(guess_mean.shape[0])}."
                     )
 
-                for abs_pos in range(prompt_len):
+                for abs_pos in range(max(0, prompt_len - 1)):
                     if 0 <= abs_pos < activation.shape[1]:
                         activation[:, abs_pos, :] = prompt_mean
                 for pos_i, abs_pos in enumerate(guess_positions):
@@ -1374,8 +1546,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Layerwise mean activation replacement inference (TransformerLens).")
     parser.add_argument("--model_name", type=str, default="mistralai/Mistral-7B-Instruct-v0.1")
     parser.add_argument("--input_h5", type=str, required=True, help="Path to *_verbalised_embeddings.h5 file.")
+    parser.add_argument(
+        "--new_h5_format",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If set, expect the new process_generations_more_embs_from_h5.py output where each "
+            "embedding field is a dict containing 'res', 'attn', and 'mlp' subfields. Validates "
+            "all three are present per example and reads from 'res' (attn/mlp are not used for "
+            "layerwise residual-stream ablation)."
+        ),
+    )
     parser.add_argument("--device", type=str, default=None, help="e.g. cuda, cuda:0, cpu")
-    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    parser.add_argument("--dtype", type=str, default="float32", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--random_seed", type=int, default=10)
     parser.add_argument("--num_samples", type=int, default=400)
     parser.add_argument("--num_few_shot", type=int, default=0)
@@ -1403,10 +1586,15 @@ def main() -> None:
             "all_pre_guess_tokens_mean_replace",
             "guess_then_guess_and_probability_tokens_mean_replace",
             "post_guess_all_but_last_sem_answer_mean_replace",
+            "probability_last_token_mean_replace",
+            "probability_span_except_last_token_mean_replace",
         ],
         help=(
             "One or more modes to run. none: no hooks. probability_tokens_mean_replace: "
-            "replace resid at H5 probability span. all_pre_probability_tokens_mean_replace: "
+            "replace resid at H5 probability span. probability_last_token_mean_replace: "
+            "same gating as probability_tokens_mean_replace but only the last marker-span token. "
+            "probability_span_except_last_token_mean_replace: same gating but all marker-span "
+            "tokens except that last token. all_pre_probability_tokens_mean_replace: "
             "replace resid at prompt + Guess + semantic-answer + Probability marker positions. "
             "guess_tokens_mean_replace: replace resid only at the Guess: prefix span (per-position means). "
             "all_pre_guess_tokens_mean_replace: replace resid at every prompt position with prompt_mean, and at "
@@ -1430,7 +1618,7 @@ def main() -> None:
             "If false, compute means from high-confidence examples and ablate low-confidence examples."
         ),
     )
-    parser.add_argument("--expected_probability_tokens", type=int, default=6)
+    parser.add_argument("--expected_probability_tokens", type=int, default=7)
     parser.add_argument("--expected_guess_tokens", type=int, default=5)
     parser.add_argument(
         "--parse_mode_verbalised_confidence",
@@ -1496,6 +1684,8 @@ def main() -> None:
     modes = set(args.ablation_mode)
     need_pre_probability_means = (
         "probability_tokens_mean_replace" in modes
+        or "probability_last_token_mean_replace" in modes
+        or "probability_span_except_last_token_mean_replace" in modes
         or
         "all_pre_probability_tokens_mean_replace" in modes
         or "guess_tokens_mean_replace" in modes
@@ -1517,6 +1707,7 @@ def main() -> None:
             expected_probability_tokens=args.expected_probability_tokens,
             expected_guess_tokens=args.expected_guess_tokens,
             mean_from_low_confidence=args.mean_from_low_confidence,
+            new_h5_format=args.new_h5_format,
         )
     else:
         low_ids, high_ids = collect_confidence_group_ids(
@@ -1674,6 +1865,49 @@ def main() -> None:
                             local_prompt=local_prompt,
                             max_new_tokens=args.model_max_new_tokens,
                             layer_to_mean_vectors=layer_to_mean_vectors_eval,
+                        )
+                        mode_confidence = (
+                            parse_mode_confidence_from_response(response)
+                            if args.parse_mode_verbalised_confidence
+                            else None
+                        )
+                    elif mode == "probability_last_token_mean_replace":
+                        if layer_to_pre_probability_means_eval is None:
+                            raise ValueError(
+                                "Mode probability_last_token_mean_replace requested but probability means are unavailable."
+                            )
+                        layer_to_mean_vectors_eval = {
+                            layer_idx: layer_to_pre_probability_means_eval[layer_idx]["probability"][-1:, :]
+                            for layer_idx in layer_to_pre_probability_means_eval
+                        }
+                        response, decoded_tokens = greedy_generate_probability_span_subset_mean_replaced(
+                            model=model,
+                            local_prompt=local_prompt,
+                            max_new_tokens=args.model_max_new_tokens,
+                            layer_to_mean_vectors=layer_to_mean_vectors_eval,
+                            subset="last_token",
+                        )
+                        mode_confidence = (
+                            parse_mode_confidence_from_response(response)
+                            if args.parse_mode_verbalised_confidence
+                            else None
+                        )
+                    elif mode == "probability_span_except_last_token_mean_replace":
+                        if layer_to_pre_probability_means_eval is None:
+                            raise ValueError(
+                                "Mode probability_span_except_last_token_mean_replace requested but "
+                                "probability means are unavailable."
+                            )
+                        layer_to_mean_vectors_eval = {
+                            layer_idx: layer_to_pre_probability_means_eval[layer_idx]["probability"][:-1, :]
+                            for layer_idx in layer_to_pre_probability_means_eval
+                        }
+                        response, decoded_tokens = greedy_generate_probability_span_subset_mean_replaced(
+                            model=model,
+                            local_prompt=local_prompt,
+                            max_new_tokens=args.model_max_new_tokens,
+                            layer_to_mean_vectors=layer_to_mean_vectors_eval,
+                            subset="except_last_token",
                         )
                         mode_confidence = (
                             parse_mode_confidence_from_response(response)

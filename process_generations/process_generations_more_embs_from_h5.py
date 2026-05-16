@@ -91,7 +91,7 @@ def parse_guess_and_probability_indices(decoded_tokens: list) -> tuple[int, int,
     if (
         last_guess_token_index <= 0
         or last_guess_token_index >= len(decoded_tokens)
-        or end_prob_token_index >= len(decoded_tokens)
+        or end_prob_token_index >= len(decoded_tokens) # Different from the parse function in the ablation files because I want to ensure that there is a number after the whitespace
         or last_guess_token_index >= first_prob_token_index
         or first_prob_token_index >= end_prob_token_index
     ):
@@ -117,6 +117,98 @@ def _last_token_position(arr: np.ndarray) -> np.ndarray:
     if arr.ndim < 4 or arr.shape[2] < 1:
         raise ValueError(f"Expected embedding rank>=4 with seq axis, got shape {arr.shape}")
     return arr[:, :, -1:, :]
+
+
+def _compute_embeddings_from_source(
+    *,
+    source_embeddings,
+    decoded_tokens: list,
+    last_guess_token_index: int,
+    first_prob_token_index: int,
+    end_prob_token_index: int,
+    expected_guess_tokens: int,
+    expected_probability_tokens: int,
+    example_id,
+    source_label: str,
+) -> dict:
+    if source_embeddings is None:
+        raise ValueError(f"{source_label}: missing source embeddings")
+    if len(source_embeddings) != len(decoded_tokens):
+        raise ValueError(
+            f"{source_label}: len(source_embeddings)={len(source_embeddings)} != len(decoded_tokens)={len(decoded_tokens)}"
+        )
+
+    # Prompt mean: use source_embeddings[0] (embedding row for the first generation step).
+    # That tensor is [layers, batch, prompt_seq_len, hidden_dim]; shape[2] is the prompt
+    # sequence length. Mean over axis 2 after dropping the final
+    # position (prompt_only_embeddings = ...[:, :, :-1, :]).
+    prompt_plus_first_gen = _tensor_to_numpy(source_embeddings[0])
+    if prompt_plus_first_gen.ndim != 4:
+        raise ValueError(
+            f"{source_label}: prompt_plus_first_gen has wrong shape: {prompt_plus_first_gen.shape}"
+        )
+    if prompt_plus_first_gen.shape[2] <= 1:
+        raise ValueError(f"{source_label}: prompt has zero tokens")
+    prompt_only_embeddings = prompt_plus_first_gen[:, :, :-1, :]
+    embeddings_mean_prompt = np.mean(prompt_only_embeddings, axis=2, keepdims=True)
+
+    # Guess token embeddings:
+    # - start from the last sequence position of source_embeddings[0] (index shape[2]-1
+    #   along the prompt sequence axis),
+    # - add remaining guess-token position embeddings.
+    guess_token_indices = range(0, last_guess_token_index)
+    embeddings_guess = []
+    for token_idx in guess_token_indices:
+        emb = _tensor_to_numpy(source_embeddings[token_idx])
+        if emb.ndim != 4:
+            raise ValueError(
+                f"{source_label}: source_embeddings[{token_idx}] has wrong rank: {emb.shape}"
+            )
+        if token_idx == 0:
+            if emb.shape[2] <= 1:
+                raise ValueError(
+                    f"{source_label}: source_embeddings[0] has seq_len <= 1: {emb.shape}"
+                )
+            embeddings_guess.append(_last_token_position(emb))
+            continue
+
+        if emb.shape[2] != 1:
+            raise ValueError(
+                f"{source_label}: source_embeddings[{token_idx}] expected seq_len=1, got shape {emb.shape}"
+            )
+        embeddings_guess.append(emb)
+
+    if len(embeddings_guess) == 0:
+        raise ValueError(f"{source_label}: empty guess token embedding list")
+    if len(embeddings_guess) != expected_guess_tokens:
+        raise ValueError(
+            f"{source_label}: got {len(embeddings_guess)} guess embeddings, expected {expected_guess_tokens}"
+        )
+
+    # Semantic answer mean over (last_guess_token_index, first_prob_token_index), exclusive-exclusive.
+    sem_answer_slice_start = last_guess_token_index
+    sem_answer_slice_end = first_prob_token_index
+    sem_answer_token_embeddings = source_embeddings[sem_answer_slice_start:sem_answer_slice_end]
+    if len(sem_answer_token_embeddings) == 0:
+        raise ValueError(
+            f"{source_label}: empty semantic-answer token window ({last_guess_token_index},{first_prob_token_index})"
+        )
+    embeddings_mean_sem_answer = _mean_across_tokens(sem_answer_token_embeddings)
+
+    # Probability span as in prior script.
+    embeddings_probability = source_embeddings[first_prob_token_index:end_prob_token_index+1]
+    if len(embeddings_probability) != expected_probability_tokens:
+        raise ValueError(
+            f"{source_label}: got {len(embeddings_probability)} probability embeddings, expected {expected_probability_tokens}"
+        )
+    embeddings_probability = [_tensor_to_numpy(e) for e in embeddings_probability]
+
+    return {
+        "embeddings_mean_prompt": _tensor_to_numpy(embeddings_mean_prompt),
+        "embeddings_guess": [_tensor_to_numpy(e) for e in embeddings_guess],
+        "embeddings_mean_sem_answer": _tensor_to_numpy(embeddings_mean_sem_answer),
+        "embeddings_probability": embeddings_probability,
+    }
 
 
 def _write_ndarray_dataset(group: h5py.Group, name: str, arr: np.ndarray) -> None:
@@ -240,14 +332,19 @@ def _first_and_last_layer_values_for_list_of_arrays(arr_list, n: int = 5):
     return out
 
 
-def convert_for_json(obj, parent_key=None):
+def convert_for_json(obj, parent_key=None, in_embedding_field=False):
+    if parent_key in _EMBEDDING_KEYS:
+        in_embedding_field = True
+    elif in_embedding_field and parent_key in {"res", "attn", "mlp"}:
+        in_embedding_field = True
+
     if isinstance(obj, np.ndarray):
-        if parent_key in _EMBEDDING_KEYS:
+        if in_embedding_field:
             return {"shape": list(obj.shape), "preview": obj.ravel()[:5].tolist()}
         return obj.tolist()
     if hasattr(obj, "tolist") and callable(getattr(obj, "tolist")):
         try:
-            if parent_key in _EMBEDDING_KEYS:
+            if in_embedding_field:
                 arr = _tensor_to_numpy(obj)
                 return {"shape": list(arr.shape), "preview": arr.ravel()[:5].tolist()}
             return obj.tolist()
@@ -258,11 +355,11 @@ def convert_for_json(obj, parent_key=None):
     if isinstance(obj, np.integer):
         return int(obj)
     if isinstance(obj, dict):
-        return {k: convert_for_json(v, parent_key=k) for k, v in obj.items()}
+        return {k: convert_for_json(v, parent_key=k, in_embedding_field=in_embedding_field) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
-        if parent_key in _EMBEDDING_KEYS and obj and hasattr(obj[0], "shape"):
+        if in_embedding_field and obj and hasattr(obj[0], "shape"):
             return _first_and_last_layer_values_for_list_of_arrays([_tensor_to_numpy(x) for x in obj], 5)
-        return [convert_for_json(x, parent_key) for x in obj]
+        return [convert_for_json(x, parent_key, in_embedding_field=in_embedding_field) for x in obj]
     return obj
 
 
@@ -272,6 +369,8 @@ def process_example(
     *,
     expected_guess_tokens: int,
     expected_probability_tokens: int,
+    collect_attn_block_embeddings: bool,
+    collect_mlp_block_embeddings: bool,
 ) -> dict | None:
     most_likely = example.get("most_likely_answer")
     question = example.get("question")
@@ -282,6 +381,8 @@ def process_example(
     response_str = most_likely.get("response")
     decoded_tokens = most_likely.get("decoded_tokens")
     all_embeddings = most_likely.get("all_embeddings")
+    all_attn_embeddings = most_likely.get("all_attn_embeddings")
+    all_mlp_embeddings = most_likely.get("all_mlp_embeddings")
 
     if response_str is None or decoded_tokens is None or all_embeddings is None:
         logging.warning(
@@ -289,15 +390,6 @@ def process_example(
             example_id,
         )
         return None
-    if len(all_embeddings) != len(decoded_tokens):
-        logging.warning(
-            "Skipping example %s: len(all_embeddings)=%d != len(decoded_tokens)=%d",
-            example_id,
-            len(all_embeddings),
-            len(decoded_tokens),
-        )
-        return None
-
     full_str = "".join(decoded_tokens)
     prob = parse_probability_from_response(full_str)
     if prob is None:
@@ -318,100 +410,109 @@ def process_example(
         return None
     last_guess_token_index, first_prob_token_index, end_prob_token_index = indices
 
-    # Prompt mean: all_embeddings[0] corresponds to the first generated token and contains
-    # [layers, batch, prompt_len + 1, hidden_dim]. Mean over prompt tokens only (exclude final +1 token).
-    prompt_plus_first_gen = _tensor_to_numpy(all_embeddings[0])
-    if prompt_plus_first_gen.ndim != 4:
-        logging.warning(
-            "Skipping example %s: prompt_plus_first_gen has wrong shape: %s",
-            example_id,
-            prompt_plus_first_gen.shape,
+    try:
+        res_processed = _compute_embeddings_from_source(
+            source_embeddings=all_embeddings,
+            decoded_tokens=decoded_tokens,
+            last_guess_token_index=last_guess_token_index,
+            first_prob_token_index=first_prob_token_index,
+            end_prob_token_index=end_prob_token_index,
+            expected_guess_tokens=expected_guess_tokens,
+            expected_probability_tokens=expected_probability_tokens,
+            example_id=example_id,
+            source_label="res",
         )
+    except ValueError as exc:
+        logging.warning("Skipping example %s: %s", example_id, exc)
         return None
-    if prompt_plus_first_gen.shape[2] <= 1:
-        logging.warning("Skipping example %s: prompt has zero tokens", example_id)
-        return None
-    prompt_only_embeddings = prompt_plus_first_gen[:, :, :-1, :]
-    embeddings_mean_prompt = np.mean(prompt_only_embeddings, axis=2, keepdims=True)
 
-    # Guess token embeddings:
-    # - start from the last sequence position of all_embeddings[0] (first generated token state),
-    # - add remaining guess-token position embeddings.
-    guess_token_indices = range(0, last_guess_token_index)
-    embeddings_guess = []
-    for token_idx in guess_token_indices:
-        emb = _tensor_to_numpy(all_embeddings[token_idx])
-        if emb.ndim != 4:
-            logging.warning("Skipping example %s: all_embeddings[%d] has wrong rank: %s", example_id, token_idx, emb.shape)
-            return None
-        if token_idx == 0:
-            if emb.shape[2] <= 1:
-                logging.warning(
-                    "Skipping example %s: all_embeddings[0] has seq_len <= 1: %s",
-                    example_id,
-                    emb.shape,
-                )
-                return None
-            embeddings_guess.append(_last_token_position(emb))
-            continue
-
-        if emb.shape[2] != 1:
-            logging.warning(
-                "Skipping example %s: all_embeddings[%d] expected seq_len=1, got shape %s",
+    attn_processed = None
+    if collect_attn_block_embeddings:
+        if all_attn_embeddings is None:
+            logging.error(
+                "Example %s missing all_attn_embeddings while --collect_attn_block_embeddings is enabled; setting attn outputs to null.",
                 example_id,
-                token_idx,
-                emb.shape,
             )
-            return None
-        embeddings_guess.append(emb)
+        else:
+            try:
+                attn_processed = _compute_embeddings_from_source(
+                    source_embeddings=all_attn_embeddings,
+                    decoded_tokens=decoded_tokens,
+                    last_guess_token_index=last_guess_token_index,
+                    first_prob_token_index=first_prob_token_index,
+                    end_prob_token_index=end_prob_token_index,
+                    expected_guess_tokens=expected_guess_tokens,
+                    expected_probability_tokens=expected_probability_tokens,
+                    example_id=example_id,
+                    source_label="attn",
+                )
+            except ValueError as exc:
+                logging.error(
+                    "Example %s has invalid all_attn_embeddings: %s. Setting attn outputs to null.",
+                    example_id,
+                    exc,
+                )
 
-    if len(embeddings_guess) == 0:
-        logging.warning("Skipping example %s: empty guess token embedding list", example_id)
-        return None
-    expected_guess_count = expected_guess_tokens - 1
-    if len(embeddings_guess) != expected_guess_count:
-        logging.warning(
-            "Skipping example %s: got %d guess embeddings, expected %d",
-            example_id,
-            len(embeddings_guess),
-            expected_guess_count,
-        )
-        return None
-
-    # Semantic answer mean over (last_guess_token_index, first_prob_token_index), exclusive-exclusive.
-    sem_answer_slice_start = last_guess_token_index
-    sem_answer_slice_end = first_prob_token_index
-    sem_answer_token_embeddings = all_embeddings[sem_answer_slice_start:sem_answer_slice_end]
-    if len(sem_answer_token_embeddings) == 0:
-        logging.warning(
-            "Skipping example %s: empty semantic-answer token window (%d,%d)",
-            example_id,
-            last_guess_token_index,
-            first_prob_token_index,
-        )
-        return None
-    embeddings_mean_sem_answer = _mean_across_tokens(sem_answer_token_embeddings)
-
-    # Probability span as in prior script.
-    embeddings_probability = all_embeddings[first_prob_token_index : end_prob_token_index]
-    expected_probability_count = expected_probability_tokens - 1
-    if len(embeddings_probability) != expected_probability_count:
-        logging.warning(
-            "Skipping example %s: got %d probability embeddings, expected %d",
-            example_id,
-            len(embeddings_probability),
-            expected_probability_count,
-        )
-        return None
-    embeddings_probability = [_tensor_to_numpy(e) for e in embeddings_probability]
+    mlp_processed = None
+    if collect_mlp_block_embeddings:
+        if all_mlp_embeddings is None:
+            logging.error(
+                "Example %s missing all_mlp_embeddings while --collect_mlp_block_embeddings is enabled; setting mlp outputs to null.",
+                example_id,
+            )
+        else:
+            try:
+                mlp_processed = _compute_embeddings_from_source(
+                    source_embeddings=all_mlp_embeddings,
+                    decoded_tokens=decoded_tokens,
+                    last_guess_token_index=last_guess_token_index,
+                    first_prob_token_index=first_prob_token_index,
+                    end_prob_token_index=end_prob_token_index,
+                    expected_guess_tokens=expected_guess_tokens,
+                    expected_probability_tokens=expected_probability_tokens,
+                    example_id=example_id,
+                    source_label="mlp",
+                )
+            except ValueError as exc:
+                logging.error(
+                    "Example %s has invalid all_mlp_embeddings: %s. Setting mlp outputs to null.",
+                    example_id,
+                    exc,
+                )
 
     processed_response = {
         "verbalised_confidence": float(prob),
-        "embeddings_mean_prompt": _tensor_to_numpy(embeddings_mean_prompt),
-        "embeddings_guess": [_tensor_to_numpy(e) for e in embeddings_guess],
-        "embeddings_mean_sem_answer": _tensor_to_numpy(embeddings_mean_sem_answer),
-        "embeddings_probability": embeddings_probability,
+        "embeddings_mean_prompt": {"res": res_processed["embeddings_mean_prompt"]},
+        "embeddings_guess": {"res": res_processed["embeddings_guess"]},
+        "embeddings_mean_sem_answer": {"res": res_processed["embeddings_mean_sem_answer"]},
+        "embeddings_probability": {"res": res_processed["embeddings_probability"]},
     }
+    if collect_attn_block_embeddings:
+        processed_response["embeddings_mean_prompt"]["attn"] = (
+            None if attn_processed is None else attn_processed["embeddings_mean_prompt"]
+        )
+        processed_response["embeddings_guess"]["attn"] = (
+            None if attn_processed is None else attn_processed["embeddings_guess"]
+        )
+        processed_response["embeddings_mean_sem_answer"]["attn"] = (
+            None if attn_processed is None else attn_processed["embeddings_mean_sem_answer"]
+        )
+        processed_response["embeddings_probability"]["attn"] = (
+            None if attn_processed is None else attn_processed["embeddings_probability"]
+        )
+    if collect_mlp_block_embeddings:
+        processed_response["embeddings_mean_prompt"]["mlp"] = (
+            None if mlp_processed is None else mlp_processed["embeddings_mean_prompt"]
+        )
+        processed_response["embeddings_guess"]["mlp"] = (
+            None if mlp_processed is None else mlp_processed["embeddings_guess"]
+        )
+        processed_response["embeddings_mean_sem_answer"]["mlp"] = (
+            None if mlp_processed is None else mlp_processed["embeddings_mean_sem_answer"]
+        )
+        processed_response["embeddings_probability"]["mlp"] = (
+            None if mlp_processed is None else mlp_processed["embeddings_probability"]
+        )
 
     return {
         "question": question,
@@ -477,14 +578,26 @@ def main():
     parser.add_argument(
         "--expected_guess_tokens",
         type=int,
-        default=6,
-        help="Expected total guess tokens before preprocessing (stored guess embeddings count is this value minus 1).",
+        default=5,
+        help="Expected number of stored guess embeddings (list length).",
     )
     parser.add_argument(
         "--expected_probability_tokens",
         type=int,
         default=7,
-        help="Expected total probability tokens before preprocessing (stored probability embeddings count is this value minus 1).",
+        help="Expected number of stored probability embeddings (list length).",
+    )
+    parser.add_argument(
+        "--collect_attn_block_embeddings",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Include attn subblock outputs under each embedding field as key 'attn'.",
+    )
+    parser.add_argument(
+        "--collect_mlp_block_embeddings",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Include mlp subblock outputs under each embedding field as key 'mlp'.",
     )
     args = parser.parse_args()
 
@@ -551,6 +664,8 @@ def main():
                 example,
                 expected_guess_tokens=args.expected_guess_tokens,
                 expected_probability_tokens=args.expected_probability_tokens,
+                collect_attn_block_embeddings=args.collect_attn_block_embeddings,
+                collect_mlp_block_embeddings=args.collect_mlp_block_embeddings,
             )
             if out is None:
                 n_reject += 1

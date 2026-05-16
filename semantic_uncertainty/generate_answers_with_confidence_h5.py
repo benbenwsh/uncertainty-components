@@ -337,7 +337,19 @@ def main(args):
                     # Temperature for first generation is zero for deterministic greedy decoding.
                     temperature = 0.0 if i == 0 else args.temperature
 
-                    predicted_answer, token_log_likelihoods, (emb_sec_last_token, emb_tok_bef_gen, all_embeddings), decoded_tokens = model.predict(local_prompt, temperature, return_latent=True)
+                    predicted_answer, token_log_likelihoods, (
+                        emb_sec_last_token,
+                        emb_tok_bef_gen,
+                        all_embeddings,
+                        all_attn_embeddings,
+                        all_mlp_embeddings,
+                    ), decoded_tokens = model.predict(
+                        local_prompt,
+                        temperature,
+                        return_latent=True,
+                        collect_attn_block_embeddings=args.collect_attn_block_embeddings,
+                        collect_mlp_block_embeddings=args.collect_mlp_block_embeddings,
+                    )
 
                     emb_sec_last_token = emb_sec_last_token.cpu() if emb_sec_last_token is not None else None
                     emb_tok_bef_gen = emb_tok_bef_gen.cpu() if emb_tok_bef_gen is not None else None
@@ -370,6 +382,8 @@ def main(args):
                             'emb_sec_last_token': emb_sec_last_token,
                             'emb_tok_bef_gen': emb_tok_bef_gen,
                             'all_embeddings': all_embeddings,
+                            'all_attn_embeddings': all_attn_embeddings,
+                            'all_mlp_embeddings': all_mlp_embeddings,
                             'decoded_tokens': decoded_tokens,
                         }
                     else:

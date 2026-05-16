@@ -259,6 +259,8 @@ def mode_to_output_key(mode: str) -> str:
         return "no_replacement"
     if mode in {
         "probability_tokens_mean_replace",
+        "probability_last_token_mean_replace",
+        "probability_span_except_last_token_mean_replace",
         "all_pre_probability_tokens_mean_replace",
         "guess_tokens_mean_replace",
         "all_pre_guess_tokens_mean_replace",
@@ -406,6 +408,15 @@ def _is_expected_or_plus_one(actual_len: int, expected_len: int) -> bool:
     return actual_len in (expected_len, expected_len + 1)
 
 
+def _completion_token_index_to_abs_pos(prompt_len: int, completion_index: int) -> int:
+    """Map completion-relative token index (0 = first generated token) to full-sequence position.
+
+    First generated token aligns with ``prompt_len - 1`` (same convention as
+    ``layerwise_mean_ablation.run_mean_ablation``).
+    """
+    return prompt_len + completion_index - 1
+
+
 def _absolute_prob_positions(
     prompt_len: int,
     decoded_tokens: List[str],
@@ -416,11 +427,45 @@ def _absolute_prob_positions(
     if parsed is None:
         return []
     _, first_prob, end_prob = parsed
-    rel_positions = list(range(first_prob, end_prob))
+    rel_positions = list(range(first_prob, end_prob+1))
     if not _is_expected_or_plus_one(len(rel_positions), expected_probability_tokens):
         return []
     rel_positions = rel_positions[:expected_probability_tokens]
-    return [prompt_len + pos for pos in rel_positions]
+    return [_completion_token_index_to_abs_pos(prompt_len, pos) for pos in rel_positions]
+
+
+def _absolute_prob_last_token_only_positions(
+    prompt_len: int,
+    decoded_tokens: List[str],
+    *,
+    expected_probability_tokens: int,
+) -> List[int]:
+    parsed = parse_guess_and_probability_indices(decoded_tokens)
+    if parsed is None:
+        return []
+    _, first_prob, end_prob = parsed
+    full_rel_positions = list(range(first_prob, end_prob+1))
+    if not _is_expected_or_plus_one(len(full_rel_positions), expected_probability_tokens):
+        return []
+    return [_completion_token_index_to_abs_pos(prompt_len, end_prob)]
+
+
+def _absolute_prob_except_last_token_positions(
+    prompt_len: int,
+    decoded_tokens: List[str],
+    *,
+    expected_probability_tokens: int,
+) -> List[int]:
+    parsed = parse_guess_and_probability_indices(decoded_tokens)
+    if parsed is None:
+        return []
+    _, first_prob, end_prob = parsed
+    full_rel_positions = list(range(first_prob, end_prob+1))
+    if not _is_expected_or_plus_one(len(full_rel_positions), expected_probability_tokens):
+        return []
+    return [
+        _completion_token_index_to_abs_pos(prompt_len, pos) for pos in range(first_prob, end_prob)
+    ]
 
 
 def _absolute_guess_span_positions(
@@ -436,7 +481,7 @@ def _absolute_guess_span_positions(
     if not _is_expected_or_plus_one(len(guess_positions_rel), expected_guess_tokens):
         return []
     guess_positions_rel = guess_positions_rel[:expected_guess_tokens]
-    return [prompt_len + k for k in guess_positions_rel]
+    return [_completion_token_index_to_abs_pos(prompt_len, k) for k in guess_positions_rel]
 
 
 def _absolute_pre_probability_positions(
@@ -446,6 +491,11 @@ def _absolute_pre_probability_positions(
     expected_guess_tokens: int,
     expected_probability_tokens: int,
 ) -> Optional[Dict[str, List[int]]]:
+    """Absolute positions for pre-probability mean/zero ablation.
+
+    ``prompt`` uses indices ``0 .. prompt_len-2`` (excludes the last prompt position, which
+    aligns with the first generated token under the completion-index mapping).
+    """
     parsed = parse_guess_and_probability_indices(decoded_tokens)
     if parsed is None:
         return None
@@ -456,16 +506,21 @@ def _absolute_pre_probability_positions(
         return None
     guess_positions_rel = guess_positions_rel[:expected_guess_tokens]
 
-    probability_positions_rel = list(range(first_prob_token_index, end_prob_token_index))
+    probability_positions_rel = list(range(first_prob_token_index, end_prob_token_index+1))
     if not _is_expected_or_plus_one(len(probability_positions_rel), expected_probability_tokens):
         return None
     probability_positions_rel = probability_positions_rel[:expected_probability_tokens]
 
     return {
-        "prompt": list(range(0, prompt_len)),
-        "guess": [prompt_len + k for k in guess_positions_rel],
-        "sem_answer": [prompt_len + k for k in range(last_guess_token_index, first_prob_token_index)],
-        "probability": [prompt_len + k for k in probability_positions_rel],
+        "prompt": list(range(0, prompt_len - 1)),
+        "guess": [_completion_token_index_to_abs_pos(prompt_len, k) for k in guess_positions_rel],
+        "sem_answer": [
+            _completion_token_index_to_abs_pos(prompt_len, k)
+            for k in range(last_guess_token_index, first_prob_token_index)
+        ],
+        "probability": [
+            _completion_token_index_to_abs_pos(prompt_len, k) for k in probability_positions_rel
+        ],
     }
 
 
@@ -475,6 +530,7 @@ def _absolute_all_pre_guess_positions(
     *,
     expected_guess_tokens: int,
 ) -> List[int]:
+    """Prompt indices ``0 .. prompt_len-2`` plus guess-span positions (see ``_absolute_guess_span_positions``)."""
     guess_positions = _absolute_guess_span_positions(
         prompt_len,
         decoded_tokens,
@@ -482,7 +538,7 @@ def _absolute_all_pre_guess_positions(
     )
     if not guess_positions:
         return []
-    return list(range(0, prompt_len)) + guess_positions
+    return list(range(0, prompt_len - 1)) + guess_positions
 
 
 def _absolute_guess_then_guess_probability_positions(
@@ -518,7 +574,10 @@ def _absolute_probability_value_autoregressive_positions(
     current_rel = len(decoded_tokens)
     if current_rel < probability_value_start_rel:
         return []
-    return [prompt_len + k for k in range(probability_value_start_rel, current_rel+1)]
+    return [
+        _completion_token_index_to_abs_pos(prompt_len, k)
+        for k in range(probability_value_start_rel, current_rel + 1)
+    ]
 
 
 def _generation_contains_stop(decoded_completion: str) -> bool:
@@ -560,9 +619,9 @@ def greedy_generate(
     eos_id = model.tokenizer.eos_token_id
     with torch.inference_mode():
         for _ in range(max_new_tokens):
-            if fwd_hooks:
-                logging.info(f"Decoded tokens in non-none ablation mode: {decoded_tokens}")
-                logging.info(f"Prompt shape: {tokens.shape}; decoded tokens length: {len(decoded_tokens)}")
+            # if fwd_hooks:
+            #     logging.info(f"Decoded tokens in non-none ablation mode: {decoded_tokens}")
+            #     logging.info(f"Prompt shape: {tokens.shape}; decoded tokens length: {len(decoded_tokens)}")
             out = model.run_with_hooks(tokens, return_type="logits", fwd_hooks=fwd_hooks or [])
             logits = out[0] if isinstance(out, tuple) else out
             next_id = int(logits[0, -1].argmax(dim=-1).item())
@@ -585,8 +644,6 @@ def build_subblock_zero_hooks(
 ) -> List[Tuple[str, Callable]]:
     hook_suffix = SUBBLOCK_TO_HOOK[subblock]
     hooks: List[Tuple[str, Callable]] = []
-    logging.info(f"Layer indices: {layer_indices}")
-    logging.info(f"Subblock: {subblock}")
     for layer in layer_indices:
         hook_name = f"blocks.{layer}.{hook_suffix}"
 
@@ -595,7 +652,6 @@ def build_subblock_zero_hooks(
                 # Activation shape: [1, seq_len, hidden_dim]
                 del hook
                 positions = positions_provider()
-                logging.info(f"Ablating a layer in subblock {subblock} at token positions: {positions}")
                 if not positions:
                     return activation
                 for abs_pos in positions:
@@ -606,7 +662,6 @@ def build_subblock_zero_hooks(
             return hook_fn
 
         hooks.append((hook_name, _make_hook()))
-    logging.info(f"All hook names: {hooks}")
     return hooks
 
 
@@ -650,6 +705,18 @@ def _mode_positions_provider_builder(
     def _builder(prompt_len: int, decoded_tokens_provider: Callable[[], List[str]]) -> Callable[[], List[int]]:
         if mode == "probability_tokens_mean_replace":
             return lambda: _absolute_prob_positions(
+                prompt_len,
+                decoded_tokens_provider(),
+                expected_probability_tokens=expected_probability_tokens,
+            )
+        if mode == "probability_last_token_mean_replace":
+            return lambda: _absolute_prob_last_token_only_positions(
+                prompt_len,
+                decoded_tokens_provider(),
+                expected_probability_tokens=expected_probability_tokens,
+            )
+        if mode == "probability_span_except_last_token_mean_replace":
+            return lambda: _absolute_prob_except_last_token_positions(
                 prompt_len,
                 decoded_tokens_provider(),
                 expected_probability_tokens=expected_probability_tokens,
@@ -866,7 +933,7 @@ def main() -> None:
     parser.add_argument("--model_name", type=str, default="mistralai/Mistral-7B-Instruct-v0.1")
     parser.add_argument("--input_h5", type=str, default=None, help="Path to *_verbalised_embeddings.h5 file.")
     parser.add_argument("--device", type=str, default=None, help="e.g. cuda, cuda:0, cpu")
-    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    parser.add_argument("--dtype", type=str, default="float32", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--random_seed", type=int, default=10)
     parser.add_argument("--num_samples", type=int, default=400)
     parser.add_argument("--num_few_shot", type=int, default=0)
@@ -888,6 +955,8 @@ def main() -> None:
         default=[
             "none",
             "probability_tokens_mean_replace",
+            "probability_last_token_mean_replace",
+            "probability_span_except_last_token_mean_replace",
             "all_pre_probability_tokens_mean_replace",
             "guess_tokens_mean_replace",
             "all_pre_guess_tokens_mean_replace",
@@ -897,12 +966,20 @@ def main() -> None:
         choices=[
             "none",
             "probability_tokens_mean_replace",
+            "probability_last_token_mean_replace",
+            "probability_span_except_last_token_mean_replace",
             "all_pre_probability_tokens_mean_replace",
             "guess_tokens_mean_replace",
             "all_pre_guess_tokens_mean_replace",
             "guess_then_guess_probability_zero_ablate",
             "probability_value_autoregressive_zero_ablate",
         ],
+        help=(
+            "One or more ablation modes. probability_last_token_mean_replace: ablate only the "
+            "last token in the Probability: marker span. "
+            "probability_span_except_last_token_mean_replace: ablate all Probability: span tokens "
+            "except that last token."
+        ),
     )
     parser.add_argument(
         "--ablate_subblocks",
@@ -923,7 +1000,7 @@ def main() -> None:
             "If false (default), target high-confidence examples."
         ),
     )
-    parser.add_argument("--expected_probability_tokens", type=int, default=6)
+    parser.add_argument("--expected_probability_tokens", type=int, default=7)
     parser.add_argument("--expected_guess_tokens", type=int, default=5)
     parser.add_argument(
         "--parse_mode_verbalised_confidence",
@@ -1137,7 +1214,6 @@ def main() -> None:
                         }
 
                 for mode in args.ablation_mode:
-                    logging.info(f"Running ablation mode: {mode}")
                     key = mode_to_output_key(mode)
                     entry[key] = {}
                     mini_entry[key] = {}

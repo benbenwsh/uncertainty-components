@@ -111,6 +111,12 @@ def get_parser(stages=['generate', 'compute']):
             "--confidence", default=False, action=argparse.BooleanOptionalAction,
             help="If true, the prompt also asks the model to output its confidence, and we record embeddings at every token position.")
         parser.add_argument(
+            "--collect_attn_block_embeddings", default=False, action=argparse.BooleanOptionalAction,
+            help="If true, collect per-token attention block outputs before residual addition.")
+        parser.add_argument(
+            "--collect_mlp_block_embeddings", default=False, action=argparse.BooleanOptionalAction,
+            help="If true, collect per-token MLP block outputs before residual addition.")
+        parser.add_argument(
             "--save_to_wandb", default=False, action=argparse.BooleanOptionalAction,
             help="If true, save files to wandb. Default: False (files are saved locally but not uploaded to wandb).")
 

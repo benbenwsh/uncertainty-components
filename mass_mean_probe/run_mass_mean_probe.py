@@ -12,10 +12,9 @@ Then, for each selected ablation target group and alpha:
   - low targets:  resid_post += alpha * direction
   - high targets: resid_post -= alpha * direction
 
-Only two ablation modes are supported:
-  - none
-  - probability_tokens_mean_replace (name kept for compatibility; behavior is
-    additive direction perturbation, not direct mean replacement)
+Ablation modes apply additive direction perturbation along span-specific directions
+(``*_mean_replace`` names are kept for compatibility with mean-ablation scripts).
+Includes full and subset ``Probability:`` span modes (see ``--ablation_mode`` help).
 """
 
 from __future__ import annotations
@@ -33,13 +32,14 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 import h5py
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from datasets import Dataset, load_dataset
 from transformers import AutoTokenizer
 from transformer_lens import HookedTransformer
 
-CONFIDENCE_PROMPT = (
+CONFIDENCE_PROMPT_NUMERIC = (
     "Provide your best guess and the probability that it is correct (0.0 to 1.0) "
     "for the following question. Give ONLY the guess and probability, no other words "
     "or explanation. For example:\n\n"
@@ -47,6 +47,41 @@ CONFIDENCE_PROMPT = (
     "Probability: <the probability between 0.0 and 1.0 that your guess is correct, without any "
     "extra commentary whatsoever; just the probability!>\n\n"
     "The question is: "
+)
+
+CONFIDENCE_PROMPT_LINGUISTIC = (
+    "Provide your best guess for the following question, and describe how likely it is that your guess is correct "
+    "as one of the following expressions: Almost No Chance, Highly Unlikely, Chances are Slight, Little Chance, "
+    "Unlikely, Probably Not, About Even, Better than Even, Likely, Probably, Very Good Chance, Highly Likely, "
+    "Almost Certain"
+    ". Give ONLY the guess and your confidence, no other words or explanation. For example:\n\n"
+    "Guess: <most likely guess, as short as possible; not a complete sentence, just the guess!>\n"
+    "Confidence: <description of confidence, without any extra commentary whatsoever; just a short phrase!>\n\n"
+    "The question is: "
+)
+
+LINGUISTIC_TO_PROBABILITY: dict[str, float] = {
+    "Almost Certain": 0.95,
+    "Highly Likely": 0.90,
+    "Very Good Chance": 0.80,
+    "We Believe": 0.75,
+    "Probably": 0.70,
+    "Probable": 0.70,
+    "Likely": 0.70,
+    "Better than Even": 0.60,
+    "About Even": 0.50,
+    "We Doubt": 0.20,
+    "Unlikely": 0.20,
+    "Probably Not": 0.25,
+    "Little Chance": 0.10,
+    "Chances are Slight": 0.10,
+    "Improbable": 0.10,
+    "Highly Unlikely": 0.05,
+    "Almost No Chance": 0.02,
+}
+
+_LINGUISTIC_PHRASES_BY_LENGTH: tuple[tuple[str, float], ...] = tuple(
+    sorted(LINGUISTIC_TO_PROBABILITY.items(), key=lambda kv: len(kv[0]), reverse=True)
 )
 
 BRIEF_PROMPTS = {
@@ -57,6 +92,11 @@ BRIEF_PROMPTS = {
 STOP_SEQUENCES = ["\n\n\n\n", "\n\n\n"]
 GUESS_PREFIX = "\n\nGuess:"
 PROBABILITY_MARKER = "\nProbability:"
+CONFIDENCE_MARKER = "\nConfidence:"
+
+
+def _marker_for_linguistic_confidence(linguistic_confidence_prompt: bool) -> str:
+    return CONFIDENCE_MARKER if linguistic_confidence_prompt else PROBABILITY_MARKER
 
 
 def _token_index_for_char_offset(decoded_tokens: List[str], char_offset: int) -> int:
@@ -68,35 +108,64 @@ def _token_index_for_char_offset(decoded_tokens: List[str], char_offset: int) ->
     return max(0, len(decoded_tokens) - 1)
 
 
-def parse_guess_and_probability_indices(decoded_tokens: List[str]) -> tuple[int, int, int] | None:
+def parse_guess_and_marker_indices(
+    decoded_tokens: List[str],
+    *,
+    linguistic_confidence_prompt: bool,
+) -> tuple[int, int, int] | None:
+    """Return (last_guess_token_index, first_span_token_index, end_span_token_index) completion indices.
+
+    Uses ``PROBABILITY_MARKER`` or ``CONFIDENCE_MARKER`` according to ``linguistic_confidence_prompt``.
+    The span always starts at the first
+    token that contains the marker (``first_marker_token_index``). For numeric ``Probability:``, a
+    whitespace-only token must follow the marker and the span ends at the single value token after
+    that space. For linguistic ``Confidence:``, there is no such required space; the span ends at the
+    first token after the marker (inclusive of marker through that token).
+    """
     full_str = "".join(decoded_tokens)
+    logging.info(f"decoded_tokens: {decoded_tokens}")
+    logging.info(f"linguistic_confidence_prompt: {linguistic_confidence_prompt}")
     if not full_str.startswith(GUESS_PREFIX):
         return None
 
+    marker = _marker_for_linguistic_confidence(linguistic_confidence_prompt)
     last_guess_token_index = _token_index_for_char_offset(decoded_tokens, len(GUESS_PREFIX) - 1) + 1
-    rfind_start = full_str.rfind(PROBABILITY_MARKER)
+    rfind_start = full_str.rfind(marker)
     if rfind_start < 0:
         return None
 
-    first_prob_token_index = _token_index_for_char_offset(decoded_tokens, rfind_start)
+    first_marker_token_index = _token_index_for_char_offset(decoded_tokens, rfind_start)
     prob_whitespace_token_index = _token_index_for_char_offset(
-        decoded_tokens, rfind_start + len(PROBABILITY_MARKER) - 1
+        decoded_tokens, rfind_start + len(marker) - 1
     ) + 1
-    if prob_whitespace_token_index >= len(decoded_tokens):
-        return None
-    if decoded_tokens[prob_whitespace_token_index].strip() != "":
-        return None
-    end_prob_token_index = prob_whitespace_token_index + 1
+
+    if not linguistic_confidence_prompt:
+        if prob_whitespace_token_index >= len(decoded_tokens):
+            return None
+        if decoded_tokens[prob_whitespace_token_index].strip() != "":
+            return None
+        end_span_token_index = prob_whitespace_token_index + 1
+    else:
+        end_span_token_index = prob_whitespace_token_index
+
+    first_span_token_index = first_marker_token_index
 
     if (
         last_guess_token_index <= 0
         or last_guess_token_index >= len(decoded_tokens)
-        or end_prob_token_index > len(decoded_tokens)
-        or last_guess_token_index >= first_prob_token_index
-        or first_prob_token_index >= end_prob_token_index
+        or end_span_token_index > len(decoded_tokens)
+        or last_guess_token_index >= first_span_token_index
+        or first_span_token_index >= end_span_token_index
     ):
         return None
-    return (last_guess_token_index, first_prob_token_index, end_prob_token_index)
+    return (last_guess_token_index, first_span_token_index, end_span_token_index)
+
+
+def parse_guess_and_probability_indices(decoded_tokens: List[str]) -> tuple[int, int, int] | None:
+    return parse_guess_and_marker_indices(
+        decoded_tokens,
+        linguistic_confidence_prompt=False,
+    )
 
 
 def parse_guess_start_index(decoded_tokens: List[str]) -> Optional[int]:
@@ -169,15 +238,21 @@ def config_txt_path(full_output_path: str) -> str:
     return os.path.join(os.path.dirname(full_output_path), "config.txt")
 
 
+def summary_json_path(full_output_path: str) -> str:
+    return os.path.join(os.path.dirname(full_output_path), "summary.json")
+
+
 def mode_to_output_key(mode: str) -> str:
     if mode == "none":
         return "no_replacement"
     if mode in {
         "probability_tokens_mean_replace",
+        "probability_last_token_mean_replace",
+        "probability_span_except_last_token_mean_replace",
         "all_pre_probability_tokens_mean_replace",
         "guess_tokens_mean_replace",
         "all_pre_guess_tokens_mean_replace",
-        "guess_then_guess_probability_zero_ablate",
+        "guess_then_guess_probability_mean_replace",
     }:
         return mode
     raise ValueError(f"Unknown mode: {mode}")
@@ -188,11 +263,6 @@ def _format_alpha(alpha: float) -> str:
     if not s:
         s = "0"
     return s.replace(".", "p")
-
-
-def parse_mode_confidence_from_response(response: str) -> Optional[float]:
-    parsed = parse_probability_from_response(response)
-    return float(parsed) if parsed is not None else None
 
 
 def parse_probability_from_response(response_str: str) -> float | None:
@@ -213,6 +283,30 @@ def parse_probability_from_response(response_str: str) -> float | None:
     return value
 
 
+def parse_linguistic_confidence_from_response(response_str: str) -> float | None:
+    if not response_str or not isinstance(response_str, str):
+        return None
+    matches = list(re.finditer(r"confidence\s*:\s*(.+)", response_str, re.IGNORECASE | re.DOTALL))
+    if not matches:
+        return None
+    tail = matches[-1].group(1)
+    tail = tail.split("\n")[0].strip()
+    tail_collapsed = " ".join(tail.split())
+    lowered = tail_collapsed.casefold()
+    for phrase, prob in _LINGUISTIC_PHRASES_BY_LENGTH:
+        if phrase.casefold() in lowered:
+            return float(prob)
+    return None
+
+
+def parse_mode_confidence_from_response(response: str, *, linguistic_prompt: bool) -> Optional[float]:
+    if linguistic_prompt:
+        parsed = parse_linguistic_confidence_from_response(response)
+    else:
+        parsed = parse_probability_from_response(response)
+    return float(parsed) if parsed is not None else None
+
+
 def write_config_txt(
     path: str,
     *,
@@ -224,8 +318,6 @@ def write_config_txt(
     low_conf_count: int,
     high_conf_count: int,
     h5_example_count: int,
-    mode_confidence_means: Dict[str, Optional[float]],
-    mode_confidence_counts: Dict[str, int],
     finished_at: str,
 ) -> None:
     lines = [
@@ -240,6 +332,7 @@ def write_config_txt(
         "",
         "[Data]",
         f"input_h5={args.input_h5}",
+        f"new_h5_format={args.new_h5_format}",
         f"h5_example_count={h5_example_count}",
         f"random_seed={args.random_seed}",
         f"num_samples={args.num_samples}",
@@ -265,25 +358,170 @@ def write_config_txt(
         f"ablate_layers_resolved={','.join(str(layer) for layer in ablate_layers)}",
         f"num_ablated_layers={len(ablate_layers)}",
         f"expected_probability_tokens={args.expected_probability_tokens}",
+        f"expected_confidence_tokens={args.expected_confidence_tokens}",
         f"expected_guess_tokens={args.expected_guess_tokens}",
+        f"normalize_span_directions={args.normalize_span_directions}",
         f"parse_mode_verbalised_confidence={args.parse_mode_verbalised_confidence}",
+        f"linguistic_confidence_prompt={args.linguistic_confidence_prompt}",
         f"low_conf_threshold={args.low_conf_threshold}",
         f"high_conf_threshold={args.high_conf_threshold}",
         f"low_conf_selected_count={low_conf_count}",
         f"high_conf_selected_count={high_conf_count}",
-        "",
-        "[Summary: Mean Parsed Verbalised Confidence]",
     ]
-    for mode_key in sorted(mode_confidence_means.keys()):
-        mean_val = mode_confidence_means[mode_key]
-        count_val = int(mode_confidence_counts.get(mode_key, 0))
-        if mean_val is None:
-            lines.append(f"{mode_key}=None ({count_val})")
-        else:
-            lines.append(f"{mode_key}={mean_val:.6f} ({count_val})")
     lines.extend(["", "[Run]", f"finished_at={finished_at}"])
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
+
+
+def _build_summary_json(
+    *,
+    non_none_modes: Sequence[str],
+    ablation_targets: Sequence[str],
+    alphas: Sequence[float],
+    mode_confidence_values: Dict[str, Dict[str, Dict[float, List[float]]]],
+    mode_responses_identical_true: Dict[str, Dict[str, Dict[float, int]]],
+    baseline_values_by_target: Dict[str, List[float]],
+) -> Dict[str, object]:
+    summary: Dict[str, object] = {}
+    for mode in non_none_modes:
+        mode_payload: Dict[str, Dict[str, Dict[str, Optional[float] | int]]] = {}
+        for target in ("low", "high"):
+            if target not in ablation_targets:
+                continue
+            per_alpha_payload: Dict[str, Dict[str, Optional[float] | int]] = {}
+            for alpha in sorted(alphas):
+                alpha_key = _format_alpha(alpha)
+                values = mode_confidence_values.get(mode, {}).get(target, {}).get(alpha, [])
+                mean_conf = float(np.mean(values)) if values else None
+                per_alpha_payload[alpha_key] = {
+                    "alpha_value": float(alpha),
+                    "mean_confidence": mean_conf,
+                    "sample_count": len(values),
+                    "responses_identical_count": int(
+                        mode_responses_identical_true.get(mode, {}).get(target, {}).get(alpha, 0)
+                    ),
+                }
+            mode_payload[target] = per_alpha_payload
+        summary[mode] = mode_payload
+
+    baseline_payload: Dict[str, Dict[str, Optional[float] | int]] = {}
+    for target in ("low", "high"):
+        values = baseline_values_by_target.get(target, [])
+        baseline_payload[target] = {
+            "mean_confidence": float(np.mean(values)) if values else None,
+            "sample_count": len(values),
+            "responses_identical_count": 0,
+        }
+    summary["no_replacement_baseline"] = baseline_payload
+    return summary
+
+
+def write_summary_json(path: str, summary_payload: Dict[str, object]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(summary_payload, f, ensure_ascii=False, indent=2)
+
+
+def _plot_mode_confidence_from_summary(
+    *,
+    mode_name: str,
+    mode_payload: Dict[str, Dict[str, Dict[str, object]]],
+    baseline_payload: Dict[str, Dict[str, object]],
+    ablation_targets: Sequence[str],
+    output_path: str,
+) -> None:
+    target_colors = {"high": "tab:blue", "low": "tab:orange"}
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+
+    for target in ("high", "low"):
+        if target not in ablation_targets:
+            continue
+        alpha_map = mode_payload.get(target, {})
+        if not isinstance(alpha_map, dict):
+            continue
+        points: List[Tuple[float, float, int]] = []
+        for metrics in alpha_map.values():
+            if not isinstance(metrics, dict):
+                continue
+            mean_conf = metrics.get("mean_confidence")
+            alpha_val = metrics.get("alpha_value")
+            sample_count = metrics.get("sample_count", 0)
+            if mean_conf is None or alpha_val is None:
+                continue
+            points.append((float(alpha_val), float(mean_conf), int(sample_count)))
+        points.sort(key=lambda tup: tup[0])
+        if points:
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            ax.plot(xs, ys, marker="o", linewidth=1.8, color=target_colors[target], label=f"target={target}")
+            for x_val, y_val, sample_count in points:
+                ax.annotate(
+                    str(sample_count),
+                    (x_val, y_val),
+                    textcoords="offset points",
+                    xytext=(4, 4),
+                    fontsize=8,
+                    color=target_colors[target],
+                )
+
+    for baseline_target in ("high", "low"):
+        baseline_metrics = baseline_payload.get(baseline_target, {})
+        baseline_mean = baseline_metrics.get("mean_confidence") if isinstance(baseline_metrics, dict) else None
+        if baseline_mean is None:
+            continue
+        ax.axhline(
+            y=float(baseline_mean),
+            color=target_colors[baseline_target],
+            linestyle=":",
+            linewidth=1.0,
+            label=f"baseline_{baseline_target}",
+        )
+
+    ax.set_xlabel("Alpha")
+    ax.set_ylabel("Verbalised confidence")
+    ax.set_ylim(0.0, 1.0)
+    ax.set_title(f"Verbalised confidence vs alpha ({mode_name})")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logging.info("Wrote %s", output_path)
+
+
+def write_summary_plots_from_json(
+    *,
+    summary_payload: Dict[str, object],
+    ablation_targets: Sequence[str],
+    output_dir: str,
+) -> None:
+    baseline_payload = summary_payload.get("no_replacement_baseline", {})
+    if not isinstance(baseline_payload, dict):
+        raise ValueError("summary payload baseline must be a dict")
+    for mode_name, mode_payload in summary_payload.items():
+        if mode_name == "no_replacement_baseline":
+            continue
+        if not isinstance(mode_payload, dict):
+            continue
+        plot_path = os.path.join(output_dir, f"verbalised_confidence_vs_alpha__{mode_name}.png")
+        _plot_mode_confidence_from_summary(
+            mode_name=mode_name,
+            mode_payload=mode_payload,
+            baseline_payload=baseline_payload,
+            ablation_targets=ablation_targets,
+            output_path=plot_path,
+        )
+
+
+def write_summary_plots_from_file(*, summary_json_file: str, ablation_targets: Sequence[str], output_dir: str) -> None:
+    with open(summary_json_file, "r", encoding="utf-8") as f:
+        summary_payload = json.load(f)
+    if not isinstance(summary_payload, dict):
+        raise ValueError(f"Expected dict in summary JSON, got {type(summary_payload).__name__}")
+    write_summary_plots_from_json(
+        summary_payload=summary_payload,
+        ablation_targets=ablation_targets,
+        output_dir=output_dir,
+    )
 
 
 def load_hooked_transformer(
@@ -347,6 +585,44 @@ def _read_h5_node(node):
     return {k: _read_h5_node(node[k]) for k in node.keys()}
 
 
+_NEW_H5_REQUIRED_COMPONENTS = ("res", "attn", "mlp")
+_NEW_H5_REQUIRED_EMBEDDING_FIELDS = (
+    "embeddings_mean_prompt",
+    "embeddings_guess",
+    "embeddings_mean_sem_answer",
+    "embeddings_probability",
+)
+
+
+def _extract_res_field(resp0: dict, ex_id: str, field_name: str, *, new_h5_format: bool):
+    """Return the embedding payload for ``field_name`` on ``resp0``.
+
+    When ``new_h5_format`` is set, every required embedding field is expected to be a
+    dict containing all of ``res``/``attn``/``mlp`` (non-null). Mass-mean direction probing
+    only consumes residual-stream activations; ``attn``/``mlp`` are validated-but-unused.
+    """
+    value = resp0.get(field_name)
+    if not new_h5_format:
+        return value
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"Example {ex_id} responses/0/{field_name} must be a dict with "
+            f"keys {_NEW_H5_REQUIRED_COMPONENTS} when --new_h5_format is set."
+        )
+    for component in _NEW_H5_REQUIRED_COMPONENTS:
+        if component not in value:
+            raise ValueError(
+                f"Example {ex_id} responses/0/{field_name} missing component '{component}' "
+                f"(required when --new_h5_format is set)."
+            )
+        if value[component] is None:
+            raise ValueError(
+                f"Example {ex_id} responses/0/{field_name}/{component} is null "
+                f"(must be populated when --new_h5_format is set)."
+            )
+    return value["res"]
+
+
 def load_examples_h5(path: Path) -> Dict[str, dict]:
     examples: Dict[str, dict] = {}
     with h5py.File(path, "r") as h5_file:
@@ -386,21 +662,103 @@ def _is_expected_or_plus_one(actual_len: int, expected_len: int) -> bool:
     return actual_len in (expected_len, expected_len + 1)
 
 
+def _expected_probability_span_token_budget(
+    *,
+    linguistic_confidence_prompt: bool,
+    expected_probability_tokens: int,
+    expected_confidence_tokens: int,
+) -> int:
+    """Token budget for span length checks and truncation on decoded completions."""
+    return expected_confidence_tokens if linguistic_confidence_prompt else expected_probability_tokens
+
+
+def _completion_token_index_to_abs_pos(prompt_len: int, completion_index: int) -> int:
+    """Map completion-relative token index (0 = first generated token) to full-sequence position.
+
+    First generated token aligns with ``prompt_len - 1`` (same convention as
+    ``layerwise_mean_ablation.run_mean_ablation``).
+    """
+    return prompt_len + completion_index - 1
+
+
 def _absolute_prob_positions(
     prompt_len: int,
     decoded_tokens: List[str],
     *,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int,
+    linguistic_confidence_prompt: bool = False,
 ) -> List[int]:
-    parsed = parse_guess_and_probability_indices(decoded_tokens)
+    parsed = parse_guess_and_marker_indices(
+        decoded_tokens,
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
+    )
     if parsed is None:
         return []
     _, first_prob, end_prob = parsed
-    rel_positions = list(range(first_prob, end_prob))
-    if not _is_expected_or_plus_one(len(rel_positions), expected_probability_tokens):
+    rel_positions = list(range(first_prob, end_prob+1))
+    span_budget = _expected_probability_span_token_budget(
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
+        expected_probability_tokens=expected_probability_tokens,
+        expected_confidence_tokens=expected_confidence_tokens,
+    )
+    logging.info(f"rel_positions: {rel_positions}")
+    logging.info(f"span_budget: {span_budget}, length of rel_positions: {len(rel_positions)}")
+    logging.info(f"prompt_len: {prompt_len}, decoded_tokens length: {len(decoded_tokens)}")
+    if not _is_expected_or_plus_one(len(rel_positions), span_budget):
         return []
-    rel_positions = rel_positions[:expected_probability_tokens]
-    return [prompt_len + pos for pos in rel_positions]
+    rel_positions = rel_positions[:span_budget]
+    final_tokens = [_completion_token_index_to_abs_pos(prompt_len, pos) for pos in rel_positions]
+    logging.info(f"final_tokens: {final_tokens}")
+    return final_tokens
+
+
+def _absolute_prob_last_token_only(
+    prompt_len: int,
+    decoded_tokens: List[str],
+    *,
+    expected_probability_tokens: int,
+    linguistic_confidence_prompt: bool = False,
+) -> List[int]:
+    """Absolute index for the last token in the ``Probability:`` marker span (numeric prompt only)."""
+    if linguistic_confidence_prompt:
+        return []
+    parsed = parse_guess_and_marker_indices(
+        decoded_tokens,
+        linguistic_confidence_prompt=False,
+    )
+    if parsed is None:
+        return []
+    _, first_prob, end_prob = parsed
+    full_rel_positions = list(range(first_prob, end_prob + 1))
+    if not _is_expected_or_plus_one(len(full_rel_positions), expected_probability_tokens):
+        return []
+    return [_completion_token_index_to_abs_pos(prompt_len, end_prob)]
+
+
+def _absolute_prob_marker_except_last_token(
+    prompt_len: int,
+    decoded_tokens: List[str],
+    *,
+    expected_probability_tokens: int,
+    linguistic_confidence_prompt: bool = False,
+) -> List[int]:
+    """Absolute indices for the ``Probability:`` marker span excluding the last span token."""
+    if linguistic_confidence_prompt:
+        return []
+    parsed = parse_guess_and_marker_indices(
+        decoded_tokens,
+        linguistic_confidence_prompt=False,
+    )
+    if parsed is None:
+        return []
+    _, first_prob, end_prob = parsed
+    full_rel_positions = list(range(first_prob, end_prob + 1))
+    if not _is_expected_or_plus_one(len(full_rel_positions), expected_probability_tokens):
+        return []
+    return [
+        _completion_token_index_to_abs_pos(prompt_len, pos) for pos in range(first_prob, end_prob)
+    ]
 
 
 def _absolute_guess_span_positions(
@@ -416,7 +774,7 @@ def _absolute_guess_span_positions(
     if not _is_expected_or_plus_one(len(guess_positions_rel), expected_guess_tokens):
         return []
     guess_positions_rel = guess_positions_rel[:expected_guess_tokens]
-    return [prompt_len + k for k in guess_positions_rel]
+    return [_completion_token_index_to_abs_pos(prompt_len, k) for k in guess_positions_rel]
 
 
 def _absolute_pre_probability_positions(
@@ -425,8 +783,18 @@ def _absolute_pre_probability_positions(
     *,
     expected_guess_tokens: int,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int,
+    linguistic_confidence_prompt: bool = False,
 ) -> Optional[Dict[str, List[int]]]:
-    parsed = parse_guess_and_probability_indices(decoded_tokens)
+    """Absolute positions for pre-probability mean ablation.
+
+    ``prompt`` uses indices ``0 .. prompt_len-2`` (excludes the last prompt position, which
+    aligns with the first generated token under the completion-index mapping).
+    """
+    parsed = parse_guess_and_marker_indices(
+        decoded_tokens,
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
+    )
     if parsed is None:
         return None
     last_guess_token_index, first_prob_token_index, end_prob_token_index = parsed
@@ -436,16 +804,26 @@ def _absolute_pre_probability_positions(
         return None
     guess_positions_rel = guess_positions_rel[:expected_guess_tokens]
 
-    probability_positions_rel = list(range(first_prob_token_index, end_prob_token_index))
-    if not _is_expected_or_plus_one(len(probability_positions_rel), expected_probability_tokens):
+    probability_positions_rel = list(range(first_prob_token_index, end_prob_token_index+1))
+    span_budget = _expected_probability_span_token_budget(
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
+        expected_probability_tokens=expected_probability_tokens,
+        expected_confidence_tokens=expected_confidence_tokens,
+    )
+    if not _is_expected_or_plus_one(len(probability_positions_rel), span_budget):
         return None
-    probability_positions_rel = probability_positions_rel[:expected_probability_tokens]
+    probability_positions_rel = probability_positions_rel[:span_budget]
 
     return {
-        "prompt": list(range(0, prompt_len)),
-        "guess": [prompt_len + k for k in guess_positions_rel],
-        "sem_answer": [prompt_len + k for k in range(last_guess_token_index, first_prob_token_index)],
-        "probability": [prompt_len + k for k in probability_positions_rel],
+        "prompt": list(range(0, prompt_len - 1)),
+        "guess": [_completion_token_index_to_abs_pos(prompt_len, k) for k in guess_positions_rel],
+        "sem_answer": [
+            _completion_token_index_to_abs_pos(prompt_len, k)
+            for k in range(last_guess_token_index, first_prob_token_index)
+        ],
+        "probability": [
+            _completion_token_index_to_abs_pos(prompt_len, k) for k in probability_positions_rel
+        ],
     }
 
 
@@ -462,7 +840,7 @@ def _absolute_all_pre_guess_positions(
     )
     if not guess_positions:
         return []
-    return list(range(0, prompt_len)) + guess_positions
+    return list(range(0, prompt_len - 1)) + guess_positions
 
 
 def _generation_contains_stop(decoded_completion: str) -> bool:
@@ -522,6 +900,8 @@ def _direction_mode_activation_applier_builder(
     *,
     expected_guess_tokens: int,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int,
+    linguistic_confidence_prompt: bool = False,
 ) -> Callable[[int, Callable[[], List[str]]], Callable[[torch.Tensor, Dict[str, torch.Tensor]], torch.Tensor]]:
     def _builder(
         prompt_len: int,
@@ -533,21 +913,79 @@ def _direction_mode_activation_applier_builder(
                 layer_delta: Dict[str, torch.Tensor],
             ) -> torch.Tensor:
                 prob_vecs = layer_delta["probability"].to(activation.dtype)
+                logging.info(f"mode: {mode}")
                 prob_positions = _absolute_prob_positions(
                     prompt_len,
                     decoded_tokens_provider(),
                     expected_probability_tokens=expected_probability_tokens,
+                    expected_confidence_tokens=expected_confidence_tokens,
+                    linguistic_confidence_prompt=linguistic_confidence_prompt,
                 )
                 if not prob_positions:
                     return activation
-                if len(prob_positions) != prob_vecs.shape[0]:
-                    raise ValueError(f"Expected {prob_vecs.shape[0]} probability tokens, got {len(prob_positions)}.")
+                n_pos = len(prob_positions)
+                if linguistic_confidence_prompt:
+                    if n_pos > prob_vecs.shape[0]:
+                        raise ValueError(
+                            f"Linguistic confidence span has {n_pos} token positions but direction has "
+                            f"{prob_vecs.shape[0]} probability components."
+                        )
+                    prob_use = prob_vecs[:n_pos]
+                else:
+                    if n_pos != prob_vecs.shape[0]:
+                        raise ValueError(f"Expected {prob_vecs.shape[0]} probability tokens, got {n_pos}.")
+                    prob_use = prob_vecs
                 for pos_i, abs_pos in enumerate(prob_positions):
+                    if 0 <= abs_pos < activation.shape[1]:
+                        activation[:, abs_pos, :] = activation[:, abs_pos, :] + prob_use[pos_i]
+                return activation
+
+            return _apply_probability_tokens_mean_replace
+
+        if mode == "probability_last_token_mean_replace":
+            def _apply_probability_last_token_mean_replace(
+                activation: torch.Tensor,
+                layer_delta: Dict[str, torch.Tensor],
+            ) -> torch.Tensor:
+                prob_vecs = layer_delta["probability"].to(activation.dtype)
+                prob_positions = _absolute_prob_last_token_only(
+                    prompt_len,
+                    decoded_tokens_provider(),
+                    expected_probability_tokens=expected_probability_tokens,
+                    linguistic_confidence_prompt=linguistic_confidence_prompt,
+                )
+                if not prob_positions:
+                    return activation
+                abs_pos = prob_positions[0]
+                if 0 <= abs_pos < activation.shape[1]:
+                    activation[:, abs_pos, :] = activation[:, abs_pos, :] + prob_vecs[-1]
+                return activation
+
+            return _apply_probability_last_token_mean_replace
+
+        if mode == "probability_span_except_last_token_mean_replace":
+            def _apply_probability_span_except_last_token_mean_replace(
+                activation: torch.Tensor,
+                layer_delta: Dict[str, torch.Tensor],
+            ) -> torch.Tensor:
+                prob_vecs = layer_delta["probability"].to(activation.dtype)
+                prob_positions = _absolute_prob_marker_except_last_token(
+                    prompt_len,
+                    decoded_tokens_provider(),
+                    expected_probability_tokens=expected_probability_tokens,
+                    linguistic_confidence_prompt=linguistic_confidence_prompt,
+                )
+                if not prob_positions:
+                    return activation
+                n = min(len(prob_positions), max(0, prob_vecs.shape[0] - 1))
+                if n == 0:
+                    return activation
+                for pos_i, abs_pos in enumerate(prob_positions[:n]):
                     if 0 <= abs_pos < activation.shape[1]:
                         activation[:, abs_pos, :] = activation[:, abs_pos, :] + prob_vecs[pos_i]
                 return activation
 
-            return _apply_probability_tokens_mean_replace
+            return _apply_probability_span_except_last_token_mean_replace
 
         if mode == "guess_tokens_mean_replace":
             def _apply_guess_tokens_mean_replace(
@@ -586,6 +1024,8 @@ def _direction_mode_activation_applier_builder(
                     decoded_tokens_provider(),
                     expected_guess_tokens=expected_guess_tokens,
                     expected_probability_tokens=expected_probability_tokens,
+                    expected_confidence_tokens=expected_confidence_tokens,
+                    linguistic_confidence_prompt=linguistic_confidence_prompt,
                 )
                 if positions is None:
                     return activation
@@ -603,13 +1043,23 @@ def _direction_mode_activation_applier_builder(
                 for abs_pos in positions["sem_answer"]:
                     if 0 <= abs_pos < activation.shape[1]:
                         activation[:, abs_pos, :] = activation[:, abs_pos, :] + sem_answer_vec
-                if len(positions["probability"]) != prob_vecs.shape[0]:
-                    raise ValueError(
-                        f"Expected {prob_vecs.shape[0]} probability tokens, got {len(positions['probability'])}."
-                    )
+                n_prob = len(positions["probability"])
+                if linguistic_confidence_prompt:
+                    if n_prob > prob_vecs.shape[0]:
+                        raise ValueError(
+                            f"Linguistic confidence span has {n_prob} token positions but direction has "
+                            f"{prob_vecs.shape[0]} probability components."
+                        )
+                    prob_use = prob_vecs[:n_prob]
+                else:
+                    if n_prob != prob_vecs.shape[0]:
+                        raise ValueError(
+                            f"Expected {prob_vecs.shape[0]} probability tokens, got {n_prob}."
+                        )
+                    prob_use = prob_vecs
                 for pos_i, abs_pos in enumerate(positions["probability"]):
                     if 0 <= abs_pos < activation.shape[1]:
-                        activation[:, abs_pos, :] = activation[:, abs_pos, :] + prob_vecs[pos_i]
+                        activation[:, abs_pos, :] = activation[:, abs_pos, :] + prob_use[pos_i]
                 return activation
 
             return _apply_all_pre_probability_tokens_mean_replace
@@ -630,10 +1080,10 @@ def _direction_mode_activation_applier_builder(
                 if not all_pre_guess_positions:
                     return activation
 
-                for abs_pos in all_pre_guess_positions[:prompt_len]:
+                for abs_pos in all_pre_guess_positions[: prompt_len - 1]:
                     if 0 <= abs_pos < activation.shape[1]:
                         activation[:, abs_pos, :] = activation[:, abs_pos, :] + prompt_vec
-                guess_positions = all_pre_guess_positions[prompt_len:]
+                guess_positions = all_pre_guess_positions[prompt_len - 1 :]
                 if len(guess_positions) != guess_vecs.shape[0]:
                     raise ValueError(f"Expected {guess_vecs.shape[0]} guess tokens, got {len(guess_positions)}.")
                 for pos_i, abs_pos in enumerate(guess_positions):
@@ -643,8 +1093,8 @@ def _direction_mode_activation_applier_builder(
 
             return _apply_all_pre_guess_tokens_mean_replace
 
-        if mode == "guess_then_guess_probability_zero_ablate":
-            def _apply_guess_then_guess_probability_zero_ablate(
+        if mode == "guess_then_guess_probability_mean_replace":
+            def _apply_guess_then_guess_probability_mean_replace(
                 activation: torch.Tensor,
                 layer_delta: Dict[str, torch.Tensor],
             ) -> torch.Tensor:
@@ -669,18 +1119,30 @@ def _direction_mode_activation_applier_builder(
                     prompt_len,
                     decoded_tokens_provider(),
                     expected_probability_tokens=expected_probability_tokens,
+                    expected_confidence_tokens=expected_confidence_tokens,
+                    linguistic_confidence_prompt=linguistic_confidence_prompt,
                 )
                 if prob_positions:
-                    if len(prob_positions) != prob_vecs.shape[0]:
-                        raise ValueError(
-                            f"Expected {prob_vecs.shape[0]} probability tokens, got {len(prob_positions)}."
-                        )
+                    n_pos = len(prob_positions)
+                    if linguistic_confidence_prompt:
+                        if n_pos > prob_vecs.shape[0]:
+                            raise ValueError(
+                                f"Linguistic confidence span has {n_pos} token positions but direction has "
+                                f"{prob_vecs.shape[0]} probability components."
+                            )
+                        prob_use = prob_vecs[:n_pos]
+                    else:
+                        if n_pos != prob_vecs.shape[0]:
+                            raise ValueError(
+                                f"Expected {prob_vecs.shape[0]} probability tokens, got {n_pos}."
+                            )
+                        prob_use = prob_vecs
                     for pos_i, abs_pos in enumerate(prob_positions):
                         if 0 <= abs_pos < activation.shape[1]:
-                            activation[:, abs_pos, :] = activation[:, abs_pos, :] + prob_vecs[pos_i]
+                            activation[:, abs_pos, :] = activation[:, abs_pos, :] + prob_use[pos_i]
                 return activation
 
-            return _apply_guess_then_guess_probability_zero_ablate
+            return _apply_guess_then_guess_probability_mean_replace
 
         raise ValueError(f"Unknown ablation mode for perturb hooks: {mode!r}")
 
@@ -695,12 +1157,16 @@ def build_direction_perturb_hooks(
     decoded_tokens_provider: Callable[[], List[str]],
     expected_guess_tokens: int,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int,
+    linguistic_confidence_prompt: bool = False,
 ) -> List[Tuple[str, Callable]]:
     hooks: List[Tuple[str, Callable]] = []
     activation_applier_builder = _direction_mode_activation_applier_builder(
         mode,
         expected_guess_tokens=expected_guess_tokens,
         expected_probability_tokens=expected_probability_tokens,
+        expected_confidence_tokens=expected_confidence_tokens,
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
     )
     activation_applier = activation_applier_builder(prompt_len, decoded_tokens_provider)
     for layer in layer_to_span_delta:
@@ -727,6 +1193,8 @@ def greedy_generate_direction_perturbed(
     mode: str,
     expected_guess_tokens: int,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int,
+    linguistic_confidence_prompt: bool = False,
 ) -> Tuple[str, List[str]]:
     tokens = model.to_tokens(local_prompt)
     prompt_len = int(tokens.shape[1])
@@ -743,6 +1211,8 @@ def greedy_generate_direction_perturbed(
         decoded_tokens_provider=_decoded_tokens_provider,
         expected_guess_tokens=expected_guess_tokens,
         expected_probability_tokens=expected_probability_tokens,
+        expected_confidence_tokens=expected_confidence_tokens,
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
     )
     with torch.inference_mode():
         for _ in range(max_new_tokens):
@@ -768,6 +1238,7 @@ def compute_low_high_span_means_and_directions(
     high_conf_threshold: float,
     expected_probability_tokens: int,
     expected_guess_tokens: int,
+    new_h5_format: bool = False,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray], set[str], set[str]]:
     low_vectors: Dict[str, List[np.ndarray]] = {
         "prompt_mean": [],
@@ -803,10 +1274,18 @@ def compute_low_high_span_means_and_directions(
         if not (is_low or is_high):
             continue
 
-        emb_prompt = resp0.get("embeddings_mean_prompt")
-        emb_guess = resp0.get("embeddings_guess")
-        emb_sem_answer = resp0.get("embeddings_mean_sem_answer")
-        emb_prob = resp0.get("embeddings_probability")
+        emb_prompt = _extract_res_field(
+            resp0, ex_id, "embeddings_mean_prompt", new_h5_format=new_h5_format
+        )
+        emb_guess = _extract_res_field(
+            resp0, ex_id, "embeddings_guess", new_h5_format=new_h5_format
+        )
+        emb_sem_answer = _extract_res_field(
+            resp0, ex_id, "embeddings_mean_sem_answer", new_h5_format=new_h5_format
+        )
+        emb_prob = _extract_res_field(
+            resp0, ex_id, "embeddings_probability", new_h5_format=new_h5_format
+        )
         if emb_prompt is None or emb_guess is None or emb_sem_answer is None or emb_prob is None:
             raise ValueError(
                 f"Example {ex_id} is missing one of required fields: "
@@ -859,6 +1338,46 @@ def compute_low_high_span_means_and_directions(
     return mean_low, mean_high, direction, low_ids, high_ids
 
 
+def normalize_direction_spans_to_unit_norm_budget(
+    direction_by_span: Dict[str, np.ndarray],
+    *,
+    spans: Sequence[str],
+) -> Dict[str, Dict[str, float]]:
+    stats: Dict[str, Dict[str, float]] = {}
+    for span in spans:
+        if span not in direction_by_span:
+            raise ValueError(f"Cannot normalize missing span directions: {span!r}")
+        span_direction = direction_by_span[span]
+        if span_direction.ndim != 3:
+            raise ValueError(
+                f"Expected direction[{span!r}] to have shape (layers, token_positions, d_model), "
+                f"got ndim={span_direction.ndim} shape={span_direction.shape}."
+            )
+
+        num_layers, num_token_positions, _ = span_direction.shape
+        target_sum = float(num_layers * num_token_positions)
+        sum_before = float(np.sum(np.linalg.norm(span_direction, axis=-1)))
+
+        if sum_before <= 0.0:
+            logging.warning(
+                "Skipping direction normalization for span=%s because sum of norms is zero.",
+                span,
+            )
+            scale = 1.0
+        else:
+            scale = target_sum / sum_before
+            direction_by_span[span] = (span_direction * scale).astype(np.float32, copy=False)
+
+        sum_after = float(np.sum(np.linalg.norm(direction_by_span[span], axis=-1)))
+        stats[span] = {
+            "target_sum": target_sum,
+            "sum_before": sum_before,
+            "sum_after": sum_after,
+            "scale": float(scale),
+        }
+    return stats
+
+
 def write_layer_direction_pickles(
     *,
     output_json_path: str,
@@ -901,8 +1420,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Mass mean direction probe inference (TransformerLens).")
     parser.add_argument("--model_name", type=str, default="mistralai/Mistral-7B-Instruct-v0.1")
     parser.add_argument("--input_h5", type=str, required=True, help="Path to *_verbalised_embeddings.h5 file.")
+    parser.add_argument(
+        "--new_h5_format",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If set, expect the new process_generations_more_embs_from_h5.py output where each "
+            "embedding field is a dict containing 'res', 'attn', and 'mlp' subfields. Validates "
+            "all three are present per example and reads from 'res' (attn/mlp are not used for "
+            "mass-mean residual-stream direction probing)."
+        ),
+    )
     parser.add_argument("--device", type=str, default=None, help="e.g. cuda, cuda:0, cpu")
-    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    parser.add_argument("--dtype", type=str, default="float32", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--random_seed", type=int, default=10)
     parser.add_argument("--num_samples", type=int, default=400)
     parser.add_argument("--num_few_shot", type=int, default=0)
@@ -927,17 +1457,25 @@ def main() -> None:
             "all_pre_probability_tokens_mean_replace",
             "guess_tokens_mean_replace",
             "all_pre_guess_tokens_mean_replace",
-            "guess_then_guess_probability_zero_ablate",
+            "guess_then_guess_probability_mean_replace",
         ],
         choices=[
             "none",
             "probability_tokens_mean_replace",
+            "probability_last_token_mean_replace",
+            "probability_span_except_last_token_mean_replace",
             "all_pre_probability_tokens_mean_replace",
             "guess_tokens_mean_replace",
             "all_pre_guess_tokens_mean_replace",
-            "guess_then_guess_probability_zero_ablate",
+            "guess_then_guess_probability_mean_replace",
         ],
-        help="Ablation mode(s) to run. Includes additional dynamic span perturbation modes.",
+        help=(
+            "Ablation mode(s) to run. probability_last_token_mean_replace: perturb only the "
+            "last token in the Probability: marker span (last H5 probability row). "
+            "probability_span_except_last_token_mean_replace: perturb all Probability: span "
+            "tokens except that last span token (remaining H5 probability rows). "
+            "Both subset modes apply only with the numeric Probability: prompt."
+        ),
     )
     parser.add_argument(
         "--alpha",
@@ -956,13 +1494,40 @@ def main() -> None:
     )
     parser.add_argument("--low_conf_threshold", type=float, default=0.1)
     parser.add_argument("--high_conf_threshold", type=float, default=0.9)
-    parser.add_argument("--expected_probability_tokens", type=int, default=6)
+    parser.add_argument("--expected_probability_tokens", type=int, default=7)
+    parser.add_argument(
+        "--expected_confidence_tokens",
+        type=int,
+        default=5,
+        help=(
+            "When --linguistic_confidence_prompt, expected number of completion tokens in the Confidence: "
+            "span for position parsing checks and truncation (instead of --expected_probability_tokens)."
+        ),
+    )
     parser.add_argument("--expected_guess_tokens", type=int, default=5)
+    parser.add_argument(
+        "--normalize_span_directions",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If true, normalize guess/probability directions so each span's summed per-(layer,token) "
+            "vector norms equals num_layers * num_token_positions."
+        ),
+    )
     parser.add_argument(
         "--parse_mode_verbalised_confidence",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Parse verbalised confidence from generated responses and report aggregate means.",
+    )
+    parser.add_argument(
+        "--linguistic_confidence_prompt",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If true, use the natural-language Confidence: prompt and map phrases to numeric confidence; "
+            "if false (default), use the numeric Probability: prompt and float parsing."
+        ),
     )
     parser.add_argument(
         "--output_json",
@@ -979,6 +1544,21 @@ def main() -> None:
         raise ValueError(f"Duplicate ablation modes are not allowed: {args.ablation_mode}")
     if "none" not in args.ablation_mode:
         raise ValueError("Please include 'none' in --ablation_mode for baseline comparisons.")
+    if args.normalize_span_directions:
+        normalization_supported_modes = {
+            "none",
+            "probability_tokens_mean_replace",
+            "probability_last_token_mean_replace",
+            "probability_span_except_last_token_mean_replace",
+            "guess_tokens_mean_replace",
+            "guess_then_guess_probability_mean_replace",
+        }
+        unsupported_modes = [mode for mode in args.ablation_mode if mode not in normalization_supported_modes]
+        if unsupported_modes:
+            raise ValueError(
+                "normalize_span_directions only supports ablation modes "
+                f"{sorted(normalization_supported_modes)}. Unsupported: {unsupported_modes}."
+            )
     args.ablation_targets = _dedupe_preserve_order(args.ablation_targets)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -1011,6 +1591,10 @@ def main() -> None:
         use_context=args.use_context,
     )
 
+    confidence_prompt = (
+        CONFIDENCE_PROMPT_LINGUISTIC if args.linguistic_confidence_prompt else CONFIDENCE_PROMPT_NUMERIC
+    )
+
     logging.info("Loading HookedTransformer: %s", args.model_name)
     model = load_hooked_transformer(args.model_name, device=device, torch_dtype=torch_dtype)
     ablate_layers = parse_ablate_layers(args.ablate_layers, model.cfg.n_layers)
@@ -1023,7 +1607,23 @@ def main() -> None:
         high_conf_threshold=args.high_conf_threshold,
         expected_probability_tokens=args.expected_probability_tokens,
         expected_guess_tokens=args.expected_guess_tokens,
+        new_h5_format=args.new_h5_format,
     )
+    if args.normalize_span_directions:
+        # Mutates direction dict in place
+        normalization_stats = normalize_direction_spans_to_unit_norm_budget(
+            direction,
+            spans=("guess", "probability"),
+        )
+        for span_name, span_stats in normalization_stats.items():
+            logging.info(
+                "Normalized span=%s direction norms: before=%.6f after=%.6f target=%.6f scale=%.6f",
+                span_name,
+                span_stats["sum_before"],
+                span_stats["sum_after"],
+                span_stats["target_sum"],
+                span_stats["scale"],
+            )
     del mean_low, mean_high
 
     direction_flat_head = np.ravel(direction["probability"])[:5].tolist()
@@ -1045,22 +1645,22 @@ def main() -> None:
 
     results = {"train": {}, "validation": {}}
     mini_results = {"train": {}, "validation": {}}
-    mode_confidence_values: Dict[str, List[float]] = {"no_replacement": []}
+    mode_confidence_values: Dict[str, Dict[str, Dict[float, List[float]]]] = {
+        mode: {target: {float(alpha): [] for alpha in args.alpha} for target in args.ablation_targets}
+        for mode in [m for m in args.ablation_mode if m != "none"]
+    }
+    mode_responses_identical_true: Dict[str, Dict[str, Dict[float, int]]] = {
+        mode: {target: {float(alpha): 0 for alpha in args.alpha} for target in args.ablation_targets}
+        for mode in [m for m in args.ablation_mode if m != "none"]
+    }
+    baseline_values_by_target: Dict[str, List[float]] = {"low": [], "high": []}
     non_none_modes = [m for m in args.ablation_mode if m != "none"]
-    for mode in non_none_modes:
-        for target in args.ablation_targets:
-            for alpha in args.alpha:
-                key = f"{mode_to_output_key(mode)}__target_{target}__alpha_{_format_alpha(alpha)}"
-                mode_confidence_values[key] = []
 
     for split_name, eval_ds in [("train", train_ds), ("validation", val_ds)]:
         split_target = round(args.num_samples * TRAIN_RATIO) if split_name == "train" else round(args.num_samples * (1 - TRAIN_RATIO))
         id_to_index = {encode_example_id(ex["id"]): i for i, ex in enumerate(eval_ds)}
-        target_union_ids: set[str] = set()
-        if "low" in args.ablation_targets:
-            target_union_ids.update(low_ids)
-        if "high" in args.ablation_targets:
-            target_union_ids.update(high_ids)
+        # Always include both confidence groups so high/low baselines are both available in summary/plots.
+        target_union_ids: set[str] = set(low_ids) | set(high_ids)
         split_target_ids = sorted(ex_id for ex_id in target_union_ids if ex_id in id_to_index)
         selected_ids = split_target_ids[: min(split_target, len(split_target_ids))]
         logging.info("Generating for %d examples (%s split).", len(selected_ids), split_name)
@@ -1070,7 +1670,7 @@ def main() -> None:
             if ds_idx is None:
                 continue
             example = eval_ds[int(ds_idx)]
-            local_prompt = fewshot_prefix + CONFIDENCE_PROMPT + example["question"]
+            local_prompt = fewshot_prefix + confidence_prompt + example["question"]
             entry = {"question": example["question"]}
             mini_entry = {"question": example["question"]}
 
@@ -1083,7 +1683,9 @@ def main() -> None:
                 fwd_hooks=None,
             )
             baseline_confidence = (
-                parse_mode_confidence_from_response(baseline_response)
+                parse_mode_confidence_from_response(
+                    baseline_response, linguistic_prompt=args.linguistic_confidence_prompt
+                )
                 if args.parse_mode_verbalised_confidence
                 else None
             )
@@ -1095,11 +1697,14 @@ def main() -> None:
             if args.parse_mode_verbalised_confidence:
                 entry["no_replacement"]["verbalised_confidence"] = baseline_confidence
                 mini_entry["no_replacement"]["verbalised_confidence"] = baseline_confidence
-                if baseline_confidence is not None:
-                    mode_confidence_values["no_replacement"].append(float(baseline_confidence))
 
             ex_is_low = ex_id in low_ids
             ex_is_high = ex_id in high_ids
+            if args.parse_mode_verbalised_confidence and baseline_confidence is not None:
+                if ex_is_low:
+                    baseline_values_by_target["low"].append(float(baseline_confidence))
+                if ex_is_high:
+                    baseline_values_by_target["high"].append(float(baseline_confidence))
 
             for target in args.ablation_targets:
                 # Only evaluate target/group combinations this example belongs to.
@@ -1134,9 +1739,13 @@ def main() -> None:
                             mode=mode,
                             expected_guess_tokens=args.expected_guess_tokens,
                             expected_probability_tokens=args.expected_probability_tokens,
+                            expected_confidence_tokens=args.expected_confidence_tokens,
+                            linguistic_confidence_prompt=args.linguistic_confidence_prompt,
                         )
                         mode_confidence = (
-                            parse_mode_confidence_from_response(response)
+                            parse_mode_confidence_from_response(
+                                response, linguistic_prompt=args.linguistic_confidence_prompt
+                            )
                             if args.parse_mode_verbalised_confidence
                             else None
                         )
@@ -1151,7 +1760,9 @@ def main() -> None:
                             entry[key]["verbalised_confidence"] = mode_confidence
                             mini_entry[key]["verbalised_confidence"] = mode_confidence
                             if mode_confidence is not None:
-                                mode_confidence_values[key].append(float(mode_confidence))
+                                mode_confidence_values[mode][target][float(alpha)].append(float(mode_confidence))
+                            if responses_identical:
+                                mode_responses_identical_true[mode][target][float(alpha)] += 1
                             if mode_confidence is None or baseline_confidence is None:
                                 meets_none_confidence_direction = None
                             elif target == "low":
@@ -1165,17 +1776,27 @@ def main() -> None:
             mini_results[split_name][ex_id] = mini_entry
             logging.info("[%s %d/%d] %s first line: %r", split_name, i + 1, len(selected_ids), ex_id, baseline_response[:120])
 
-    mode_confidence_means: Dict[str, Optional[float]] = {}
-    mode_confidence_counts: Dict[str, int] = {}
-    for mode_key, values in mode_confidence_values.items():
-        mode_confidence_means[mode_key] = float(np.mean(values)) if values else None
-        mode_confidence_counts[mode_key] = len(values)
+    summary_payload = _build_summary_json(
+        non_none_modes=non_none_modes,
+        ablation_targets=args.ablation_targets,
+        alphas=args.alpha,
+        mode_confidence_values=mode_confidence_values,
+        mode_responses_identical_true=mode_responses_identical_true,
+        baseline_values_by_target=baseline_values_by_target,
+    )
 
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
     mini_out_path = mini_output_json_path(out_path)
     with open(mini_out_path, "w", encoding="utf-8") as f:
         json.dump(mini_results, f, ensure_ascii=False, indent=2)
+    summary_out_path = summary_json_path(out_path)
+    write_summary_json(summary_out_path, summary_payload)
+    write_summary_plots_from_file(
+        summary_json_file=summary_out_path,
+        ablation_targets=args.ablation_targets,
+        output_dir=os.path.dirname(out_path),
+    )
     write_layer_direction_pickles(
         output_json_path=out_path,
         ablate_layers=ablate_layers,
@@ -1194,12 +1815,11 @@ def main() -> None:
         low_conf_count=len(low_ids),
         high_conf_count=len(high_ids),
         h5_example_count=len(examples_h5),
-        mode_confidence_means=mode_confidence_means,
-        mode_confidence_counts=mode_confidence_counts,
         finished_at=datetime.now().astimezone().isoformat(timespec="seconds"),
     )
     logging.info("Wrote %s", out_path)
     logging.info("Wrote %s", mini_out_path)
+    logging.info("Wrote %s", summary_out_path)
     logging.info("Wrote %s", config_out_path)
 
 
