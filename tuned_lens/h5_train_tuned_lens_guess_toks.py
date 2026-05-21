@@ -780,7 +780,8 @@ def main():
         description="Train tuned-lens affine probes for all layers using embeddings_guess[0..5] from H5."
     )
     parser.add_argument("--train_path", type=str, required=True)
-    parser.add_argument("--val_path", type=str, required=True)
+    parser.add_argument("--test_path", type=str, required=False)
+    parser.add_argument("--val_path", type=str, required=False, help="Deprecated alias for --test_path.")
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -810,6 +811,11 @@ def main():
     )
     parser.add_argument("--log_every", type=int, default=10)
     args = parser.parse_args()
+
+    if args.val_path is None and args.test_path is not None:
+        args.val_path = args.test_path
+    if args.val_path is None:
+        raise ValueError("--test_path (or deprecated --val_path) is required")
 
     if args.steps <= 0:
         raise ValueError("--steps must be >= 1")

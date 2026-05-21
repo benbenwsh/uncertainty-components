@@ -249,6 +249,7 @@ def mode_to_output_key(mode: str) -> str:
         "probability_tokens_mean_replace",
         "probability_last_token_mean_replace",
         "probability_span_except_last_token_mean_replace",
+        "probability_value_mean_replace",
         "all_pre_probability_tokens_mean_replace",
         "guess_tokens_mean_replace",
         "all_pre_guess_tokens_mean_replace",
@@ -718,20 +719,24 @@ def _absolute_prob_last_token_only(
     decoded_tokens: List[str],
     *,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int,
     linguistic_confidence_prompt: bool = False,
 ) -> List[int]:
-    """Absolute index for the last token in the ``Probability:`` marker span (numeric prompt only)."""
-    if linguistic_confidence_prompt:
-        return []
+    """Absolute index for the last token in the Probability:/Confidence: marker span."""
     parsed = parse_guess_and_marker_indices(
         decoded_tokens,
-        linguistic_confidence_prompt=False,
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
     )
     if parsed is None:
         return []
     _, first_prob, end_prob = parsed
     full_rel_positions = list(range(first_prob, end_prob + 1))
-    if not _is_expected_or_plus_one(len(full_rel_positions), expected_probability_tokens):
+    span_budget = _expected_probability_span_token_budget(
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
+        expected_probability_tokens=expected_probability_tokens,
+        expected_confidence_tokens=expected_confidence_tokens,
+    )
+    if not _is_expected_or_plus_one(len(full_rel_positions), span_budget):
         return []
     return [_completion_token_index_to_abs_pos(prompt_len, end_prob)]
 
@@ -741,20 +746,24 @@ def _absolute_prob_marker_except_last_token(
     decoded_tokens: List[str],
     *,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int,
     linguistic_confidence_prompt: bool = False,
 ) -> List[int]:
-    """Absolute indices for the ``Probability:`` marker span excluding the last span token."""
-    if linguistic_confidence_prompt:
-        return []
+    """Absolute indices for the Probability:/Confidence: marker span excluding the last span token."""
     parsed = parse_guess_and_marker_indices(
         decoded_tokens,
-        linguistic_confidence_prompt=False,
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
     )
     if parsed is None:
         return []
     _, first_prob, end_prob = parsed
     full_rel_positions = list(range(first_prob, end_prob + 1))
-    if not _is_expected_or_plus_one(len(full_rel_positions), expected_probability_tokens):
+    span_budget = _expected_probability_span_token_budget(
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
+        expected_probability_tokens=expected_probability_tokens,
+        expected_confidence_tokens=expected_confidence_tokens,
+    )
+    if not _is_expected_or_plus_one(len(full_rel_positions), span_budget):
         return []
     return [
         _completion_token_index_to_abs_pos(prompt_len, pos) for pos in range(first_prob, end_prob)
@@ -825,6 +834,22 @@ def _absolute_pre_probability_positions(
             _completion_token_index_to_abs_pos(prompt_len, k) for k in probability_positions_rel
         ],
     }
+
+
+def _absolute_probability_value_start_position(
+    prompt_len: int,
+    decoded_tokens: List[str],
+) -> Optional[int]:
+    """Absolute position of first probability-value token (numeric Probability: parser only)."""
+    parsed = parse_guess_and_probability_indices(decoded_tokens)
+    if parsed is None:
+        return None
+    _, _, end_prob_token_index = parsed
+    seq_len = prompt_len + len(decoded_tokens)
+    abs_pos = _completion_token_index_to_abs_pos(prompt_len, end_prob_token_index)
+    if 0 <= abs_pos < seq_len:
+        return abs_pos
+    return None
 
 
 def _absolute_all_pre_guess_positions(
@@ -952,6 +977,7 @@ def _direction_mode_activation_applier_builder(
                     prompt_len,
                     decoded_tokens_provider(),
                     expected_probability_tokens=expected_probability_tokens,
+                    expected_confidence_tokens=expected_confidence_tokens,
                     linguistic_confidence_prompt=linguistic_confidence_prompt,
                 )
                 if not prob_positions:
@@ -973,6 +999,7 @@ def _direction_mode_activation_applier_builder(
                     prompt_len,
                     decoded_tokens_provider(),
                     expected_probability_tokens=expected_probability_tokens,
+                    expected_confidence_tokens=expected_confidence_tokens,
                     linguistic_confidence_prompt=linguistic_confidence_prompt,
                 )
                 if not prob_positions:
@@ -986,6 +1013,34 @@ def _direction_mode_activation_applier_builder(
                 return activation
 
             return _apply_probability_span_except_last_token_mean_replace
+
+        if mode == "probability_value_mean_replace":
+            def _apply_probability_value_mean_replace(
+                activation: torch.Tensor,
+                layer_delta: Dict[str, torch.Tensor],
+            ) -> torch.Tensor:
+                prob_vecs = layer_delta["probability"].to(activation.dtype)
+                prob_value_mean = layer_delta["probability_value_mean"].to(activation.dtype)
+                if prob_vecs.shape[0] < 1:
+                    raise ValueError("Expected at least one probability direction row for probability_value mode.")
+
+                start_abs = _absolute_probability_value_start_position(prompt_len, decoded_tokens_provider())
+                if start_abs is None:
+                    return activation
+                seq_len = activation.shape[1]
+                if not (0 <= start_abs < seq_len):
+                    return activation
+
+                # First probability-value token uses the last probability-span row.
+                activation[:, start_abs, :] = activation[:, start_abs, :] + prob_vecs[-1]
+                # Subsequent tail positions use a shared probability-value direction.
+                if start_abs + 1 < seq_len:
+                    activation[:, start_abs + 1 : seq_len, :] = (
+                        activation[:, start_abs + 1 : seq_len, :] + prob_value_mean
+                    )
+                return activation
+
+            return _apply_probability_value_mean_replace
 
         if mode == "guess_tokens_mean_replace":
             def _apply_guess_tokens_mean_replace(
@@ -1245,12 +1300,14 @@ def compute_low_high_span_means_and_directions(
         "guess": [],
         "sem_answer_mean": [],
         "probability": [],
+        "probability_value_mean": [],
     }
     high_vectors: Dict[str, List[np.ndarray]] = {
         "prompt_mean": [],
         "guess": [],
         "sem_answer_mean": [],
         "probability": [],
+        "probability_value_mean": [],
     }
     low_ids: set[str] = set()
     high_ids: set[str] = set()
@@ -1286,10 +1343,14 @@ def compute_low_high_span_means_and_directions(
         emb_prob = _extract_res_field(
             resp0, ex_id, "embeddings_probability", new_h5_format=new_h5_format
         )
-        if emb_prompt is None or emb_guess is None or emb_sem_answer is None or emb_prob is None:
+        emb_prob_val = _extract_res_field(
+            resp0, ex_id, "embeddings_mean_prob_val", new_h5_format=new_h5_format
+        )
+        if emb_prompt is None or emb_guess is None or emb_sem_answer is None or emb_prob is None or emb_prob_val is None:
             raise ValueError(
                 f"Example {ex_id} is missing one of required fields: "
-                "embeddings_mean_prompt, embeddings_guess, embeddings_mean_sem_answer, embeddings_probability."
+                "embeddings_mean_prompt, embeddings_guess, embeddings_mean_sem_answer, "
+                "embeddings_probability, embeddings_mean_prob_val."
             )
         if not isinstance(emb_guess, list):
             raise ValueError(f"Example {ex_id} responses/0/embeddings_guess must be a list.")
@@ -1312,16 +1373,19 @@ def compute_low_high_span_means_and_directions(
         sem_answer_selected = _as_layer_hidden(emb_sem_answer)[layer_indices, :]
         guess_selected = np.stack([_as_layer_hidden(tok_arr)[layer_indices, :] for tok_arr in emb_guess], axis=1)
         prob_selected = np.stack([_as_layer_hidden(tok_arr)[layer_indices, :] for tok_arr in emb_prob], axis=1)
+        prob_val_selected = _as_layer_hidden(emb_prob_val)[layer_indices, :]
         if is_low:
             low_vectors["prompt_mean"].append(prompt_selected)
             low_vectors["guess"].append(guess_selected)
             low_vectors["sem_answer_mean"].append(sem_answer_selected)
             low_vectors["probability"].append(prob_selected)
+            low_vectors["probability_value_mean"].append(prob_val_selected)
         if is_high:
             high_vectors["prompt_mean"].append(prompt_selected)
             high_vectors["guess"].append(guess_selected)
             high_vectors["sem_answer_mean"].append(sem_answer_selected)
             high_vectors["probability"].append(prob_selected)
+            high_vectors["probability_value_mean"].append(prob_val_selected)
 
     if not low_vectors["probability"]:
         raise ValueError(f"No low-confidence examples found at threshold <= {low_conf_threshold}.")
@@ -1331,7 +1395,7 @@ def compute_low_high_span_means_and_directions(
     mean_low: Dict[str, np.ndarray] = {}
     mean_high: Dict[str, np.ndarray] = {}
     direction: Dict[str, np.ndarray] = {}
-    for key in ("prompt_mean", "guess", "sem_answer_mean", "probability"):
+    for key in ("prompt_mean", "guess", "sem_answer_mean", "probability", "probability_value_mean"):
         mean_low[key] = np.mean(np.stack(low_vectors[key], axis=0), axis=0).astype(np.float32)
         mean_high[key] = np.mean(np.stack(high_vectors[key], axis=0), axis=0).astype(np.float32)
         direction[key] = (mean_high[key] - mean_low[key]).astype(np.float32)
@@ -1398,6 +1462,7 @@ def write_layer_direction_pickles(
             "probability_prefix_directions": [
                 direction_by_span["probability"][layer_i, tok_i] for tok_i in range(expected_probability_tokens)
             ],
+            "probability_value_mean_direction": direction_by_span["probability_value_mean"][layer_i],
         }
         pickle_path = os.path.join(out_dir, f"layer_{layer_idx}_directions.pkl")
         with open(pickle_path, "wb") as f:
@@ -1454,6 +1519,9 @@ def main() -> None:
         default=[
             "none",
             "probability_tokens_mean_replace",
+            "probability_last_token_mean_replace",
+            "probability_span_except_last_token_mean_replace",
+            "probability_value_mean_replace",
             "all_pre_probability_tokens_mean_replace",
             "guess_tokens_mean_replace",
             "all_pre_guess_tokens_mean_replace",
@@ -1464,6 +1532,7 @@ def main() -> None:
             "probability_tokens_mean_replace",
             "probability_last_token_mean_replace",
             "probability_span_except_last_token_mean_replace",
+            "probability_value_mean_replace",
             "all_pre_probability_tokens_mean_replace",
             "guess_tokens_mean_replace",
             "all_pre_guess_tokens_mean_replace",
@@ -1729,6 +1798,11 @@ def main() -> None:
                                 ),
                                 "probability": torch.tensor(
                                     sign * alpha * direction["probability"][layer_i], device=device, dtype=torch_dtype
+                                ),
+                                "probability_value_mean": torch.tensor(
+                                    sign * alpha * direction["probability_value_mean"][layer_i],
+                                    device=device,
+                                    dtype=torch_dtype,
                                 ),
                             }
                         response, decoded_tokens = greedy_generate_direction_perturbed(

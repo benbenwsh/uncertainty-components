@@ -4,12 +4,12 @@ Train a linear probe for each layer to predict verbalised confidence from embedd
 This file only looks at one token position: TBG; train_multitoken_verbalised_confidence_probe.py looks at more token positions.
 This script loads pickle files, extracts all layers from emb_tok_bef_gen,
 trains one independent probe per layer with the same configuration (model type, hyperparameters,
-same train/val data), and saves under results/all_layers/<run_id>/layer_1/, layer_2/, ...
+same train/test data), and saves under results/all_layers/<run_id>/layer_1/, layer_2/, ...
 
 Usage:
     python train_verbalised_confidence_probe_all_layers.py \
         --train_path semantic_uncertainty/out/1/train_linear_probe.pkl \
-        --val_path semantic_uncertainty/out/1/validation_linear_probe.pkl \
+        --test_path semantic_uncertainty/out/1/test_linear_probe.pkl \
         [--output_dir ./results] \
         [--model_type ridge] \
         [--alpha 1.0] \
@@ -68,18 +68,18 @@ def _load_pickle_batches_minimal(path):
     return data
 
 
-def load_verbalised_confidence_data_all_layers(train_path, val_path):
+def load_verbalised_confidence_data_all_layers(train_path, test_path):
     """
     Load pickle files and extract verbalised confidence and all-layer embeddings from emb_tok_bef_gen.
 
     Returns:
         X_train: (n_examples, n_layers, hidden_dim)
-        X_val: (n_examples, n_layers, hidden_dim)
-        y_train, y_val: (n_examples,) float
+        X_test: (n_examples, n_layers, hidden_dim)
+        y_train, y_test: (n_examples,) float
         n_layers: int
     """
     train_data = _load_pickle_batches_minimal(train_path)
-    val_data = _load_pickle_batches_minimal(val_path)
+    test_data = _load_pickle_batches_minimal(test_path)
 
     def extract_all_layers_and_labels(data_dict):
         X_list = []
@@ -113,31 +113,31 @@ def load_verbalised_confidence_data_all_layers(train_path, val_path):
         return np.array(X_list), np.array(y_list)
 
     X_train, y_train = extract_all_layers_and_labels(train_data)
-    X_val, y_val = extract_all_layers_and_labels(val_data)
+    X_test, y_test = extract_all_layers_and_labels(test_data)
 
-    if len(X_train) == 0 or len(X_val) == 0:
-        raise ValueError("No valid examples in train or val data.")
+    if len(X_train) == 0 or len(X_test) == 0:
+        raise ValueError("No valid examples in train or test data.")
 
     n_layers = X_train.shape[1]
     hidden_dim = X_train.shape[2]
-    if X_val.shape[1] != n_layers or X_val.shape[2] != hidden_dim:
+    if X_test.shape[1] != n_layers or X_test.shape[2] != hidden_dim:
         raise ValueError(
-            f"Train and val layer/hidden dim mismatch: train ({n_layers}, {hidden_dim}), "
-            f"val ({X_val.shape[1]}, {X_val.shape[2]})"
+            f"Train and test layer/hidden dim mismatch: train ({n_layers}, {hidden_dim}), "
+            f"test ({X_test.shape[1]}, {X_test.shape[2]})"
         )
 
-    print(f"Loaded {len(X_train)} training examples, {len(X_val)} validation examples")
+    print(f"Loaded {len(X_train)} training examples, {len(X_test)} test examples")
     print(f"Layers: {n_layers}, embedding dim per layer: {hidden_dim}")
     print(f"Confidence range: [{y_train.min():.3f}, {y_train.max():.3f}]")
 
-    return X_train, X_val, y_train, y_val, n_layers
+    return X_train, X_test, y_train, y_test, n_layers
 
 
-def _plot_metrics_by_layer(layer_numbers, train_metrics, val_metrics, metric_name, metric_label, run_base: Path):
-    """Plot one metric (train and val) vs layer number and save to run_base."""
+def _plot_metrics_by_layer(layer_numbers, train_metrics, test_metrics, metric_name, metric_label, run_base: Path):
+    """Plot one metric (train and test) vs layer number and save to run_base."""
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(layer_numbers, train_metrics, 'o-', label='Train', markersize=4)
-    ax.plot(layer_numbers, val_metrics, 's-', label='Validation', markersize=4)
+    ax.plot(layer_numbers, test_metrics, 's-', label='Test', markersize=4)
     ax.set_xlabel('Layer number')
     ax.set_ylabel(metric_label)
     ax.set_title(f'{metric_label} by layer')
@@ -150,15 +150,15 @@ def _plot_metrics_by_layer(layer_numbers, train_metrics, val_metrics, metric_nam
     print(f"Saved {out_path}")
 
 
-def _plot_all_metrics_by_layer(run_base: Path, layer_numbers, train_metrics_list, val_metrics_list):
+def _plot_all_metrics_by_layer(run_base: Path, layer_numbers, train_metrics_list, test_metrics_list):
     """Create 3 graphs: MSE, MAE, R² vs layer number."""
     metrics_config = [
-        ('mse', 'MSE', train_metrics_list[0], val_metrics_list[0]),
-        ('mae', 'MAE', train_metrics_list[1], val_metrics_list[1]),
-        ('r2', 'R²', train_metrics_list[2], val_metrics_list[2]),
+        ('mse', 'MSE', train_metrics_list[0], test_metrics_list[0]),
+        ('mae', 'MAE', train_metrics_list[1], test_metrics_list[1]),
+        ('r2', 'R²', train_metrics_list[2], test_metrics_list[2]),
     ]
-    for metric_name, metric_label, train_vals, val_vals in metrics_config:
-        _plot_metrics_by_layer(layer_numbers, train_vals, val_vals, metric_name, metric_label, run_base)
+    for metric_name, metric_label, train_vals, test_vals in metrics_config:
+        _plot_metrics_by_layer(layer_numbers, train_vals, test_vals, metric_name, metric_label, run_base)
 
 
 def _get_run_base_dir(output_dir: Path) -> Path:
@@ -179,7 +179,7 @@ def main():
         description="Train one verbalised-confidence probe per layer (same config, independent probes)"
     )
     parser.add_argument('--train_path', type=str, required=True, help='Path to train_linear_probe.pkl')
-    parser.add_argument('--val_path', type=str, required=True, help='Path to validation_linear_probe.pkl')
+    parser.add_argument('--test_path', type=str, required=True, help='Path to test_linear_probe.pkl')
     parser.add_argument(
         '--output_dir',
         type=str,
@@ -199,13 +199,13 @@ def main():
         default=1.0,
         help='Regularization strength for Ridge (default: 1.0)',
     )
-    parser.add_argument('--plot', action='store_true', help='Save train/val regression plots per layer')
+    parser.add_argument('--plot', action='store_true', help='Save train/test regression plots per layer')
     parser.add_argument('--save_model', default=True, action='store_true', help='Save trained probes to pickle')
     args = parser.parse_args()
 
     print("Loading data...")
-    X_train, X_val, y_train, y_val, n_layers = load_verbalised_confidence_data_all_layers(
-        args.train_path, args.val_path
+    X_train, X_test, y_train, y_test, n_layers = load_verbalised_confidence_data_all_layers(
+        args.train_path, args.test_path
     )
 
     run_base = _get_run_base_dir(Path(args.output_dir))
@@ -213,7 +213,7 @@ def main():
 
     layer_numbers = []
     train_mse, train_mae, train_r2 = [], [], []
-    val_mse, val_mae, val_r2 = [], [], []
+    test_mse, test_mae, test_r2 = [], [], []
 
     for layer_idx in range(n_layers):
         layer_name = f"layer_{layer_idx + 1}"
@@ -221,10 +221,10 @@ def main():
         layer_dir.mkdir(parents=True, exist_ok=True)
 
         X_train_l = X_train[:, layer_idx, :]
-        X_val_l = X_val[:, layer_idx, :]
+        X_test_l = X_test[:, layer_idx, :]
 
         model, metrics = train_verbalised_confidence_probe(
-            X_train_l, y_train, X_val_l, y_val,
+            X_train_l, y_train, X_test_l, y_test,
             model_type=args.model_type,
             alpha=args.alpha,
             verbose=False,
@@ -234,13 +234,13 @@ def main():
         train_mse.append(metrics['train']['mse'])
         train_mae.append(metrics['train']['mae'])
         train_r2.append(metrics['train']['r2'])
-        val_mse.append(metrics['val']['mse'])
-        val_mae.append(metrics['val']['mae'])
-        val_r2.append(metrics['val']['r2'])
+        test_mse.append(metrics['test']['mse'])
+        test_mae.append(metrics['test']['mae'])
+        test_r2.append(metrics['test']['r2'])
 
         if args.plot:
             plot_results(y_train, model.predict(X_train_l), 'train', str(layer_dir))
-            plot_results(y_val, model.predict(X_val_l), 'val', str(layer_dir))
+            plot_results(y_test, model.predict(X_test_l), 'test', str(layer_dir))
 
         if args.save_model:
             model_path = layer_dir / 'verbalised_confidence_probe.pkl'
@@ -256,9 +256,9 @@ def main():
             layer_args = argparse.Namespace(layer_idx=layer_idx, alpha=args.alpha)
             write_config_txt(
                 layer_dir, layer_args, args.model_type,
-                n_train=len(X_train_l), n_val=len(X_val_l),
+                n_train=len(X_train_l), n_test=len(X_test_l),
                 metrics=metrics,
-                train_path=str(args.train_path), val_path=str(args.val_path),
+                train_path=str(args.train_path), test_path=str(args.test_path),
             )
             print(f"Saved config to {layer_dir / 'config.txt'}")
 
@@ -268,7 +268,7 @@ def main():
         run_base,
         layer_numbers,
         [train_mse, train_mae, train_r2],
-        [val_mse, val_mae, val_r2],
+        [test_mse, test_mae, test_r2],
     )
 
     print(f"\nDone. Trained {n_layers} probes in {run_base}")

@@ -8,7 +8,7 @@ verbalised_confidence (0-1).
 Usage:
     python train_verbalised_confidence_probe.py \
         --train_path semantic_uncertainty/out/1/train_linear_probe.pkl \
-        --val_path semantic_uncertainty/out/1/validation_linear_probe.pkl \
+        --test_path semantic_uncertainty/out/1/test_linear_probe.pkl \
         [--output_dir ./results] \
         [--model_type ridge] \
         [--alpha 1.0] \
@@ -26,25 +26,25 @@ from sklearn.linear_model import Ridge, LinearRegression
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 
-def load_verbalised_confidence_data(train_path, val_path, layer_idx=32):
+def load_verbalised_confidence_data(train_path, test_path, layer_idx=32):
     """
     Load pickle files and extract verbalised confidence and embeddings.
     
     Args:
         train_path: Path to train_linear_probe.pkl
-        val_path: Path to validation_linear_probe.pkl
+        test_path: Path to test_linear_probe.pkl
         layer_idx: Index of layer to extract (default: 33, last layer)
     
     Returns:
-        X_train, y_train, X_val, y_val as numpy arrays
+        X_train, y_train, X_test, y_test as numpy arrays
     """
     # Load training data
     with open(train_path, 'rb') as f:
         train_data = pickle.load(f)
     
-    # Load validation data
-    with open(val_path, 'rb') as f:
-        val_data = pickle.load(f)
+    # Load test data
+    with open(test_path, 'rb') as f:
+        test_data = pickle.load(f)
     
     def extract_features_and_labels(data_dict):
         """Extract embeddings (layer 33) and verbalised confidence from data dict."""
@@ -97,19 +97,19 @@ def load_verbalised_confidence_data(train_path, val_path, layer_idx=32):
         
         return np.array(X_list), np.array(y_list)
     
-    # np arrays: x_train/val shape = (num_examples, feature_dim)
-    # y_train/val shape = (num_examples) -> floats (verbalised confidence)
+    # np arrays: x_train/test shape = (num_examples, feature_dim)
+    # y_train/test shape = (num_examples) -> floats (verbalised confidence)
     X_train, y_train = extract_features_and_labels(train_data)
-    X_val, y_val = extract_features_and_labels(val_data)
+    X_test, y_test = extract_features_and_labels(test_data)
     
-    print(f"Loaded {len(X_train)} training examples, {len(X_val)} validation examples")
+    print(f"Loaded {len(X_train)} training examples, {len(X_test)} test examples")
     print(f"Embedding dimension: {X_train.shape[1]}")
     print(f"Confidence range: [{y_train.min():.3f}, {y_train.max():.3f}]")
     
-    return X_train, y_train, X_val, y_val
+    return X_train, y_train, X_test, y_test
 
 
-def train_verbalised_confidence_probe(X_train, y_train, X_val, y_val, 
+def train_verbalised_confidence_probe(X_train, y_train, X_test, y_test, 
                                        model_type='ridge', alpha=1.0, verbose=True):
     """
     Train a regressor to predict verbalised confidence.
@@ -117,8 +117,8 @@ def train_verbalised_confidence_probe(X_train, y_train, X_val, y_val,
     Args:
         X_train: Training embeddings (n_samples, n_features)
         y_train: Training confidence values (n_samples,)
-        X_val: Validation embeddings (n_samples, n_features)
-        y_val: Validation confidence values (n_samples,)
+        X_test: Test embeddings (n_samples, n_features)
+        y_test: Test confidence values (n_samples,)
         model_type: 'ridge' or 'linear'.
         alpha: Regularization strength for Ridge (how much to penalise large weights) (ignored for linear).
         verbose: If True, print training message and metrics (default: True).
@@ -141,20 +141,20 @@ def train_verbalised_confidence_probe(X_train, y_train, X_val, y_val,
     
     # Predictions
     y_train_pred = model.predict(X_train)
-    y_val_pred = model.predict(X_val)
+    y_test_pred = model.predict(X_test)
     
     # Clip predictions to [0, 1] range
     y_train_pred = np.clip(y_train_pred, 0, 1)
-    y_val_pred = np.clip(y_val_pred, 0, 1)
+    y_test_pred = np.clip(y_test_pred, 0, 1)
     
     # Calculate metrics
     train_mse = mean_squared_error(y_train, y_train_pred)
     train_mae = mean_absolute_error(y_train, y_train_pred) # Mean Absolute Error
     train_r2 = r2_score(y_train, y_train_pred) # R-squared score
     
-    val_mse = mean_squared_error(y_val, y_val_pred)
-    val_mae = mean_absolute_error(y_val, y_val_pred)
-    val_r2 = r2_score(y_val, y_val_pred)
+    test_mse = mean_squared_error(y_test, y_test_pred)
+    test_mae = mean_absolute_error(y_test, y_test_pred)
+    test_r2 = r2_score(y_test, y_test_pred)
     
     metrics = {
         'train': {
@@ -162,10 +162,10 @@ def train_verbalised_confidence_probe(X_train, y_train, X_val, y_val,
             'mae': train_mae,
             'r2': train_r2,
         },
-        'val': {
-            'mse': val_mse,
-            'mae': val_mae,
-            'r2': val_r2,
+        'test': {
+            'mse': test_mse,
+            'mae': test_mae,
+            'r2': test_r2,
         }
     }
     
@@ -174,10 +174,10 @@ def train_verbalised_confidence_probe(X_train, y_train, X_val, y_val,
         print(f"  MSE:  {train_mse:.6f}")
         print(f"  MAE:  {train_mae:.6f}")
         print(f"  R²:   {train_r2:.6f}")
-        print("\nValidation Metrics:")
-        print(f"  MSE:  {val_mse:.6f}")
-        print(f"  MAE:  {val_mae:.6f}")
-        print(f"  R²:   {val_r2:.6f}")
+        print("\nTest Metrics:")
+        print(f"  MSE:  {test_mse:.6f}")
+        print(f"  MAE:  {test_mae:.6f}")
+        print(f"  R²:   {test_r2:.6f}")
 
     return model, metrics
 
@@ -194,8 +194,8 @@ def _get_run_dir(output_dir: Path, layer_idx: int) -> Path:
     return run_dir
 
 
-def write_config_txt(run_dir: Path, args, model_type: str, n_train: int, n_val: int,
-                     metrics: dict, train_path: str, val_path: str) -> None:
+def write_config_txt(run_dir: Path, args, model_type: str, n_train: int, n_test: int,
+                     metrics: dict, train_path: str, test_path: str) -> None:
     """Write a config/summary txt file into run_dir."""
     lines = [
         "Verbalised confidence probe – training configuration and results",
@@ -205,13 +205,13 @@ def write_config_txt(run_dir: Path, args, model_type: str, n_train: int, n_val: 
         f"Embedding: emb_tok_bef_gen",
         f"Alpha (regularization): {args.alpha}",
         f"Train path: {train_path}",
-        f"Val path: {val_path}",
+        f"Test path: {test_path}",
         "",
         "Data",
         "-" * 40,
         f"Number of training samples: {n_train}",
-        f"Number of validation samples: {n_val}",
-        f"Split (train / val): {n_train} / {n_val}",
+        f"Number of test samples: {n_test}",
+        f"Split (train / test): {n_train} / {n_test}",
         "",
     ]
     lines.extend([
@@ -221,10 +221,10 @@ def write_config_txt(run_dir: Path, args, model_type: str, n_train: int, n_val: 
         f"  MSE:  {metrics['train']['mse']:.6f}",
         f"  MAE:  {metrics['train']['mae']:.6f}",
         f"  R²:   {metrics['train']['r2']:.6f}",
-        "Validation:",
-        f"  MSE:  {metrics['val']['mse']:.6f}",
-        f"  MAE:  {metrics['val']['mae']:.6f}",
-        f"  R²:   {metrics['val']['r2']:.6f}",
+        "Test:",
+        f"  MSE:  {metrics['test']['mse']:.6f}",
+        f"  MAE:  {metrics['test']['mae']:.6f}",
+        f"  R²:   {metrics['test']['r2']:.6f}",
         "",
         f"Trained at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
     ])
@@ -239,7 +239,7 @@ def plot_results(y_true, y_pred, split_name, output_dir=None):
     Args:
         y_true: True confidence values
         y_pred: Predicted confidence values
-        split_name: Name for the split (train/val)
+        split_name: Name for the split (train/test)
         output_dir: Directory to save plots (optional)
     """
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
@@ -288,10 +288,10 @@ def main():
         help='Path to train_linear_probe.pkl file'
     )
     parser.add_argument(
-        '--val_path',
+        '--test_path',
         type=str,
         required=True,
-        help='Path to validation_linear_probe.pkl file'
+        help='Path to test_linear_probe.pkl file'
     )
     parser.add_argument(
         '--output_dir',
@@ -334,15 +334,15 @@ def main():
     
     # Load data
     print("Loading data...")
-    X_train, y_train, X_val, y_val = load_verbalised_confidence_data(
+    X_train, y_train, X_test, y_test = load_verbalised_confidence_data(
         args.train_path, 
-        args.val_path,
+        args.test_path,
         layer_idx=args.layer_idx
     )
     
     # Train model
     model, metrics = train_verbalised_confidence_probe(
-        X_train, y_train, X_val, y_val,
+        X_train, y_train, X_test, y_test,
         model_type=args.model_type,
         alpha=args.alpha
     )
@@ -356,7 +356,7 @@ def main():
     if args.plot:
         print("\nGenerating plots...")
         plot_results(y_train, model.predict(X_train), 'train', str(run_dir))
-        plot_results(y_val, model.predict(X_val), 'val', str(run_dir))
+        plot_results(y_test, model.predict(X_test), 'test', str(run_dir))
     
     # Save model and artifacts to results/layer_{n}/{k}/
     if args.save_model:
@@ -372,9 +372,9 @@ def main():
         print(f"\nSaved model to {model_path}")
         write_config_txt(
             run_dir, args, args.model_type,
-            n_train=len(X_train), n_val=len(X_val),
+            n_train=len(X_train), n_test=len(X_test),
             metrics=metrics,
-            train_path=str(args.train_path), val_path=str(args.val_path),
+            train_path=str(args.train_path), test_path=str(args.test_path),
         )
         print(f"Saved config to {run_dir / 'config.txt'}")
 

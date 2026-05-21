@@ -42,7 +42,11 @@ from blockwise_zero_ablation.run_blockwise_zero_ablation import (
     split_answerable_indices,
     write_individual_layer_plots,
 )
-from layerwise_mean_ablation.run_mean_ablation import _as_layer_hidden, _is_expected_or_plus_one
+from layerwise_mean_ablation.run_mean_ablation import (
+    _absolute_probability_value_start_position,
+    _as_layer_hidden,
+    _is_expected_or_plus_one,
+)
 
 
 TRAIN_RATIO = 0.9
@@ -53,6 +57,7 @@ REQUIRED_EMBEDDING_FIELDS = (
     "embeddings_guess",
     "embeddings_mean_sem_answer",
     "embeddings_probability",
+    "embeddings_mean_prob_val",
 )
 
 
@@ -140,6 +145,8 @@ def write_config_txt(
         f"high_conf_selected_count={high_conf_count}",
         "",
         "[Mode Confidence Metrics]",
+        "Values below are mean verbalised confidence.",
+        "",
     ]
     for mode_name in args.ablation_mode:
         per_subblock = mode_confidence_means.get(mode_name, {})
@@ -147,7 +154,7 @@ def write_config_txt(
         for subblock in args.ablate_subblocks:
             mode_mean = per_subblock.get(subblock)
             valid_count = int(per_subblock_counts.get(subblock, 0))
-            metric_key = f"{mode_name}__{subblock}_mean_verbalised_confidence"
+            metric_key = f"{mode_name}__{subblock}"
             if mode_name == "none":
                 if mode_mean is None:
                     lines.append(f"{metric_key}=None ({valid_count})")
@@ -205,6 +212,7 @@ def compute_pre_probability_group_means_by_component(
     sem_answer_vectors: Dict[str, List[np.ndarray]] = {c: [] for c in TARGET_COMPONENTS}
     guess_vectors: Dict[str, List[np.ndarray]] = {c: [] for c in TARGET_COMPONENTS}
     probability_vectors: Dict[str, List[np.ndarray]] = {c: [] for c in TARGET_COMPONENTS}
+    probability_value_mean_vectors: Dict[str, List[np.ndarray]] = {c: [] for c in TARGET_COMPONENTS}
     layer_idx = np.asarray(ablate_layers)
 
     for ex_id, ex in examples_h5.items():
@@ -241,6 +249,9 @@ def compute_pre_probability_group_means_by_component(
                 resp0, ex_id, "embeddings_mean_sem_answer", component
             )
             emb_prob = _validate_component_field(resp0, ex_id, "embeddings_probability", component)
+            emb_mean_prob_val = _validate_component_field(
+                resp0, ex_id, "embeddings_mean_prob_val", component
+            )
 
             if not isinstance(emb_guess, list):
                 raise ValueError(
@@ -266,6 +277,7 @@ def compute_pre_probability_group_means_by_component(
 
             prompt_layer_hidden = _as_layer_hidden(emb_prompt)[layer_idx, :]
             sem_answer_layer_hidden = _as_layer_hidden(emb_sem_answer)[layer_idx, :]
+            mean_prob_val_layer_hidden = _as_layer_hidden(emb_mean_prob_val)[layer_idx, :]
 
             guess_selected: List[np.ndarray] = []
             for tok_arr in emb_guess:
@@ -281,6 +293,7 @@ def compute_pre_probability_group_means_by_component(
             sem_answer_vectors[component].append(sem_answer_layer_hidden)
             guess_vectors[component].append(guess_stacked)
             probability_vectors[component].append(prob_stacked)
+            probability_value_mean_vectors[component].append(mean_prob_val_layer_hidden)
 
     source_name = "low-confidence" if mean_from_low_confidence else "high-confidence"
     if not low_ids:
@@ -306,6 +319,9 @@ def compute_pre_probability_group_means_by_component(
             "probability": np.mean(
                 np.stack(probability_vectors[component], axis=0), axis=0
             ).astype(np.float32),
+            "probability_value_mean": np.mean(
+                np.stack(probability_value_mean_vectors[component], axis=0), axis=0
+            ).astype(np.float32),
         }
     return means_by_component, low_ids, high_ids
 
@@ -328,6 +344,9 @@ def _build_layer_means(
                     comp_means["sem_answer_mean"][layer_i], device=device, dtype=torch_dtype
                 ),
                 "probability": torch.tensor(comp_means["probability"][layer_i], device=device, dtype=torch_dtype),
+                "probability_value_mean": torch.tensor(
+                    comp_means["probability_value_mean"][layer_i], device=device, dtype=torch_dtype
+                ),
             }
     return out
 
@@ -343,6 +362,7 @@ def _positions_and_replacements_for_mode(
     guess = layer_means["guess"]
     sem_answer_mean = layer_means["sem_answer_mean"]
     probability = layer_means["probability"]
+    probability_value_mean = layer_means["probability_value_mean"]
     logging.info("Inside _positions_and_replacements_for_mode")
     logging.info(f"Mode: {mode}, shape of each layer mean: {prompt_mean.shape}, {guess.shape}, {sem_answer_mean.shape}, {probability.shape}")
 
@@ -433,7 +453,7 @@ def _positions_and_replacements_for_mode(
             vectors.append(probability[i])
         return positions, vectors
 
-    if mode == "guess_then_guess_probability_zero_ablate":
+    if mode == "guess_then_guess_probability_mean_replace":
         guess_positions = _absolute_guess_span_positions(
             prompt_len,
             decoded_tokens,
@@ -458,6 +478,19 @@ def _positions_and_replacements_for_mode(
             vectors.append(probability[i])
         return positions, vectors
 
+    if mode == "probability_value_mean_replace":
+        start_abs = _absolute_probability_value_start_position(prompt_len, decoded_tokens)
+        if start_abs is None:
+            return [], []
+        seq_len = prompt_len + len(decoded_tokens)
+        if start_abs >= seq_len:
+            return [], []
+        positions = list(range(start_abs, seq_len))
+        if not positions:
+            return [], []
+        vectors = [probability[-1]] + [probability_value_mean] * (len(positions) - 1)
+        return positions, vectors
+
     raise ValueError(f"Unsupported mode for mean replacement: {mode!r}")
 
 
@@ -480,16 +513,12 @@ def build_subblock_mean_replace_hooks(
             def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
                 del hook
                 decoded_tokens = decoded_tokens_provider()
-                logging.info(f"Decoded tokens: {decoded_tokens}")
-                logging.info(f"Mode: {mode}, prompt_len: {prompt_len}, subblock: {subblock}")
                 positions, vectors = _positions_and_replacements_for_mode(
                     mode=mode,
                     prompt_len=prompt_len,
                     decoded_tokens=decoded_tokens,
                     layer_means=local_layer_means,
                 )
-                logging.info(f"Positions: {positions if len(positions) > 0 else 'None'}")
-                logging.info(f"First 3 elements of vectors: {vectors[:1]}")
                 if not positions:
                     return activation
                 for abs_pos, vector in zip(positions, vectors):
@@ -569,7 +598,8 @@ def main() -> None:
             "all_pre_probability_tokens_mean_replace",
             "guess_tokens_mean_replace",
             "all_pre_guess_tokens_mean_replace",
-            "guess_then_guess_probability_zero_ablate",
+            "guess_then_guess_probability_mean_replace",
+            "probability_value_mean_replace",
         ],
         choices=[
             "none",
@@ -579,13 +609,17 @@ def main() -> None:
             "all_pre_probability_tokens_mean_replace",
             "guess_tokens_mean_replace",
             "all_pre_guess_tokens_mean_replace",
-            "guess_then_guess_probability_zero_ablate",
+            "guess_then_guess_probability_mean_replace",
+            "probability_value_mean_replace",
         ],
         help=(
             "One or more ablation modes. probability_last_token_mean_replace: mean-replace only the "
             "last token of the H5 probability span (end_prob; first value digit). "
             "probability_span_except_last_token_mean_replace: mean-replace all probability-span tokens "
-            "except that last token (all marker-span tokens before end_prob)."
+            "except that last token (all marker-span tokens before end_prob). "
+            "probability_value_mean_replace: no hooks until Guess/Probability parse succeeds; then "
+            "mean-replace from first probability-value token through current last token, using "
+            "probability[-1] for the first position and embeddings_mean_prob_val mean for later positions."
         ),
     )
     parser.add_argument("--ablate_subblocks", type=str, nargs="+", required=True, choices=["attn", "mlp"])

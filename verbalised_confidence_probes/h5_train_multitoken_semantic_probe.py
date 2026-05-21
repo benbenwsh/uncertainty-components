@@ -8,7 +8,7 @@ isotropic Gaussian noise (same h, label 0).
 
 Loads verbalised-embeddings native HDF5 examples (embeddings_guess only).
 
-Per-token RNG streams (train/val) use offsets from random_seed so negative sampling differs
+Per-token RNG streams (train/test) use offsets from random_seed so negative sampling differs
 across token folders.
 
 Output layout: output_dir/sem_probe_mult_toks_all_layers/<run_id>/tok_n_guess/ and, when
@@ -223,7 +223,7 @@ def build_xy_for_layer_token(
             y_list.append(0.0)
 
     if not X_list or n_layers is None or hidden_dim is None:
-        raise ValueError("No valid examples in train or val data.")
+        raise ValueError("No valid examples in train or test data.")
 
     X = np.stack(X_list, axis=0)
     y = np.array(y_list, dtype=np.int8)
@@ -252,8 +252,8 @@ def _classification_metrics(model: LogisticRegression, X: np.ndarray, y: np.ndar
 def train_semantic_probe(
     X_train: np.ndarray,
     y_train: np.ndarray,
-    X_val: np.ndarray,
-    y_val: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
     random_state: int,
     max_iter: int,
 ) -> tuple[LogisticRegression, dict]:
@@ -265,7 +265,7 @@ def train_semantic_probe(
     model.fit(X_train, y_train)
     metrics = {
         "train": _classification_metrics(model, X_train, y_train),
-        "val": _classification_metrics(model, X_val, y_val),
+        "test": _classification_metrics(model, X_test, y_test),
     }
     return model, metrics
 
@@ -276,12 +276,12 @@ def write_semantic_probe_config_txt(
     token_pos: int,
     layer_idx: int,
     n_train_rows: int,
-    n_val_rows: int,
+    n_test_rows: int,
     n_layers: int,
     hidden_dim: int,
     metrics: dict,
     train_path: str,
-    val_path: str,
+    test_path: str,
 ) -> None:
     lines = [
         f"Semantic entailment probe (multitoken: tok_{token_pos}_guess, all layers)",
@@ -297,12 +297,12 @@ def write_semantic_probe_config_txt(
         f"random_seed: {args.random_seed}",
         f"max_iter: {args.max_iter}",
         f"Train path: {train_path}",
-        f"Val path: {val_path}",
+        f"Test path: {test_path}",
         "",
         "Data (rows after augmentation: 1 + n_negatives per example)",
         "-" * 40,
         f"Training rows: {n_train_rows}",
-        f"Validation rows: {n_val_rows}",
+        f"Test rows: {n_test_rows}",
         f"Total layers in stack: {n_layers}",
         "",
         "Metrics",
@@ -320,17 +320,17 @@ def write_semantic_probe_config_txt(
             if not np.isnan(metrics["train"]["log_loss"])
             else "  Log loss: nan"
         ),
-        "Validation:",
-        f"  Accuracy: {metrics['val']['accuracy']:.6f}",
+        "Test:",
+        f"  Accuracy: {metrics['test']['accuracy']:.6f}",
         (
-            f"  ROC-AUC:  {metrics['val']['roc_auc']:.6f}"
-            if not np.isnan(metrics["val"]["roc_auc"])
+            f"  ROC-AUC:  {metrics['test']['roc_auc']:.6f}"
+            if not np.isnan(metrics["test"]["roc_auc"])
             else "  ROC-AUC:  nan"
         ),
-        f"  F1:       {metrics['val']['f1']:.6f}",
+        f"  F1:       {metrics['test']['f1']:.6f}",
         (
-            f"  Log loss: {metrics['val']['log_loss']:.6f}"
-            if not np.isnan(metrics["val"]["log_loss"])
+            f"  Log loss: {metrics['test']['log_loss']:.6f}"
+            if not np.isnan(metrics["test"]["log_loss"])
             else "  Log loss: nan"
         ),
         "",
@@ -343,16 +343,16 @@ def write_semantic_probe_config_txt(
 def _plot_metrics_by_layer(
     layer_numbers: list[int],
     train_metrics: list[float],
-    val_metrics: list[float],
+    test_metrics: list[float],
     metric_name: str,
     metric_label: str,
     out_dir: Path,
 ) -> None:
     fig, ax = plt.subplots(figsize=(8, 5))
     tr = np.ma.masked_invalid(np.asarray(train_metrics, dtype=np.float64))
-    va = np.ma.masked_invalid(np.asarray(val_metrics, dtype=np.float64))
+    va = np.ma.masked_invalid(np.asarray(test_metrics, dtype=np.float64))
     ax.plot(layer_numbers, tr, "o-", label="Train", markersize=4)
-    ax.plot(layer_numbers, va, "s-", label="Validation", markersize=4)
+    ax.plot(layer_numbers, va, "s-", label="Test", markersize=4)
     ax.set_xlabel("Layer number")
     ax.set_ylabel(metric_label)
     ax.set_title(f"{metric_label} by layer")
@@ -423,7 +423,7 @@ def _load_semantic_metrics_from_run_dir(run_base: Path) -> dict:
 
         layer_numbers: list[int] = []
         train_acc, train_auc, train_f1 = [], [], []
-        val_acc, val_auc, val_f1 = [], [], []
+        test_acc, test_auc, test_f1 = [], [], []
 
         for layer_pkl in layer_pkls:
             try:
@@ -437,16 +437,16 @@ def _load_semantic_metrics_from_run_dir(run_base: Path) -> dict:
                 logging.warning("Missing metrics in %s", layer_pkl)
                 continue
             tr = metrics.get("train", {})
-            va = metrics.get("val", {})
+            va = metrics.get("test", {})
             try:
                 layer_num = int(layer_pkl.parent.name.split("_")[-1])
                 layer_numbers.append(layer_num)
                 train_acc.append(float(tr["accuracy"]))
                 train_auc.append(float(tr["roc_auc"]))
                 train_f1.append(float(tr["f1"]))
-                val_acc.append(float(va["accuracy"]))
-                val_auc.append(float(va["roc_auc"]))
-                val_f1.append(float(va["f1"]))
+                test_acc.append(float(va["accuracy"]))
+                test_auc.append(float(va["roc_auc"]))
+                test_f1.append(float(va["f1"]))
             except (KeyError, TypeError, ValueError) as exc:
                 logging.warning("Invalid metrics in %s: %s", layer_pkl, exc)
                 continue
@@ -460,13 +460,13 @@ def _load_semantic_metrics_from_run_dir(run_base: Path) -> dict:
         train_acc = [train_acc[i] for i in order]
         train_auc = [train_auc[i] for i in order]
         train_f1 = [train_f1[i] for i in order]
-        val_acc = [val_acc[i] for i in order]
-        val_auc = [val_auc[i] for i in order]
-        val_f1 = [val_f1[i] for i in order]
+        test_acc = [test_acc[i] for i in order]
+        test_auc = [test_auc[i] for i in order]
+        test_f1 = [test_f1[i] for i in order]
 
         all_token_metrics[token_name] = {
             "train": [train_acc, train_auc, train_f1],
-            "val": [val_acc, val_auc, val_f1],
+            "test": [test_acc, test_auc, test_f1],
             "layers": layer_numbers,
             "token_pos": token_pos,
         }
@@ -479,15 +479,15 @@ def _plot_all_metrics_by_layer_semantic(
     train_acc: list[float],
     train_auc: list[float],
     train_f1: list[float],
-    val_acc: list[float],
-    val_auc: list[float],
-    val_f1: list[float],
+    test_acc: list[float],
+    test_auc: list[float],
+    test_f1: list[float],
     more_graphs: bool,
 ) -> None:
     metrics_config = [
-        ("accuracy", "Accuracy", train_acc, val_acc),
-        ("auc", "ROC-AUC", train_auc, val_auc),
-        ("f1", "F1", train_f1, val_f1),
+        ("accuracy", "Accuracy", train_acc, test_acc),
+        ("auc", "ROC-AUC", train_auc, test_auc),
+        ("f1", "F1", train_f1, test_f1),
     ]
     if not more_graphs:
         metrics_config = metrics_config[:1]
@@ -500,7 +500,7 @@ def _plot_metrics_all_tokens_semantic(
     all_token_metrics: dict,
     more_graphs: bool,
 ) -> None:
-    """Combined plots at run root: Blues for train, Oranges for val; token order via width/alpha."""
+    """Combined plots at run root: Blues for train, Oranges for test; token order via width/alpha."""
     token_items = _sorted_semantic_token_items(all_token_metrics)
     if not token_items:
         return
@@ -522,7 +522,7 @@ def _plot_metrics_all_tokens_semantic(
             style = _style_for_token_order(order_idx, n_tok)
             layer_numbers = metrics_dict["layers"]
             train_vals = metrics_dict["train"][metric_idx]
-            val_vals = metrics_dict["val"][metric_idx]
+            test_vals = metrics_dict["test"][metric_idx]
             marker = _marker_for_token_pos(token_pos)
             ax.plot(
                 layer_numbers,
@@ -537,8 +537,8 @@ def _plot_metrics_all_tokens_semantic(
             )
             ax.plot(
                 layer_numbers,
-                val_vals,
-                label=f"{token_name} (Val)",
+                test_vals,
+                label=f"{token_name} (Test)",
                 marker=marker,
                 markersize=4,
                 color=oranges[order_idx],
@@ -548,7 +548,7 @@ def _plot_metrics_all_tokens_semantic(
             )
         ax.set_xlabel("Layer number")
         ax.set_ylabel(title_metric)
-        ax.set_title(f"{title_metric} by layer — all guess tokens (train=blue, val=orange)")
+        ax.set_title(f"{title_metric} by layer — all guess tokens (train=blue, test=orange)")
         ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
@@ -575,7 +575,7 @@ def main():
         description="Train semantic entailment logistic probes for tok_0..5_guess across all layers (H5 input)"
     )
     parser.add_argument("--train_path", type=str, required=False)
-    parser.add_argument("--val_path", type=str, required=False)
+    parser.add_argument("--test_path", type=str, required=False)
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -613,8 +613,8 @@ def main():
     )
     args = parser.parse_args()
 
-    if not args.plots_only and (not args.train_path or not args.val_path):
-        parser.error("--train_path and --val_path are required unless --plots_only is enabled.")
+    if not args.plots_only and (not args.train_path or not args.test_path):
+        parser.error("--train_path and --test_path are required unless --plots_only is enabled.")
     if args.plots_only and not args.run_dir:
         parser.error("--run_dir is required when --plots_only is enabled.")
 
@@ -639,7 +639,7 @@ def main():
             return
         for token_name, metrics_dict in sorted(all_token_metrics.items(), key=lambda x: _token_sort_key_guess(x[0])):
             token_dir = run_base / token_name
-            tr, va = metrics_dict["train"], metrics_dict["val"]
+            tr, va = metrics_dict["train"], metrics_dict["test"]
             logging.info("Regenerating per-token plots for %s", token_name)
             _plot_all_metrics_by_layer_semantic(
                 token_dir,
@@ -670,7 +670,7 @@ def main():
         print(f"\n--- tok_{token_pos}_guess -> {token_dir}")
 
         rng_train = np.random.default_rng(args.random_seed + token_pos)
-        rng_val = np.random.default_rng(args.random_seed + 1 + token_pos)
+        rng_test = np.random.default_rng(args.random_seed + 1 + token_pos)
 
         n_layers = None
         for _ref, _h, nl, _hd in _iter_layer_pairs_from_h5(args.train_path, token_pos, 0):
@@ -684,7 +684,7 @@ def main():
 
         layer_numbers: list[int] = []
         train_acc, train_auc, train_f1 = [], [], []
-        val_acc, val_auc, val_f1 = [], [], []
+        test_acc, test_auc, test_f1 = [], [], []
 
         for layer_idx in range(n_layers):
             layer_name = f"layer_{layer_idx + 1}"
@@ -700,18 +700,18 @@ def main():
                 args.noise_rel,
                 rng_train,
             )
-            print(f"Building val data for tok_{token_pos}_guess layer {layer_idx + 1}...")
+            print(f"Building test data for tok_{token_pos}_guess layer {layer_idx + 1}...")
             X_va, y_va, nl_va, hd_va = build_xy_for_layer_token(
-                args.val_path,
+                args.test_path,
                 token_pos,
                 layer_idx,
                 args.n_negatives,
                 args.noise_rel,
-                rng_val,
+                rng_test,
             )
 
             if X_tr.size == 0 or X_va.size == 0 or y_tr.size == 0 or y_va.size == 0:
-                raise ValueError(f"Empty train or val data at {token_dir.name} {layer_name}")
+                raise ValueError(f"Empty train or test data at {token_dir.name} {layer_name}")
 
             if nl_tr != n_layers or nl_va != n_layers or hd_tr != hd_va:
                 raise ValueError(f"Layer/dim mismatch at {token_dir.name} {layer_name}")
@@ -729,9 +729,9 @@ def main():
             train_acc.append(metrics["train"]["accuracy"])
             train_auc.append(metrics["train"]["roc_auc"])
             train_f1.append(metrics["train"]["f1"])
-            val_acc.append(metrics["val"]["accuracy"])
-            val_auc.append(metrics["val"]["roc_auc"])
-            val_f1.append(metrics["val"]["f1"])
+            test_acc.append(metrics["test"]["accuracy"])
+            test_auc.append(metrics["test"]["roc_auc"])
+            test_f1.append(metrics["test"]["f1"])
 
             if args.save_model:
                 with open(layer_dir / "semantic_probe.pkl", "wb") as f:
@@ -760,16 +760,16 @@ def main():
                     hd_tr,
                     metrics,
                     str(args.train_path),
-                    str(args.val_path),
+                    str(args.test_path),
                 )
                 print(
                     f"Saved {layer_dir / 'semantic_probe.pkl'} "
-                    f"val_acc={metrics['val']['accuracy']:.4f}"
+                    f"test_acc={metrics['test']['accuracy']:.4f}"
                 )
 
         all_token_metrics[f"tok_{token_pos}_guess"] = {
             "train": [train_acc, train_auc, train_f1],
-            "val": [val_acc, val_auc, val_f1],
+            "test": [test_acc, test_auc, test_f1],
             "layers": layer_numbers,
             "token_pos": token_pos,
         }
@@ -781,9 +781,9 @@ def main():
                 train_acc,
                 train_auc,
                 train_f1,
-                val_acc,
-                val_auc,
-                val_f1,
+                test_acc,
+                test_auc,
+                test_f1,
                 more_graphs=args.more_graphs,
             )
 

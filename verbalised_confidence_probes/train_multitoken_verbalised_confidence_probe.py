@@ -9,7 +9,7 @@ results/mult_toks_all_layers/<run_id>/tok_n_guess/ and tok_n_prob/ directories.
 Usage:
     python train_multitoken_verbalised_confidence_probe.py \
         --train_path semantic_uncertainty/processed_generations/1/train_verbalised_embeddings.pkl \
-        --val_path semantic_uncertainty/processed_generations/1/validation_verbalised_embeddings.pkl \
+        --test_path semantic_uncertainty/processed_generations/1/test_verbalised_embeddings.pkl \
         [--output_dir ./results] \
         [--model_type ridge] \
         [--alpha 1.0] \
@@ -87,22 +87,22 @@ def _tensor_to_numpy(obj):
     return np.asarray(obj)
 
 
-def load_multitoken_verbalised_confidence_data(train_path, val_path):
+def load_multitoken_verbalised_confidence_data(train_path, test_path):
     """
     Load pickle files and extract verbalised confidence and embeddings for all token positions.
     
     Returns:
         dict: {
             'guess': {
-                token_pos: (X_train, X_val, y_train, y_val, n_layers)
+                token_pos: (X_train, X_test, y_train, y_test, n_layers)
             },
             'probability': {
-                token_pos: (X_train, X_val, y_train, y_val, n_layers)
+                token_pos: (X_train, X_test, y_train, y_test, n_layers)
             }
         }
     """
     train_data = _load_pickle_batches_multitoken(train_path)
-    val_data = _load_pickle_batches_multitoken(val_path)
+    test_data = _load_pickle_batches_multitoken(test_path)
     
     def extract_token_positions_and_labels(data_dict, embedding_type):
         """
@@ -182,33 +182,33 @@ def load_multitoken_verbalised_confidence_data(train_path, val_path):
     # Extract data for both embedding types
     train_guess = extract_token_positions_and_labels(train_data, 'guess')
     train_prob = extract_token_positions_and_labels(train_data, 'probability')
-    val_guess = extract_token_positions_and_labels(val_data, 'guess')
-    val_prob = extract_token_positions_and_labels(val_data, 'probability')
+    test_guess = extract_token_positions_and_labels(test_data, 'guess')
+    test_prob = extract_token_positions_and_labels(test_data, 'probability')
     
-    # Match train and val token positions
+    # Match train and test token positions
     result = {'guess': {}, 'probability': {}}
     
-    for embedding_type, train_dict, val_dict in [('guess', train_guess, val_guess), ('probability', train_prob, val_prob)]:
+    for embedding_type, train_dict, test_dict in [('guess', train_guess, test_guess), ('probability', train_prob, test_prob)]:
         # Find common token positions
-        common_positions = set(train_dict.keys()) & set(val_dict.keys())
+        common_positions = set(train_dict.keys()) & set(test_dict.keys())
         if len(common_positions) == 0:
             logging.warning(f"No common token positions found for {embedding_type} embeddings")
             continue
         
         for token_pos in sorted(common_positions):
             X_train, y_train, n_layers_train = train_dict[token_pos]
-            X_val, y_val, n_layers_val = val_dict[token_pos]
+            X_test, y_test, n_layers_test = test_dict[token_pos]
             
-            if n_layers_train != n_layers_val:
-                logging.warning(f"Layer count mismatch for {embedding_type} token {token_pos}: train={n_layers_train}, val={n_layers_val}")
+            if n_layers_train != n_layers_test:
+                logging.warning(f"Layer count mismatch for {embedding_type} token {token_pos}: train={n_layers_train}, test={n_layers_test}")
                 continue
             
-            if len(X_train) == 0 or len(X_val) == 0:
+            if len(X_train) == 0 or len(X_test) == 0:
                 logging.warning(f"No examples for {embedding_type} token {token_pos}")
                 continue
             
-            result[embedding_type][token_pos] = (X_train, X_val, y_train, y_val, n_layers_train)
-            logging.info(f"Loaded {embedding_type} token {token_pos}: {len(X_train)} train, {len(X_val)} val, {n_layers_train} layers")
+            result[embedding_type][token_pos] = (X_train, X_test, y_train, y_test, n_layers_train)
+            logging.info(f"Loaded {embedding_type} token {token_pos}: {len(X_train)} train, {len(X_test)} test, {n_layers_train} layers")
     
     return result
 
@@ -279,7 +279,7 @@ def _plot_group_lines(ax, token_items, metric_idx: int, cmap_name: str, split_mo
         style = _style_for_token_order(order_idx, len(token_items))
         layer_numbers = metrics_dict['layers']
         train_vals = metrics_dict['train'][metric_idx]
-        val_vals = metrics_dict['val'][metric_idx]
+        test_vals = metrics_dict['test'][metric_idx]
         color = colors[order_idx]
         marker = _marker_for_token_pos(token_pos)
 
@@ -295,11 +295,11 @@ def _plot_group_lines(ax, token_items, metric_idx: int, cmap_name: str, split_mo
                 linewidth=style['linewidth'],
                 alpha=style['alpha'],
             )
-        if split_mode in ('both', 'val'):
+        if split_mode in ('both', 'test'):
             ax.plot(
                 layer_numbers,
-                val_vals,
-                label=f'{token_name} (Val)',
+                test_vals,
+                label=f'{token_name} (Test)',
                 marker=marker,
                 markersize=4,
                 color=color,
@@ -330,7 +330,7 @@ def _load_all_token_metrics_from_run_dir(run_base: Path):
 
         layer_numbers = []
         train_mse, train_mae, train_r2 = [], [], []
-        val_mse, val_mae, val_r2 = [], [], []
+        test_mse, test_mae, test_r2 = [], [], []
 
         for layer_pkl in layer_pkls:
             try:
@@ -346,16 +346,16 @@ def _load_all_token_metrics_from_run_dir(run_base: Path):
                 continue
 
             train_metrics = metrics.get('train', {})
-            val_metrics = metrics.get('val', {})
+            test_metrics = metrics.get('test', {})
             try:
                 layer_num = int(layer_pkl.parent.name.split('_')[-1])
                 layer_numbers.append(layer_num)
                 train_mse.append(float(train_metrics['mse']))
                 train_mae.append(float(train_metrics['mae']))
                 train_r2.append(float(train_metrics['r2']))
-                val_mse.append(float(val_metrics['mse']))
-                val_mae.append(float(val_metrics['mae']))
-                val_r2.append(float(val_metrics['r2']))
+                test_mse.append(float(test_metrics['mse']))
+                test_mae.append(float(test_metrics['mae']))
+                test_r2.append(float(test_metrics['r2']))
             except (KeyError, TypeError, ValueError) as exc:
                 logging.warning("Invalid metrics format in %s: %s", layer_pkl, exc)
                 continue
@@ -369,13 +369,13 @@ def _load_all_token_metrics_from_run_dir(run_base: Path):
         train_mse = [train_mse[i] for i in order]
         train_mae = [train_mae[i] for i in order]
         train_r2 = [train_r2[i] for i in order]
-        val_mse = [val_mse[i] for i in order]
-        val_mae = [val_mae[i] for i in order]
-        val_r2 = [val_r2[i] for i in order]
+        test_mse = [test_mse[i] for i in order]
+        test_mae = [test_mae[i] for i in order]
+        test_r2 = [test_r2[i] for i in order]
 
         all_token_metrics[token_name] = {
             'train': [train_mse, train_mae, train_r2],
-            'val': [val_mse, val_mae, val_r2],
+            'test': [test_mse, test_mae, test_r2],
             'layers': layer_numbers,
             'token_pos': token_pos,
             'embedding_type': embedding_type,
@@ -383,11 +383,11 @@ def _load_all_token_metrics_from_run_dir(run_base: Path):
     return all_token_metrics
 
 
-def _plot_metrics_by_layer(layer_numbers, train_metrics, val_metrics, metric_name, metric_label, output_dir: Path):
-    """Plot one metric (train and val) vs layer number and save to output_dir."""
+def _plot_metrics_by_layer(layer_numbers, train_metrics, test_metrics, metric_name, metric_label, output_dir: Path):
+    """Plot one metric (train and test) vs layer number and save to output_dir."""
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(layer_numbers, train_metrics, 'o-', label='Train', markersize=4)
-    ax.plot(layer_numbers, val_metrics, 's-', label='Validation', markersize=4)
+    ax.plot(layer_numbers, test_metrics, 's-', label='Test', markersize=4)
     ax.set_xlabel('Layer number')
     ax.set_ylabel(metric_label)
     ax.set_title(f'{metric_label} by layer')
@@ -400,17 +400,17 @@ def _plot_metrics_by_layer(layer_numbers, train_metrics, val_metrics, metric_nam
     logging.info(f"Saved {out_path}")
 
 
-def _plot_all_metrics_by_layer(output_dir: Path, layer_numbers, train_metrics_list, val_metrics_list, more_graphs: bool = False):
+def _plot_all_metrics_by_layer(output_dir: Path, layer_numbers, train_metrics_list, test_metrics_list, more_graphs: bool = False):
     """Create 3 graphs: MSE, MAE, R² vs layer number for a single token position."""
     metrics_config = [
-        ('mse', 'MSE', train_metrics_list[0], val_metrics_list[0]),
-        ('mae', 'MAE', train_metrics_list[1], val_metrics_list[1]),
-        ('r2', 'R²', train_metrics_list[2], val_metrics_list[2]),
+        ('mse', 'MSE', train_metrics_list[0], test_metrics_list[0]),
+        ('mae', 'MAE', train_metrics_list[1], test_metrics_list[1]),
+        ('r2', 'R²', train_metrics_list[2], test_metrics_list[2]),
     ]
     if not more_graphs:
         metrics_config = metrics_config[:1]
-    for metric_name, metric_label, train_vals, val_vals in metrics_config:
-        _plot_metrics_by_layer(layer_numbers, train_vals, val_vals, metric_name, metric_label, output_dir)
+    for metric_name, metric_label, train_vals, test_vals in metrics_config:
+        _plot_metrics_by_layer(layer_numbers, train_vals, test_vals, metric_name, metric_label, output_dir)
 
 
 def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: bool = False):
@@ -419,7 +419,7 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: boo
     For each family and each metric, save:
     - both splits in one chart
     - train-only chart
-    - val-only chart
+    - test-only chart
 
     Token order is encoded via increasing line width/opacity by token index.
     
@@ -427,7 +427,7 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: boo
         run_base: Base directory for saving plots
         all_token_metrics: dict with structure:
             {
-                'tok_0_guess': {'train': [mse, mae, r2], 'val': [mse, mae, r2], 'layers': [1,2,...]},
+                'tok_0_guess': {'train': [mse, mae, r2], 'test': [mse, mae, r2], 'layers': [1,2,...]},
                 'tok_1_guess': {...},
                 ...
             }
@@ -458,7 +458,7 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: boo
             plt.close(fig)
             logging.info(f"Saved {out_path}")
 
-            for split_mode, split_label in [('train', 'Train'), ('val', 'Val')]:
+            for split_mode, split_label in [('train', 'Train'), ('test', 'Test')]:
                 fig, ax = plt.subplots(figsize=(10, 6))
                 _plot_group_lines(ax, guess_token_items, metric_idx, cmap_name='Blues', split_mode=split_mode)
                 ax.set_xlabel('Layer number')
@@ -487,7 +487,7 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: boo
             plt.close(fig)
             logging.info(f"Saved {out_path}")
 
-            for split_mode, split_label in [('train', 'Train'), ('val', 'Val')]:
+            for split_mode, split_label in [('train', 'Train'), ('test', 'Test')]:
                 fig, ax = plt.subplots(figsize=(10, 6))
                 _plot_group_lines(ax, prob_token_items, metric_idx, cmap_name='Oranges', split_mode=split_mode)
                 ax.set_xlabel('Layer number')
@@ -517,7 +517,7 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: boo
             plt.close(fig)
             logging.info(f"Saved {out_path}")
 
-            for split_mode, split_label in [('train', 'Train'), ('val', 'Val')]:
+            for split_mode, split_label in [('train', 'Train'), ('test', 'Test')]:
                 fig, ax = plt.subplots(figsize=(11, 6))
                 _plot_group_lines(ax, guess_token_items, metric_idx, cmap_name='Blues', split_mode=split_mode)
                 _plot_group_lines(ax, prob_token_items, metric_idx, cmap_name='Oranges', split_mode=split_mode)
@@ -539,8 +539,8 @@ def main():
     )
     parser.add_argument('--train_path', type=str, required=False,
                        help='Path to train pickle file (from process_generations_verbalised_embeddings.py)')
-    parser.add_argument('--val_path', type=str, required=False,
-                       help='Path to validation pickle file (from process_generations_verbalised_embeddings.py)')
+    parser.add_argument('--test_path', type=str, required=False,
+                       help='Path to test pickle file (from process_generations_verbalised_embeddings.py)')
     parser.add_argument(
         '--output_dir',
         type=str,
@@ -560,13 +560,13 @@ def main():
         default=1.0,
         help='Regularization strength for Ridge (default: 1.0)',
     )
-    parser.add_argument('--plot', default=True, action='store_true', help='Save train/val regression plots per layer')
+    parser.add_argument('--plot', default=True, action='store_true', help='Save train/test regression plots per layer')
     parser.add_argument('--save_model', default=True, action='store_true', help='Save trained probes to pickle')
     parser.add_argument(
         '--more_graphs',
         action='store_true',
         default=False,
-        help='If set, also generate MAE/R2 plots and per-layer train/val regression plots (default: only MSE plots).',
+        help='If set, also generate MAE/R2 plots and per-layer train/test regression plots (default: only MSE plots).',
     )
     parser.add_argument(
         '--plots_only',
@@ -581,8 +581,8 @@ def main():
     )
     args = parser.parse_args()
 
-    if not args.plots_only and (not args.train_path or not args.val_path):
-        parser.error('--train_path and --val_path are required unless --plots_only is enabled.')
+    if not args.plots_only and (not args.train_path or not args.test_path):
+        parser.error('--train_path and --test_path are required unless --plots_only is enabled.')
     if args.plots_only and not args.run_dir:
         parser.error('--run_dir is required when --plots_only is enabled.')
 
@@ -621,7 +621,7 @@ def main():
                 token_dir,
                 metrics_dict['layers'],
                 metrics_dict['train'],
-                metrics_dict['val'],
+                metrics_dict['test'],
                 more_graphs=args.more_graphs,
             )
 
@@ -630,10 +630,10 @@ def main():
         logging.info("Done. Regenerated plots in %s", run_base)
         return
 
-    logging.info(f"Loading data from {args.train_path} and {args.val_path}")
+    logging.info(f"Loading data from {args.train_path} and {args.test_path}")
 
     # Load data
-    data_dict = load_multitoken_verbalised_confidence_data(args.train_path, args.val_path)
+    data_dict = load_multitoken_verbalised_confidence_data(args.train_path, args.test_path)
 
     if len(data_dict['guess']) == 0 and len(data_dict['probability']) == 0:
         logging.error("No valid data loaded. Exiting.")
@@ -654,7 +654,7 @@ def main():
 
         # Train for each token position
         for token_pos in sorted(data_dict[embedding_type].keys()):
-            X_train, X_val, y_train, y_val, n_layers = data_dict[embedding_type][token_pos]
+            X_train, X_test, y_train, y_test, n_layers = data_dict[embedding_type][token_pos]
 
             token_dir_name = f"tok_{token_pos}_{embedding_type}"
             token_dir = run_base / token_dir_name
@@ -664,7 +664,7 @@ def main():
 
             layer_numbers = []
             train_mse, train_mae, train_r2 = [], [], []
-            val_mse, val_mae, val_r2 = [], [], []
+            test_mse, test_mae, test_r2 = [], [], []
 
             # Train probe for each layer
             for layer_idx in range(n_layers):
@@ -674,11 +674,11 @@ def main():
 
                 # Extract layer embeddings: X_train shape is (n_examples, n_layers, hidden_dim)
                 X_train_l = X_train[:, layer_idx, :]
-                X_val_l = X_val[:, layer_idx, :]
+                X_test_l = X_test[:, layer_idx, :]
 
                 # Train probe
                 model, metrics = train_verbalised_confidence_probe(
-                    X_train_l, y_train, X_val_l, y_val,
+                    X_train_l, y_train, X_test_l, y_test,
                     model_type=args.model_type,
                     alpha=args.alpha,
                     verbose=False,
@@ -688,14 +688,14 @@ def main():
                 train_mse.append(metrics['train']['mse'])
                 train_mae.append(metrics['train']['mae'])
                 train_r2.append(metrics['train']['r2'])
-                val_mse.append(metrics['val']['mse'])
-                val_mae.append(metrics['val']['mae'])
-                val_r2.append(metrics['val']['r2'])
+                test_mse.append(metrics['test']['mse'])
+                test_mae.append(metrics['test']['mae'])
+                test_r2.append(metrics['test']['r2'])
 
                 # Save plots if requested
                 if args.plot and args.more_graphs:
                     plot_results(y_train, model.predict(X_train_l), 'train', str(layer_dir))
-                    plot_results(y_val, model.predict(X_val_l), 'val', str(layer_dir))
+                    plot_results(y_test, model.predict(X_test_l), 'test', str(layer_dir))
 
                 # Save model and config
                 if args.save_model:
@@ -714,9 +714,9 @@ def main():
                     layer_args = argparse.Namespace(layer_idx=layer_idx, alpha=args.alpha)
                     write_config_txt(
                         layer_dir, layer_args, args.model_type,
-                        n_train=len(X_train_l), n_val=len(X_val_l),
+                        n_train=len(X_train_l), n_test=len(X_test_l),
                         metrics=metrics,
-                        train_path=str(args.train_path), val_path=str(args.val_path),
+                        train_path=str(args.train_path), test_path=str(args.test_path),
                     )
                     logging.debug(f"Saved model and config to {layer_dir}")
 
@@ -726,14 +726,14 @@ def main():
                 token_dir,
                 layer_numbers,
                 [train_mse, train_mae, train_r2],
-                [val_mse, val_mae, val_r2],
+                [test_mse, test_mae, test_r2],
                 more_graphs=args.more_graphs,
             )
 
             # Store metrics for cross-token graphs
             all_token_metrics[token_dir_name] = {
                 'train': [train_mse, train_mae, train_r2],
-                'val': [val_mse, val_mae, val_r2],
+                'test': [test_mse, test_mae, test_r2],
                 'layers': layer_numbers,
                 'token_pos': token_pos,
                 'embedding_type': embedding_type,

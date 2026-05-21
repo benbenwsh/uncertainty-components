@@ -265,7 +265,9 @@ def mode_to_output_key(mode: str) -> str:
         "guess_tokens_mean_replace",
         "all_pre_guess_tokens_mean_replace",
         "guess_then_guess_probability_zero_ablate",
-        "probability_value_autoregressive_zero_ablate",
+        "guess_then_guess_probability_mean_replace",
+        "probability_value_zero_ablate",
+        "probability_value_mean_replace",
     }:
         return mode
     raise ValueError(f"Unknown ablation mode: {mode!r}")
@@ -563,7 +565,7 @@ def _absolute_guess_then_guess_probability_positions(
     return guess_positions if not prob_positions else sorted(set(guess_positions + prob_positions))
 
 
-def _absolute_probability_value_autoregressive_positions(
+def _absolute_probability_value_positions(
     prompt_len: int,
     decoded_tokens: List[str],
 ) -> List[int]:
@@ -754,8 +756,8 @@ def _mode_positions_provider_builder(
                 expected_guess_tokens=expected_guess_tokens,
                 expected_probability_tokens=expected_probability_tokens,
             )
-        if mode == "probability_value_autoregressive_zero_ablate":
-            return lambda: _absolute_probability_value_autoregressive_positions(
+        if mode == "probability_value_zero_ablate":
+            return lambda: _absolute_probability_value_positions(
                 prompt_len,
                 decoded_tokens_provider(),
             )
@@ -961,7 +963,7 @@ def main() -> None:
             "guess_tokens_mean_replace",
             "all_pre_guess_tokens_mean_replace",
             "guess_then_guess_probability_zero_ablate",
-            "probability_value_autoregressive_zero_ablate",
+            "probability_value_zero_ablate",
         ],
         choices=[
             "none",
@@ -972,7 +974,7 @@ def main() -> None:
             "guess_tokens_mean_replace",
             "all_pre_guess_tokens_mean_replace",
             "guess_then_guess_probability_zero_ablate",
-            "probability_value_autoregressive_zero_ablate",
+            "probability_value_zero_ablate",
         ],
         help=(
             "One or more ablation modes. probability_last_token_mean_replace: ablate only the "

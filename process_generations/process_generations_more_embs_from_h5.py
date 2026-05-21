@@ -8,16 +8,19 @@ Input:
 
 Output:
   HDF5 + JSON with one processed response per example containing:
+    - response (original model completion string)
     - verbalised_confidence
     - embeddings_mean_prompt
     - embeddings_guess
     - embeddings_mean_sem_answer
     - embeddings_probability
+    - embeddings_mean_prob_val
 """
 
 import argparse
 import json
 import logging
+import re
 import sys
 import time
 from pathlib import Path
@@ -35,6 +38,7 @@ _EMBEDDING_KEYS = frozenset(
         "embeddings_guess",
         "embeddings_mean_sem_answer",
         "embeddings_probability",
+        "embeddings_mean_prob_val",
     }
 )
 
@@ -100,6 +104,34 @@ def parse_guess_and_probability_indices(decoded_tokens: list) -> tuple[int, int,
     return (last_guess_token_index, first_prob_token_index, end_prob_token_index)
 
 
+def _last_probability_value_char_span(full_str: str) -> tuple[int, int] | None:
+    """Return [start,end] char span for the last numeric value after ``Probability:``."""
+    if not full_str:
+        return None
+    matches = list(
+        re.finditer(r"probability\s*:\s*([0-9]+[.,]?[0-9]*)\s*%?", full_str, re.IGNORECASE)
+    )
+    if not matches:
+        matches = list(re.finditer(r"probability\s*:\s*(\d+(?:[.,]\d+)?)", full_str, re.IGNORECASE))
+    if not matches:
+        return None
+    match = matches[-1]
+    return match.start(1), match.end(1) - 1 # inclusive
+
+
+def _probability_value_token_span(decoded_tokens: list, full_str: str) -> tuple[int, int] | None:
+    """Map probability numeric char span to [start,end] token indices."""
+    span = _last_probability_value_char_span(full_str)
+    if span is None:
+        return None
+    char_start, char_end = span
+    token_start = _token_index_for_char_offset(decoded_tokens, char_start)
+    token_end = _token_index_for_char_offset(decoded_tokens, char_end)
+    if token_start > token_end:
+        return None
+    return token_start, token_end
+
+
 def _mean_across_tokens(token_embeddings: list[np.ndarray]) -> np.ndarray:
     """Average token embeddings across token dimension.
 
@@ -126,6 +158,8 @@ def _compute_embeddings_from_source(
     last_guess_token_index: int,
     first_prob_token_index: int,
     end_prob_token_index: int,
+    prob_value_start_token_index: int,
+    prob_value_end_token_index: int,
     expected_guess_tokens: int,
     expected_probability_tokens: int,
     example_id,
@@ -202,12 +236,26 @@ def _compute_embeddings_from_source(
             f"{source_label}: got {len(embeddings_probability)} probability embeddings, expected {expected_probability_tokens}"
         )
     embeddings_probability = [_tensor_to_numpy(e) for e in embeddings_probability]
+    if (
+        prob_value_start_token_index <= 0
+        or prob_value_end_token_index >= len(source_embeddings)
+        or prob_value_start_token_index > prob_value_end_token_index
+    ):
+        raise ValueError(
+            f"{source_label}: invalid probability value span "
+            f"[{prob_value_start_token_index}, {prob_value_end_token_index}]"
+        )
+    prob_value_token_embeddings = source_embeddings[prob_value_start_token_index:prob_value_end_token_index+1]
+    if len(prob_value_token_embeddings) == 0:
+        raise ValueError(f"{source_label}: empty probability-value token window")
+    embeddings_mean_prob_val = _mean_across_tokens(prob_value_token_embeddings)
 
     return {
         "embeddings_mean_prompt": _tensor_to_numpy(embeddings_mean_prompt),
         "embeddings_guess": [_tensor_to_numpy(e) for e in embeddings_guess],
         "embeddings_mean_sem_answer": _tensor_to_numpy(embeddings_mean_sem_answer),
         "embeddings_probability": embeddings_probability,
+        "embeddings_mean_prob_val": _tensor_to_numpy(embeddings_mean_prob_val),
     }
 
 
@@ -409,6 +457,25 @@ def process_example(
         )
         return None
     last_guess_token_index, first_prob_token_index, end_prob_token_index = indices
+    prob_value_token_span = _probability_value_token_span(decoded_tokens, full_str)
+    if prob_value_token_span is None:
+        logging.warning(
+            "Skipping example %s: could not map probability value token span. response=%r",
+            example_id,
+            response_str,
+        )
+        return None
+    prob_value_start_token_index, prob_value_end_token_index = prob_value_token_span
+    if not (prob_value_start_token_index <= end_prob_token_index <= prob_value_end_token_index):
+        logging.warning(
+            "Skipping example %s: value token span [%d,%d] does not include end_prob_token_index=%d. response=%r",
+            example_id,
+            prob_value_start_token_index,
+            prob_value_end_token_index,
+            end_prob_token_index,
+            response_str,
+        )
+        return None
 
     try:
         res_processed = _compute_embeddings_from_source(
@@ -417,6 +484,8 @@ def process_example(
             last_guess_token_index=last_guess_token_index,
             first_prob_token_index=first_prob_token_index,
             end_prob_token_index=end_prob_token_index,
+            prob_value_start_token_index=prob_value_start_token_index,
+            prob_value_end_token_index=prob_value_end_token_index,
             expected_guess_tokens=expected_guess_tokens,
             expected_probability_tokens=expected_probability_tokens,
             example_id=example_id,
@@ -441,6 +510,8 @@ def process_example(
                     last_guess_token_index=last_guess_token_index,
                     first_prob_token_index=first_prob_token_index,
                     end_prob_token_index=end_prob_token_index,
+                    prob_value_start_token_index=prob_value_start_token_index,
+                    prob_value_end_token_index=prob_value_end_token_index,
                     expected_guess_tokens=expected_guess_tokens,
                     expected_probability_tokens=expected_probability_tokens,
                     example_id=example_id,
@@ -468,6 +539,8 @@ def process_example(
                     last_guess_token_index=last_guess_token_index,
                     first_prob_token_index=first_prob_token_index,
                     end_prob_token_index=end_prob_token_index,
+                    prob_value_start_token_index=prob_value_start_token_index,
+                    prob_value_end_token_index=prob_value_end_token_index,
                     expected_guess_tokens=expected_guess_tokens,
                     expected_probability_tokens=expected_probability_tokens,
                     example_id=example_id,
@@ -481,11 +554,13 @@ def process_example(
                 )
 
     processed_response = {
+        "response": response_str,
         "verbalised_confidence": float(prob),
         "embeddings_mean_prompt": {"res": res_processed["embeddings_mean_prompt"]},
         "embeddings_guess": {"res": res_processed["embeddings_guess"]},
         "embeddings_mean_sem_answer": {"res": res_processed["embeddings_mean_sem_answer"]},
         "embeddings_probability": {"res": res_processed["embeddings_probability"]},
+        "embeddings_mean_prob_val": {"res": res_processed["embeddings_mean_prob_val"]},
     }
     if collect_attn_block_embeddings:
         processed_response["embeddings_mean_prompt"]["attn"] = (
@@ -500,6 +575,9 @@ def process_example(
         processed_response["embeddings_probability"]["attn"] = (
             None if attn_processed is None else attn_processed["embeddings_probability"]
         )
+        processed_response["embeddings_mean_prob_val"]["attn"] = (
+            None if attn_processed is None else attn_processed["embeddings_mean_prob_val"]
+        )
     if collect_mlp_block_embeddings:
         processed_response["embeddings_mean_prompt"]["mlp"] = (
             None if mlp_processed is None else mlp_processed["embeddings_mean_prompt"]
@@ -512,6 +590,9 @@ def process_example(
         )
         processed_response["embeddings_probability"]["mlp"] = (
             None if mlp_processed is None else mlp_processed["embeddings_probability"]
+        )
+        processed_response["embeddings_mean_prob_val"]["mlp"] = (
+            None if mlp_processed is None else mlp_processed["embeddings_mean_prob_val"]
         )
 
     return {

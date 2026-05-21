@@ -40,10 +40,8 @@ if str(REPO_ROOT) not in sys.path:
 from blockwise_zero_ablation.run_blockwise_zero_ablation import SUBBLOCK_TO_HOOK
 from mass_mean_probe.run_mass_mean_probe import (
     BRIEF_PROMPTS,
-    CONFIDENCE_MARKER,
     CONFIDENCE_PROMPT_LINGUISTIC,
     CONFIDENCE_PROMPT_NUMERIC,
-    PROBABILITY_MARKER,
     _absolute_all_pre_guess_positions,
     _absolute_guess_span_positions,
     _absolute_pre_probability_positions,
@@ -298,7 +296,6 @@ def _direction_mode_activation_applier_builder(
     expected_guess_tokens: int,
     expected_probability_tokens: int,
     expected_confidence_tokens: int,
-    probability_marker: str = PROBABILITY_MARKER,
     linguistic_confidence_prompt: bool = False,
 ) -> Callable[[int, Callable[[], List[str]]], Callable[[torch.Tensor, Dict[str, torch.Tensor]], torch.Tensor]]:
     def _builder(
@@ -317,7 +314,6 @@ def _direction_mode_activation_applier_builder(
                     decoded_tokens_provider(),
                     expected_probability_tokens=expected_probability_tokens,
                     expected_confidence_tokens=expected_confidence_tokens,
-                    probability_marker=probability_marker,
                     linguistic_confidence_prompt=linguistic_confidence_prompt,
                 )
                 if not prob_positions:
@@ -380,7 +376,6 @@ def _direction_mode_activation_applier_builder(
                     expected_guess_tokens=expected_guess_tokens,
                     expected_probability_tokens=expected_probability_tokens,
                     expected_confidence_tokens=expected_confidence_tokens,
-                    probability_marker=probability_marker,
                     linguistic_confidence_prompt=linguistic_confidence_prompt,
                 )
                 if positions is None:
@@ -475,7 +470,6 @@ def _direction_mode_activation_applier_builder(
                     decoded_tokens_provider(),
                     expected_probability_tokens=expected_probability_tokens,
                     expected_confidence_tokens=expected_confidence_tokens,
-                    probability_marker=probability_marker,
                     linguistic_confidence_prompt=linguistic_confidence_prompt,
                 )
                 if prob_positions:
@@ -515,7 +509,6 @@ def build_subblock_direction_perturb_hooks(
     expected_guess_tokens: int,
     expected_probability_tokens: int,
     expected_confidence_tokens: int,
-    probability_marker: str = PROBABILITY_MARKER,
     linguistic_confidence_prompt: bool = False,
 ) -> List[Tuple[str, Callable]]:
     hooks: List[Tuple[str, Callable]] = []
@@ -524,7 +517,6 @@ def build_subblock_direction_perturb_hooks(
         expected_guess_tokens=expected_guess_tokens,
         expected_probability_tokens=expected_probability_tokens,
         expected_confidence_tokens=expected_confidence_tokens,
-        probability_marker=probability_marker,
         linguistic_confidence_prompt=linguistic_confidence_prompt,
     )
     activation_applier = activation_applier_builder(prompt_len, decoded_tokens_provider)
@@ -556,7 +548,6 @@ def greedy_generate_direction_perturbed_subblock(
     expected_guess_tokens: int,
     expected_probability_tokens: int,
     expected_confidence_tokens: int,
-    probability_marker: str = PROBABILITY_MARKER,
     linguistic_confidence_prompt: bool = False,
 ) -> Tuple[str, List[str]]:
     tokens = model.to_tokens(local_prompt)
@@ -576,7 +567,6 @@ def greedy_generate_direction_perturbed_subblock(
         expected_guess_tokens=expected_guess_tokens,
         expected_probability_tokens=expected_probability_tokens,
         expected_confidence_tokens=expected_confidence_tokens,
-        probability_marker=probability_marker,
         linguistic_confidence_prompt=linguistic_confidence_prompt,
     )
     with torch.inference_mode():
@@ -1079,7 +1069,6 @@ def main() -> None:
     confidence_prompt = (
         CONFIDENCE_PROMPT_LINGUISTIC if args.linguistic_confidence_prompt else CONFIDENCE_PROMPT_NUMERIC
     )
-    probability_marker = CONFIDENCE_MARKER if args.linguistic_confidence_prompt else PROBABILITY_MARKER
 
     logging.info("Loading HookedTransformer: %s", args.model_name)
     model = load_hooked_transformer(args.model_name, device=device, torch_dtype=torch_dtype)
@@ -1246,7 +1235,6 @@ def main() -> None:
                                 expected_guess_tokens=args.expected_guess_tokens,
                                 expected_probability_tokens=args.expected_probability_tokens,
                                 expected_confidence_tokens=args.expected_confidence_tokens,
-                                probability_marker=probability_marker,
                                 linguistic_confidence_prompt=args.linguistic_confidence_prompt,
                             )
                             mode_confidence = (

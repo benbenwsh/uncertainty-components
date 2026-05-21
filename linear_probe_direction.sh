@@ -26,7 +26,7 @@ python3 ./linear_probe_direction/run_linear_probe_direction.py \
   --device cuda:0 \
   --ablation_mode none probability_tokens_mean_replace \
   --ablate_layers 10-16 \
-  --alpha -1 -0.5 0.0 0.25 0.5 0.75 1.0 1.5 2.0 \
+  --alpha -2 -1 0.0 0.25 0.5 0.75 1.0 2.0 3.0 \
   --ablation_targets low high \
   --no-enable_brief \
   --normalize_span_directions

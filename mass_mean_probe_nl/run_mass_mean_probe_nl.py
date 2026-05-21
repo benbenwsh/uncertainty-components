@@ -4,7 +4,9 @@
 Natural-language mass mean-direction probing via TransformerLens.
 
 This variant removes output-format parsing and instead uses prompt/generation-position
-ablation modes driven only by the mean prompt direction.
+ablation modes driven by prompt and probability-last-token mean directions. With
+--probability_last_direction_only, only the probability-last-token direction is used
+for estimation and at all ablated positions.
 """
 
 from __future__ import annotations
@@ -27,8 +29,7 @@ from transformers import AutoTokenizer
 from transformer_lens import HookedTransformer
 
 NATURAL_LANGUAGE_PROMPT = (
-    "Answer the following question directly and concisely. "
-    "Do not follow any special output template.\n"
+    "Answer the following question, and express your confidence in your answer.\n"
     "Question: "
 )
 
@@ -41,14 +42,17 @@ STOP_SEQUENCES = ["\n\n\n\n", "\n\n\n"]
 
 ABLATION_MODES = [
     "none",
+    "all_tokens_mean_replace",
     "all_prompt_tokens_mean_replace",
     "all_prompt_and_first_generated_mean_replace",
     "first_generated_token_mean_replace",
     "current_generated_token_mean_replace",
+    "current_generated_window5_mean_replace",
 ]
 
 _NEW_H5_REQUIRED_COMPONENTS = ("res", "attn", "mlp")
 _EMBEDDING_FIELD_PROMPT = "embeddings_mean_prompt"
+_EMBEDDING_FIELD_PROBABILITY = "embeddings_probability"
 
 
 def load_trivia_qa(seed: int) -> Tuple[Dataset, Dataset]:
@@ -175,7 +179,17 @@ def write_config_txt(
         f"alpha={args.alpha}",
         "non_none_mode_behavior=additive_direction_perturbation",
         "direction_definition=high_mean_minus_low_mean",
-        "direction_field=embeddings_mean_prompt",
+        f"probability_last_direction_only={args.probability_last_direction_only}",
+        (
+            "direction_fields=embeddings_probability[-1]"
+            if args.probability_last_direction_only
+            else "direction_fields=embeddings_mean_prompt,embeddings_probability[-1]"
+        ),
+        (
+            "direction_position_rule=all_positions_use_probability_last"
+            if args.probability_last_direction_only
+            else "direction_position_rule=positions_lt_prompt_len_minus_1_use_prompt_else_probability_last"
+        ),
         f"ablate_layers_spec={args.ablate_layers}",
         f"ablate_layers_resolved={','.join(str(layer) for layer in ablate_layers)}",
         f"num_ablated_layers={len(ablate_layers)}",
@@ -365,17 +379,21 @@ def greedy_generate(
 
 
 def _positions_for_mode(mode: str, *, prompt_len: int, seq_len: int) -> List[int]:
+    if mode == "all_tokens_mean_replace":
+        return list(range(seq_len))
     if mode == "all_prompt_tokens_mean_replace":
-        return list(range(prompt_len))
+        logging.info(f"all_prompt_tokens_mean_replace: {list(range(prompt_len))}, seq_len: {seq_len}, prompt_len: {prompt_len}")
+        return list(range(prompt_len-1))
     if mode == "all_prompt_and_first_generated_mean_replace":
-        positions = list(range(prompt_len))
-        if prompt_len < seq_len:
-            positions.append(prompt_len)
-        return positions
+        logging.info(f"all_prompt_and_first_generated_mean_replace: {list(range(prompt_len))}, seq_len: {seq_len}, prompt_len: {prompt_len}")
+        return list(range(prompt_len))
     if mode == "first_generated_token_mean_replace":
-        return [prompt_len] if prompt_len < seq_len else []
+        return [prompt_len-1]
     if mode == "current_generated_token_mean_replace":
         return [seq_len - 1]
+    if mode == "current_generated_window5_mean_replace":
+        positions = list(range(max(0, seq_len - 5), seq_len))
+        return positions
     raise ValueError(f"Unknown ablation mode for perturb hooks: {mode!r}")
 
 
@@ -383,18 +401,28 @@ def _direction_mode_activation_applier_builder(
     mode: str,
     *,
     prompt_len: int,
-) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    probability_last_direction_only: bool = False,
+) -> Callable[[torch.Tensor, Dict[str, torch.Tensor]], torch.Tensor]:
     if mode not in ABLATION_MODES or mode == "none":
         raise ValueError(f"Unknown ablation mode for perturb hooks: {mode!r}")
 
     def _apply_mode(
-        activation: torch.Tensor,
-        layer_delta: torch.Tensor,
+        activation: torch.Tensor, # (batch_size, seq_len, d_model)
+        layer_delta: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        delta_vec = layer_delta.to(activation.dtype)
+        probability_last_delta_vec = layer_delta["probability_last"].to(activation.dtype)
+        prompt_delta_vec = (
+            probability_last_delta_vec
+            if probability_last_direction_only
+            else layer_delta["prompt"].to(activation.dtype)
+        )
         seq_len = int(activation.shape[1])
         for abs_pos in _positions_for_mode(mode, prompt_len=prompt_len, seq_len=seq_len):
             if 0 <= abs_pos < seq_len:
+                if probability_last_direction_only:
+                    delta_vec = probability_last_delta_vec
+                else:
+                    delta_vec = prompt_delta_vec if abs_pos < prompt_len - 1 else probability_last_delta_vec
                 activation[:, abs_pos, :] = activation[:, abs_pos, :] + delta_vec
         return activation
 
@@ -402,13 +430,18 @@ def _direction_mode_activation_applier_builder(
 
 
 def build_direction_perturb_hooks(
-    layer_to_delta: Dict[int, torch.Tensor],
+    layer_to_delta: Dict[int, Dict[str, torch.Tensor]],
     *,
     mode: str,
     prompt_len: int,
+    probability_last_direction_only: bool = False,
 ) -> List[Tuple[str, Callable]]:
     hooks: List[Tuple[str, Callable]] = []
-    activation_applier = _direction_mode_activation_applier_builder(mode, prompt_len=prompt_len)
+    activation_applier = _direction_mode_activation_applier_builder(
+        mode,
+        prompt_len=prompt_len,
+        probability_last_direction_only=probability_last_direction_only,
+    )
     for layer in layer_to_delta:
         hook_name = f"blocks.{layer}.hook_resid_post"
 
@@ -428,8 +461,9 @@ def greedy_generate_direction_perturbed(
     local_prompt: str,
     max_new_tokens: int,
     *,
-    layer_to_delta: Dict[int, torch.Tensor],
+    layer_to_delta: Dict[int, Dict[str, torch.Tensor]],
     mode: str,
+    probability_last_direction_only: bool = False,
 ) -> Tuple[str, List[str]]:
     tokens = model.to_tokens(local_prompt)
     prompt_len = int(tokens.shape[1])
@@ -439,12 +473,14 @@ def greedy_generate_direction_perturbed(
         layer_to_delta=layer_to_delta,
         mode=mode,
         prompt_len=prompt_len,
+        probability_last_direction_only=probability_last_direction_only,
     )
     with torch.inference_mode():
         for _ in range(max_new_tokens):
             out = model.run_with_hooks(tokens, return_type="logits", fwd_hooks=hooks)
             logits = out[0] if isinstance(out, tuple) else out
             next_id = int(logits[0, -1].argmax(dim=-1).item())
+            logging.info(f"decoded_tokens: {decoded_tokens}")
             decoded_tokens.append(model.tokenizer.decode([next_id], skip_special_tokens=False))
             next_t = torch.tensor([[next_id]], device=tokens.device, dtype=tokens.dtype)
             tokens = torch.cat([tokens, next_t], dim=-1)
@@ -456,16 +492,18 @@ def greedy_generate_direction_perturbed(
     return _postprocess_response_from_full_decode(model, tokens, local_prompt), decoded_tokens
 
 
-def compute_low_high_prompt_means_and_directions(
+def compute_low_high_mixed_means_and_directions(
     examples_h5: Dict[str, dict],
     ablate_layers: Sequence[int],
     *,
     low_conf_threshold: float,
     high_conf_threshold: float,
     new_h5_format: bool = False,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, set[str], set[str]]:
-    low_vectors: List[np.ndarray] = []
-    high_vectors: List[np.ndarray] = []
+    probability_last_direction_only: bool = False,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray], set[str], set[str]]:
+    direction_keys = ("probability_last",) if probability_last_direction_only else ("prompt", "probability_last")
+    low_vectors: Dict[str, List[np.ndarray]] = {key: [] for key in direction_keys}
+    high_vectors: Dict[str, List[np.ndarray]] = {key: [] for key in direction_keys}
     low_ids: set[str] = set()
     high_ids: set[str] = set()
     layer_indices = np.asarray(ablate_layers)
@@ -488,25 +526,48 @@ def compute_low_high_prompt_means_and_directions(
         if not (is_low or is_high):
             continue
 
-        emb_prompt = _extract_res_field(
-            resp0, ex_id, _EMBEDDING_FIELD_PROMPT, new_h5_format=new_h5_format
+        emb_probability = _extract_res_field(
+            resp0, ex_id, _EMBEDDING_FIELD_PROBABILITY, new_h5_format=new_h5_format
         )
-        if emb_prompt is None:
-            raise ValueError(f"Example {ex_id} is missing required field {_EMBEDDING_FIELD_PROMPT}.")
-        prompt_selected = _as_layer_hidden(emb_prompt)[layer_indices, :]
+        if emb_probability is None:
+            raise ValueError(
+                f"Example {ex_id} is missing required field {_EMBEDDING_FIELD_PROBABILITY}."
+            )
+        if not isinstance(emb_probability, (list, tuple)) or len(emb_probability) == 0:
+            raise ValueError(f"Example {ex_id} field {_EMBEDDING_FIELD_PROBABILITY} must be a non-empty list.")
+        probability_last_selected = _as_layer_hidden(emb_probability[-1])[layer_indices, :]
+        prompt_selected = None
+        if not probability_last_direction_only:
+            emb_prompt = _extract_res_field(
+                resp0, ex_id, _EMBEDDING_FIELD_PROMPT, new_h5_format=new_h5_format
+            )
+            if emb_prompt is None:
+                raise ValueError(
+                    f"Example {ex_id} is missing required field {_EMBEDDING_FIELD_PROMPT}."
+                )
+            prompt_selected = _as_layer_hidden(emb_prompt)[layer_indices, :]
         if is_low:
-            low_vectors.append(prompt_selected)
+            if prompt_selected is not None:
+                low_vectors["prompt"].append(prompt_selected)
+            low_vectors["probability_last"].append(probability_last_selected)
         if is_high:
-            high_vectors.append(prompt_selected)
+            if prompt_selected is not None:
+                high_vectors["prompt"].append(prompt_selected)
+            high_vectors["probability_last"].append(probability_last_selected)
 
-    if not low_vectors:
+    count_key = "probability_last" if probability_last_direction_only else "prompt"
+    if not low_vectors[count_key]:
         raise ValueError(f"No low-confidence examples found at threshold <= {low_conf_threshold}.")
-    if not high_vectors:
+    if not high_vectors[count_key]:
         raise ValueError(f"No high-confidence examples found at threshold >= {high_conf_threshold}.")
 
-    mean_low = np.mean(np.stack(low_vectors, axis=0), axis=0).astype(np.float32)
-    mean_high = np.mean(np.stack(high_vectors, axis=0), axis=0).astype(np.float32)
-    direction = (mean_high - mean_low).astype(np.float32)
+    mean_low: Dict[str, np.ndarray] = {}
+    mean_high: Dict[str, np.ndarray] = {}
+    direction: Dict[str, np.ndarray] = {}
+    for key in direction_keys:
+        mean_low[key] = np.mean(np.stack(low_vectors[key], axis=0), axis=0).astype(np.float32)
+        mean_high[key] = np.mean(np.stack(high_vectors[key], axis=0), axis=0).astype(np.float32)
+        direction[key] = (mean_high[key] - mean_low[key]).astype(np.float32)
     return mean_low, mean_high, direction, low_ids, high_ids
 
 
@@ -575,6 +636,12 @@ def main() -> None:
     parser.add_argument("--low_conf_threshold", type=float, default=0.1)
     parser.add_argument("--high_conf_threshold", type=float, default=0.9)
     parser.add_argument(
+        "--probability_last_direction_only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use only probability-last-token mean direction for estimation and at all ablated positions.",
+    )
+    parser.add_argument(
         "--output_json",
         type=str,
         default=None,
@@ -625,18 +692,26 @@ def main() -> None:
     out_path = resolve_output_json_path(args.output_json)
 
     examples_h5 = load_examples_h5(Path(args.input_h5))
-    _, _, direction_prompt, low_ids, high_ids = compute_low_high_prompt_means_and_directions(
+    _, _, directions, low_ids, high_ids = compute_low_high_mixed_means_and_directions(
         examples_h5=examples_h5,
         ablate_layers=ablate_layers,
         low_conf_threshold=args.low_conf_threshold,
         high_conf_threshold=args.high_conf_threshold,
         new_h5_format=args.new_h5_format,
+        probability_last_direction_only=args.probability_last_direction_only,
     )
-    logging.info(
-        "Computed prompt direction from %d low and %d high examples.",
-        len(low_ids),
-        len(high_ids),
-    )
+    if args.probability_last_direction_only:
+        logging.info(
+            "Computed probability-last-only directions from %d low and %d high examples.",
+            len(low_ids),
+            len(high_ids),
+        )
+    else:
+        logging.info(
+            "Computed prompt and probability-last directions from %d low and %d high examples.",
+            len(low_ids),
+            len(high_ids),
+        )
 
     results = {"train": {}, "validation": {}}
     mini_results = {"train": {}, "validation": {}}
@@ -687,17 +762,29 @@ def main() -> None:
                 sign = 1.0 if target == "low" else -1.0
                 for mode in non_none_modes:
                     for alpha in args.alpha:
-                        layer_to_delta: Dict[int, torch.Tensor] = {}
+                        layer_to_delta: Dict[int, Dict[str, torch.Tensor]] = {}
                         for layer_i, layer_idx in enumerate(ablate_layers):
-                            layer_to_delta[layer_idx] = torch.tensor(
-                                sign * alpha * direction_prompt[layer_i], device=device, dtype=torch_dtype
-                            )
+                            layer_delta: Dict[str, torch.Tensor] = {
+                                "probability_last": torch.tensor(
+                                    sign * alpha * directions["probability_last"][layer_i],
+                                    device=device,
+                                    dtype=torch_dtype,
+                                ),
+                            }
+                            if not args.probability_last_direction_only:
+                                layer_delta["prompt"] = torch.tensor(
+                                    sign * alpha * directions["prompt"][layer_i],
+                                    device=device,
+                                    dtype=torch_dtype,
+                                )
+                            layer_to_delta[layer_idx] = layer_delta
                         response, decoded_tokens = greedy_generate_direction_perturbed(
                             model=model,
                             local_prompt=local_prompt,
                             max_new_tokens=args.model_max_new_tokens,
                             layer_to_delta=layer_to_delta,
                             mode=mode,
+                            probability_last_direction_only=args.probability_last_direction_only,
                         )
                         key = f"{mode_to_output_key(mode)}__target_{target}__alpha_{_format_alpha(alpha)}"
                         responses_identical = response == baseline_response

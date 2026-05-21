@@ -711,7 +711,7 @@ def main() -> None:
     )
     parser.add_argument("--low_conf_threshold", type=float, default=0.1)
     parser.add_argument("--high_conf_threshold", type=float, default=0.9)
-    parser.add_argument("--expected_probability_tokens", type=int, default=6)
+    parser.add_argument("--expected_probability_tokens", type=int, default=7)
     parser.add_argument(
         "--normalize_span_directions",
         action=argparse.BooleanOptionalAction,

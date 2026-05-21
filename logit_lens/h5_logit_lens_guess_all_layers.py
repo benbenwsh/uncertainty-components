@@ -767,7 +767,7 @@ def _write_config_txt(
         "Normalization for probability curves: per-example min-max over layers to [0,1]",
         f"Max examples per input path: {args.max_examples_per_split}",
         f"Train path: {args.train_path}",
-        f"Val path: {args.val_path}",
+        f"Test path: {args.test_path}",
         f"Input paths used: {', '.join(input_paths)}",
         f"Top-token report source path: {report_source_path}",
         f"Output dir: {run_dir}",
@@ -790,7 +790,8 @@ def main():
     parser.add_argument("--train_path", type=str, required=True)
     # Two paths are accepted to mirror how data is generated and to allow larger
     # combined runs, but the underlying computation is identical for every example.
-    parser.add_argument("--val_path", type=str, default=None, help="Optional second HDF5 path to combine.")
+    parser.add_argument("--test_path", type=str, default=None, help="Optional second HDF5 path to combine.")
+    parser.add_argument("--val_path", type=str, default=None, help="Deprecated alias for --test_path.")
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -820,6 +821,9 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.test_path is None and args.val_path is not None:
+        args.test_path = args.val_path
+
     if args.top_n <= 0:
         raise ValueError("--top_n must be >= 1")
     if args.top_token_examples <= 0:
@@ -836,13 +840,13 @@ def main():
     print(f"Run directory: {run_base}")
 
     input_paths = [args.train_path]
-    use_val_path = bool(args.val_path) and Path(args.val_path).exists()
-    if args.val_path and not use_val_path:
-        print(f"WARNING: val_path does not exist, falling back to train_path for report examples: {args.val_path}")
-    if use_val_path:
-        input_paths.append(args.val_path)
+    use_test_path = bool(args.test_path) and Path(args.test_path).exists()
+    if args.test_path and not use_test_path:
+        print(f"WARNING: test_path does not exist, falling back to train_path for report examples: {args.test_path}")
+    if use_test_path:
+        input_paths.append(args.test_path)
 
-    report_source_path = args.val_path if use_val_path else args.train_path
+    report_source_path = args.test_path if use_test_path else args.train_path
 
     print("Scanning HDF5 lazily...")
     n_examples, n_layers, hidden_dim = _infer_h5_shape(

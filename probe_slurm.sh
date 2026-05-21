@@ -15,4 +15,4 @@ source /vol/cuda/13.0.0/setup.sh
 /usr/bin/nvidia-smi
 uptime
 
-python3 ./verbalised_confidence_probes/train_semantic_probe_all_layers.py --train_path ./semantic_uncertainty/processed_generations/4/train_verbalised_embeddings.pkl --val_path ./semantic_uncertainty/processed_generations/5/validation_verbalised_embeddings.pkl --plot --n_negatives 99
+python3 ./verbalised_confidence_probes/train_semantic_probe_all_layers.py --train_path ./semantic_uncertainty/processed_generations/4/train_verbalised_embeddings.pkl --test_path ./semantic_uncertainty/processed_generations/5/test_verbalised_embeddings.pkl --plot --n_negatives 99
