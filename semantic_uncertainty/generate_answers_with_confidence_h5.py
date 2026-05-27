@@ -343,12 +343,19 @@ def main(args):
                         all_embeddings,
                         all_attn_embeddings,
                         all_mlp_embeddings,
+                        all_q_embeddings,
+                        all_k_embeddings,
+                        all_v_embeddings,
+                        all_o_embeddings,
+                        all_concat_embeddings,
                     ), decoded_tokens = model.predict(
                         local_prompt,
                         temperature,
                         return_latent=True,
                         collect_attn_block_embeddings=args.collect_attn_block_embeddings,
                         collect_mlp_block_embeddings=args.collect_mlp_block_embeddings,
+                        collect_qkvo_embeddings=args.collect_qkvo_embeddings,
+                        collect_concat_embeddings=args.collect_concat_embeddings,
                     )
 
                     emb_sec_last_token = emb_sec_last_token.cpu() if emb_sec_last_token is not None else None
@@ -384,6 +391,11 @@ def main(args):
                             'all_embeddings': all_embeddings,
                             'all_attn_embeddings': all_attn_embeddings,
                             'all_mlp_embeddings': all_mlp_embeddings,
+                            'all_q_embeddings': all_q_embeddings,
+                            'all_k_embeddings': all_k_embeddings,
+                            'all_v_embeddings': all_v_embeddings,
+                            'all_o_embeddings': all_o_embeddings,
+                            'all_concat_embeddings': all_concat_embeddings,
                             'decoded_tokens': decoded_tokens,
                         }
                     else:

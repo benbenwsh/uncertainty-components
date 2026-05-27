@@ -250,10 +250,13 @@ def mode_to_output_key(mode: str) -> str:
         "probability_last_token_mean_replace",
         "probability_span_except_last_token_mean_replace",
         "probability_value_mean_replace",
+        "semantic_answer_mean_replace",
         "all_pre_probability_tokens_mean_replace",
         "guess_tokens_mean_replace",
         "all_pre_guess_tokens_mean_replace",
         "guess_then_guess_probability_mean_replace",
+        "current_generated_token_mean_replace",
+        "current_generated_window5_mean_replace",
     }:
         return mode
     raise ValueError(f"Unknown mode: {mode}")
@@ -770,6 +773,29 @@ def _absolute_prob_marker_except_last_token(
     ]
 
 
+def _absolute_sem_answer_positions(
+    prompt_len: int,
+    decoded_tokens: List[str],
+    *,
+    linguistic_confidence_prompt: bool = False,
+) -> List[int]:
+    """Absolute positions for semantic-answer completion tokens (between Guess: and marker span)."""
+    parsed = parse_guess_and_marker_indices(
+        decoded_tokens,
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
+    )
+    if parsed is None:
+        return []
+    last_guess_token_index, first_span_token_index, _ = parsed
+    seq_len = prompt_len + len(decoded_tokens)
+    out: List[int] = []
+    for k in range(last_guess_token_index, first_span_token_index):
+        p = _completion_token_index_to_abs_pos(prompt_len, k)
+        if 0 <= p < seq_len:
+            out.append(p)
+    return out
+
+
 def _absolute_guess_span_positions(
     prompt_len: int,
     decoded_tokens: List[str],
@@ -1064,6 +1090,26 @@ def _direction_mode_activation_applier_builder(
 
             return _apply_guess_tokens_mean_replace
 
+        if mode == "semantic_answer_mean_replace":
+            def _apply_semantic_answer_mean_replace(
+                activation: torch.Tensor,
+                layer_delta: Dict[str, torch.Tensor],
+            ) -> torch.Tensor:
+                sem_answer_vec = layer_delta["sem_answer_mean"].to(activation.dtype)
+                sem_positions = _absolute_sem_answer_positions(
+                    prompt_len,
+                    decoded_tokens_provider(),
+                    linguistic_confidence_prompt=linguistic_confidence_prompt,
+                )
+                if not sem_positions:
+                    return activation
+                for abs_pos in sem_positions:
+                    if 0 <= abs_pos < activation.shape[1]:
+                        activation[:, abs_pos, :] = activation[:, abs_pos, :] + sem_answer_vec
+                return activation
+
+            return _apply_semantic_answer_mean_replace
+
         if mode == "all_pre_probability_tokens_mean_replace":
             def _apply_all_pre_probability_tokens_mean_replace(
                 activation: torch.Tensor,
@@ -1198,6 +1244,32 @@ def _direction_mode_activation_applier_builder(
                 return activation
 
             return _apply_guess_then_guess_probability_mean_replace
+
+        if mode == "current_generated_token_mean_replace":
+            def _apply_current_generated_token_mean_replace(
+                activation: torch.Tensor,
+                layer_delta: Dict[str, torch.Tensor],
+            ) -> torch.Tensor:
+                prob_last_vec = layer_delta["probability"][-1].to(activation.dtype)
+                abs_pos = int(activation.shape[1]) - 1
+                if 0 <= abs_pos < activation.shape[1]:
+                    activation[:, abs_pos, :] = activation[:, abs_pos, :] + prob_last_vec
+                return activation
+
+            return _apply_current_generated_token_mean_replace
+
+        if mode == "current_generated_window5_mean_replace":
+            def _apply_current_generated_window5_mean_replace(
+                activation: torch.Tensor,
+                layer_delta: Dict[str, torch.Tensor],
+            ) -> torch.Tensor:
+                prob_last_vec = layer_delta["probability"][-1].to(activation.dtype)
+                seq_len = int(activation.shape[1])
+                for abs_pos in range(max(0, seq_len - 5), seq_len):
+                    activation[:, abs_pos, :] = activation[:, abs_pos, :] + prob_last_vec
+                return activation
+
+            return _apply_current_generated_window5_mean_replace
 
         raise ValueError(f"Unknown ablation mode for perturb hooks: {mode!r}")
 
@@ -1522,10 +1594,13 @@ def main() -> None:
             "probability_last_token_mean_replace",
             "probability_span_except_last_token_mean_replace",
             "probability_value_mean_replace",
+            "semantic_answer_mean_replace",
             "all_pre_probability_tokens_mean_replace",
             "guess_tokens_mean_replace",
             "all_pre_guess_tokens_mean_replace",
             "guess_then_guess_probability_mean_replace",
+            "current_generated_token_mean_replace",
+            "current_generated_window5_mean_replace",
         ],
         choices=[
             "none",
@@ -1533,16 +1608,26 @@ def main() -> None:
             "probability_last_token_mean_replace",
             "probability_span_except_last_token_mean_replace",
             "probability_value_mean_replace",
+            "semantic_answer_mean_replace",
             "all_pre_probability_tokens_mean_replace",
             "guess_tokens_mean_replace",
             "all_pre_guess_tokens_mean_replace",
             "guess_then_guess_probability_mean_replace",
+            "current_generated_token_mean_replace",
+            "current_generated_window5_mean_replace",
         ],
         help=(
             "Ablation mode(s) to run. probability_last_token_mean_replace: perturb only the "
             "last token in the Probability: marker span (last H5 probability row). "
             "probability_span_except_last_token_mean_replace: perturb all Probability: span "
             "tokens except that last span token (remaining H5 probability rows). "
+            "current_generated_token_mean_replace: perturb only the current last sequence token "
+            "at each decode step using the probability-last direction. "
+            "current_generated_window5_mean_replace: perturb the current last 5 sequence tokens "
+            "at each decode step using the probability-last direction. "
+            "semantic_answer_mean_replace: no-op until Guess/Probability(or Confidence) parse "
+            "succeeds, then perturb only semantic-answer tokens using the shared "
+            "sem_answer_mean direction. "
             "Both subset modes apply only with the numeric Probability: prompt."
         ),
     )
@@ -1620,7 +1705,10 @@ def main() -> None:
             "probability_last_token_mean_replace",
             "probability_span_except_last_token_mean_replace",
             "guess_tokens_mean_replace",
+            "semantic_answer_mean_replace",
             "guess_then_guess_probability_mean_replace",
+            "current_generated_token_mean_replace",
+            "current_generated_window5_mean_replace",
         }
         unsupported_modes = [mode for mode in args.ablation_mode if mode not in normalization_supported_modes]
         if unsupported_modes:

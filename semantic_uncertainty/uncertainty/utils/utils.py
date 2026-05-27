@@ -117,6 +117,12 @@ def get_parser(stages=['generate', 'compute']):
             "--collect_mlp_block_embeddings", default=False, action=argparse.BooleanOptionalAction,
             help="If true, collect per-token MLP block outputs before residual addition.")
         parser.add_argument(
+            "--collect_qkvo_embeddings", default=False, action=argparse.BooleanOptionalAction,
+            help="If true, collect per-token q/k/v/o projection outputs.")
+        parser.add_argument(
+            "--collect_concat_embeddings", default=False, action=argparse.BooleanOptionalAction,
+            help="If true, collect per-token concat embeddings right before W_O (o_proj input).")
+        parser.add_argument(
             "--save_to_wandb", default=False, action=argparse.BooleanOptionalAction,
             help="If true, save files to wandb. Default: False (files are saved locally but not uploaded to wandb).")
 

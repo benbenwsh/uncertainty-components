@@ -253,7 +253,9 @@ class HuggingfaceModelAllEmbeddings(BaseModel):
             return_full=False,
             return_latent=False,
             collect_attn_block_embeddings=False,
-            collect_mlp_block_embeddings=False):
+            collect_mlp_block_embeddings=False,
+            collect_qkvo_embeddings=False,
+            collect_concat_embeddings=False):
 
         if isinstance(input_data, tuple):
             logging.WARNING("INPUT IS A TUPLE.")
@@ -298,23 +300,39 @@ class HuggingfaceModelAllEmbeddings(BaseModel):
 
         attn_layer_outputs = []
         mlp_layer_outputs = []
+        q_layer_outputs = []
+        k_layer_outputs = []
+        v_layer_outputs = []
+        o_layer_outputs = []
+        concat_layer_inputs = []
         hook_handles = []
 
         collect_attn = bool(return_latent and collect_attn_block_embeddings)
         collect_mlp = bool(return_latent and collect_mlp_block_embeddings)
-        if collect_attn or collect_mlp:
+        collect_qkvo = bool(return_latent and collect_qkvo_embeddings)
+        collect_concat = bool(return_latent and collect_concat_embeddings)
+        if collect_attn or collect_mlp or collect_qkvo or collect_concat:
             layers = getattr(getattr(self.model, "model", None), "layers", None)
             if layers is None:
                 logging.warning(
-                    "Model does not expose model.layers; skipping attn/mlp block embedding collection."
+                    "Model does not expose model.layers; skipping attn/mlp/qkvo/concat embedding collection."
                 )
                 collect_attn = False
                 collect_mlp = False
+                collect_qkvo = False
+                collect_concat = False
             else:
                 if collect_attn:
                     attn_layer_outputs = [[] for _ in range(len(layers))]
                 if collect_mlp:
                     mlp_layer_outputs = [[] for _ in range(len(layers))]
+                if collect_qkvo:
+                    q_layer_outputs = [[] for _ in range(len(layers))]
+                    k_layer_outputs = [[] for _ in range(len(layers))]
+                    v_layer_outputs = [[] for _ in range(len(layers))]
+                    o_layer_outputs = [[] for _ in range(len(layers))]
+                if collect_concat:
+                    concat_layer_inputs = [[] for _ in range(len(layers))]
 
                 def _extract_hidden_tensor(module_output):
                     if isinstance(module_output, (tuple, list)):
@@ -339,11 +357,61 @@ class HuggingfaceModelAllEmbeddings(BaseModel):
                         mlp_layer_outputs[layer_idx].append(tensor.detach())
                     return _hook
 
+                def _make_qkvo_hook(layer_outputs, layer_idx):
+                    def _hook(_, __, module_output):
+                        tensor = _extract_hidden_tensor(module_output)
+                        if tensor is None:
+                            return
+                        layer_outputs[layer_idx].append(tensor.detach())
+                    return _hook
+
+                def _extract_pre_hook_input(module_input):
+                    if not isinstance(module_input, (tuple, list)) or len(module_input) == 0:
+                        return None
+                    tensor = module_input[0]
+                    if isinstance(tensor, (tuple, list)):
+                        if len(tensor) == 0:
+                            return None
+                        tensor = tensor[0]
+                    return tensor
+
+                def _make_concat_pre_hook(layer_idx):
+                    def _hook(_, module_input):
+                        tensor = _extract_pre_hook_input(module_input)
+                        if tensor is None:
+                            return
+                        concat_layer_inputs[layer_idx].append(tensor.detach())
+                    return _hook
+
                 for layer_idx, layer in enumerate(layers):
                     if collect_attn and hasattr(layer, "self_attn"):
                         hook_handles.append(layer.self_attn.register_forward_hook(_make_attn_hook(layer_idx)))
                     if collect_mlp and hasattr(layer, "mlp"):
                         hook_handles.append(layer.mlp.register_forward_hook(_make_mlp_hook(layer_idx)))
+                    if collect_qkvo and hasattr(layer, "self_attn"):
+                        self_attn = layer.self_attn
+                        if hasattr(self_attn, "q_proj"):
+                            hook_handles.append(
+                                self_attn.q_proj.register_forward_hook(_make_qkvo_hook(q_layer_outputs, layer_idx))
+                            )
+                        if hasattr(self_attn, "k_proj"):
+                            hook_handles.append(
+                                self_attn.k_proj.register_forward_hook(_make_qkvo_hook(k_layer_outputs, layer_idx))
+                            )
+                        if hasattr(self_attn, "v_proj"):
+                            hook_handles.append(
+                                self_attn.v_proj.register_forward_hook(_make_qkvo_hook(v_layer_outputs, layer_idx))
+                            )
+                        if hasattr(self_attn, "o_proj"):
+                            hook_handles.append(
+                                self_attn.o_proj.register_forward_hook(_make_qkvo_hook(o_layer_outputs, layer_idx))
+                            )
+                    if collect_concat and hasattr(layer, "self_attn"):
+                        self_attn = layer.self_attn
+                        if hasattr(self_attn, "o_proj"):
+                            hook_handles.append(
+                                self_attn.o_proj.register_forward_pre_hook(_make_concat_pre_hook(layer_idx))
+                            )
 
         try:
             with torch.no_grad():
@@ -468,6 +536,11 @@ class HuggingfaceModelAllEmbeddings(BaseModel):
 
             all_attn_embeddings = None
             all_mlp_embeddings = None
+            all_q_embeddings = None
+            all_k_embeddings = None
+            all_v_embeddings = None
+            all_o_embeddings = None
+            all_concat_embeddings = None
 
             def _pack_layerwise_outputs(layer_outputs, name):
                 if not layer_outputs:
@@ -503,6 +576,13 @@ class HuggingfaceModelAllEmbeddings(BaseModel):
                 all_attn_embeddings = _pack_layerwise_outputs(attn_layer_outputs, "attention")
             if collect_mlp:
                 all_mlp_embeddings = _pack_layerwise_outputs(mlp_layer_outputs, "mlp")
+            if collect_qkvo:
+                all_q_embeddings = _pack_layerwise_outputs(q_layer_outputs, "q_proj")
+                all_k_embeddings = _pack_layerwise_outputs(k_layer_outputs, "k_proj")
+                all_v_embeddings = _pack_layerwise_outputs(v_layer_outputs, "v_proj")
+                all_o_embeddings = _pack_layerwise_outputs(o_layer_outputs, "o_proj")
+            if collect_concat:
+                all_concat_embeddings = _pack_layerwise_outputs(concat_layer_inputs, "concat")
 
         # Get log_likelihoods.
         transition_scores = self.model.compute_transition_scores(
@@ -529,9 +609,14 @@ class HuggingfaceModelAllEmbeddings(BaseModel):
                 all_embeddings,
                 all_attn_embeddings,
                 all_mlp_embeddings,
+                all_q_embeddings,
+                all_k_embeddings,
+                all_v_embeddings,
+                all_o_embeddings,
+                all_concat_embeddings,
             )
         else:
-            hidden_states += (None, None, None, None, None)
+            hidden_states += (None, None, None, None, None, None, None, None, None, None)
 
         return_values = (sliced_answer, log_likelihoods, hidden_states, sliced_decoded_tokens)
 

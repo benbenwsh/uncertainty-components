@@ -15,17 +15,22 @@ source /vol/cuda/13.0.0/setup.sh
 /usr/bin/nvidia-smi
 uptime
 
-# for layer in $(seq 0 31); do
-#   python3 ./layerwise_mean_ablation/run_mean_ablation.py --input_h5 ./semantic_uncertainty/processed_generations_h5/3_train_200_samples_temp_0/train_verbalised_embeddings.h5 --num_samples 200 --device cuda:0 --ablate_layers "${layer}" --no-mean_from_low_confidence
-# done
-# python3 ./layerwise_mean_ablation/run_mean_ablation.py --input_h5 ./semantic_uncertainty/processed_generations_h5/3_train_200_samples_temp_0/train_verbalised_embeddings.h5 --num_samples 200 --device cuda:0 --ablate_layers 0-6 --no-mean_from_low_confidence
-
-python3 ./layerwise_mean_ablation/run_mean_ablation.py \
+# Standard tokenwise run across a layer span:
+python3 ./tokenwise_probability_mean_ablation/run_tokenwise_probability_mean_ablation.py \
   --input_h5 ./process_generations/processed_generations_more_h5/2_200_concat/train_verbalised_embeddings.h5 \
   --no-enable_brief \
-  --num_samples 200 \
+  --num_samples 80 \
   --device cuda:0 \
   --ablate_layers 10-16 \
   --new_h5_format \
-  --ablation_mode none semantic_answer_mean_replace \
-  --no-mean_from_low_confidence
+  --individual_layers
+
+# Individual-layer mode (uncomment to run layer x token grid output):
+# python3 ./tokenwise_probability_mean_ablation/run_tokenwise_probability_mean_ablation.py \
+#   --input_h5 ./process_generations/processed_generations_more_h5/1_1000_prob_val_span/train_verbalised_embeddings.h5 \
+#   --no-enable_brief \
+#   --num_samples 1000 \
+#   --device cuda:0 \
+#   --new_h5_format \
+#   --no-mean_from_low_confidence \
+#   --individual_layers

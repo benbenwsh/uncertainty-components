@@ -15,17 +15,28 @@ source /vol/cuda/13.0.0/setup.sh
 /usr/bin/nvidia-smi
 uptime
 
+# Example sweep by layer:
 # for layer in $(seq 0 31); do
-#   python3 ./layerwise_mean_ablation/run_mean_ablation.py --input_h5 ./semantic_uncertainty/processed_generations_h5/3_train_200_samples_temp_0/train_verbalised_embeddings.h5 --num_samples 200 --device cuda:0 --ablate_layers "${layer}" --no-mean_from_low_confidence
+#   python3 ./headwise_mass_mean_probe/run_headwise_mass_mean_probe.py \
+#     --input_h5 ./process_generations/processed_generations_more_h5/2_200_concat/train_verbalised_embeddings.h5 \
+#     --no-enable_brief \
+#     --num_samples 200 \
+#     --device cuda:0 \
+#     --ablate_layers "${layer}" \
+#     --ablate_heads all \
+#     --ablation_mode none probability_tokens_mean_replace guess_tokens_mean_replace guess_then_guess_probability_mean_replace \
+#     --alpha -3 -2 3.0 \
+#     --ablation_targets low high
 # done
-# python3 ./layerwise_mean_ablation/run_mean_ablation.py --input_h5 ./semantic_uncertainty/processed_generations_h5/3_train_200_samples_temp_0/train_verbalised_embeddings.h5 --num_samples 200 --device cuda:0 --ablate_layers 0-6 --no-mean_from_low_confidence
 
-python3 ./layerwise_mean_ablation/run_mean_ablation.py \
+python3 ./headwise_mass_mean_probe/run_headwise_mass_mean_probe.py \
   --input_h5 ./process_generations/processed_generations_more_h5/2_200_concat/train_verbalised_embeddings.h5 \
   --no-enable_brief \
   --num_samples 200 \
   --device cuda:0 \
   --ablate_layers 10-16 \
-  --new_h5_format \
-  --ablation_mode none semantic_answer_mean_replace \
-  --no-mean_from_low_confidence
+  --ablate_heads all \
+  --ablation_mode none probability_tokens_mean_replace \
+  --whole_concat_mode \
+  --alpha -1 0.0 0.5 1.0 2.0 \
+  --ablation_targets low high

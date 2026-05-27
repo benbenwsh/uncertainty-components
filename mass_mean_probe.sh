@@ -21,13 +21,14 @@ uptime
 # python3 ./layerwise_mean_ablation/run_mean_ablation.py --input_h5 ./semantic_uncertainty/processed_generations_h5/3_train_200_samples_temp_0/train_verbalised_embeddings.h5 --num_samples 200 --device cuda:0 --ablate_layers 0-6 --no-mean_from_low_confidence
 
 python3 ./mass_mean_probe/run_mass_mean_probe.py \
-  --input_h5 ./process_generations/processed_generations_more_h5/1_200_with_prob_val/train_verbalised_embeddings.h5 \
+  --input_h5 ./process_generations/processed_generations_more_h5/2_200_concat/train_verbalised_embeddings.h5 \
   --num_samples 200 \
   --device cuda:0 \
   --ablate_layers 10-16 \
-  --alpha -1 0.0 0.25 0.5 0.75 1.0 2.0 \
+  --alpha -1 0.0 0.5 1.0 2.0 \
   --ablation_targets low high \
   --low_conf_threshold 0.1 \
   --high_conf_threshold 0.9 \
   --new_h5_format \
   --no-enable_brief \
+  --ablation_mode none semantic_answer_mean_replace \

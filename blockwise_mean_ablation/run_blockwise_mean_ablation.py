@@ -491,6 +491,12 @@ def _positions_and_replacements_for_mode(
         vectors = [probability[-1]] + [probability_value_mean] * (len(positions) - 1)
         return positions, vectors
 
+    if mode == "current_generated_token_mean_replace":
+        current_abs_pos = prompt_len + len(decoded_tokens) - 1
+        if current_abs_pos < 0:
+            return [], []
+        return [current_abs_pos], [probability[-1]]
+
     raise ValueError(f"Unsupported mode for mean replacement: {mode!r}")
 
 
@@ -600,6 +606,7 @@ def main() -> None:
             "all_pre_guess_tokens_mean_replace",
             "guess_then_guess_probability_mean_replace",
             "probability_value_mean_replace",
+            "current_generated_token_mean_replace",
         ],
         choices=[
             "none",
@@ -611,6 +618,7 @@ def main() -> None:
             "all_pre_guess_tokens_mean_replace",
             "guess_then_guess_probability_mean_replace",
             "probability_value_mean_replace",
+            "current_generated_token_mean_replace",
         ],
         help=(
             "One or more ablation modes. probability_last_token_mean_replace: mean-replace only the "
@@ -619,7 +627,9 @@ def main() -> None:
             "except that last token (all marker-span tokens before end_prob). "
             "probability_value_mean_replace: no hooks until Guess/Probability parse succeeds; then "
             "mean-replace from first probability-value token through current last token, using "
-            "probability[-1] for the first position and embeddings_mean_prob_val mean for later positions."
+            "probability[-1] for the first position and embeddings_mean_prob_val mean for later positions. "
+            "current_generated_token_mean_replace: at each decode step, mean-replace only the current "
+            "last sequence token using probability[-1]."
         ),
     )
     parser.add_argument("--ablate_subblocks", type=str, nargs="+", required=True, choices=["attn", "mlp"])

@@ -29,7 +29,7 @@ from transformers import AutoTokenizer
 from transformer_lens import HookedTransformer
 
 NATURAL_LANGUAGE_PROMPT = (
-    "Answer the following question, and express your confidence in your answer.\n"
+    "Answer the following question.\n"
     "Question: "
 )
 
@@ -382,10 +382,8 @@ def _positions_for_mode(mode: str, *, prompt_len: int, seq_len: int) -> List[int
     if mode == "all_tokens_mean_replace":
         return list(range(seq_len))
     if mode == "all_prompt_tokens_mean_replace":
-        logging.info(f"all_prompt_tokens_mean_replace: {list(range(prompt_len))}, seq_len: {seq_len}, prompt_len: {prompt_len}")
         return list(range(prompt_len-1))
     if mode == "all_prompt_and_first_generated_mean_replace":
-        logging.info(f"all_prompt_and_first_generated_mean_replace: {list(range(prompt_len))}, seq_len: {seq_len}, prompt_len: {prompt_len}")
         return list(range(prompt_len))
     if mode == "first_generated_token_mean_replace":
         return [prompt_len-1]

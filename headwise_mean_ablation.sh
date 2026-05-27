@@ -16,16 +16,15 @@ source /vol/cuda/13.0.0/setup.sh
 uptime
 
 # for layer in $(seq 0 31); do
-#   python3 ./layerwise_mean_ablation/run_mean_ablation.py --input_h5 ./semantic_uncertainty/processed_generations_h5/3_train_200_samples_temp_0/train_verbalised_embeddings.h5 --num_samples 200 --device cuda:0 --ablate_layers "${layer}" --no-mean_from_low_confidence
+#   python3 ./headwise_mean_ablation/run_headwise_mean_ablation.py --input_h5 ./process_generations/processed_generations_more_h5/2_200_concat/train_verbalised_embeddings.h5 --num_samples 200 --device cuda:0 --ablate_layers "${layer}" --no-mean_from_low_confidence
 # done
-# python3 ./layerwise_mean_ablation/run_mean_ablation.py --input_h5 ./semantic_uncertainty/processed_generations_h5/3_train_200_samples_temp_0/train_verbalised_embeddings.h5 --num_samples 200 --device cuda:0 --ablate_layers 0-6 --no-mean_from_low_confidence
 
-python3 ./layerwise_mean_ablation/run_mean_ablation.py \
+python3 ./headwise_mean_ablation/run_headwise_mean_ablation.py \
   --input_h5 ./process_generations/processed_generations_more_h5/2_200_concat/train_verbalised_embeddings.h5 \
   --no-enable_brief \
   --num_samples 200 \
   --device cuda:0 \
   --ablate_layers 10-16 \
-  --new_h5_format \
-  --ablation_mode none semantic_answer_mean_replace \
+  --ablate_heads all \
+  --ablation_unit_mode grouped_head \
   --no-mean_from_low_confidence

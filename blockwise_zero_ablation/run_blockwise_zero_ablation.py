@@ -268,6 +268,7 @@ def mode_to_output_key(mode: str) -> str:
         "guess_then_guess_probability_mean_replace",
         "probability_value_zero_ablate",
         "probability_value_mean_replace",
+        "current_generated_token_mean_replace",
     }:
         return mode
     raise ValueError(f"Unknown ablation mode: {mode!r}")

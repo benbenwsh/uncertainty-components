@@ -83,6 +83,10 @@ def _embeddings_h5_key(embedding_type: str) -> str:
         return "embeddings_guess"
     if embedding_type == "probability":
         return "embeddings_probability"
+    if embedding_type == "mean_prompt":
+        return "embeddings_mean_prompt"
+    if embedding_type == "mean_sem_answer":
+        return "embeddings_mean_sem_answer"
     raise ValueError(f"Unknown embedding_type: {embedding_type}")
 
 
@@ -94,7 +98,7 @@ def _embedding_token_list_group(
     strict: bool = False,
     example_id: str = "",
     path: str = "",
-) -> h5py.Group | None:
+) -> h5py.Group | h5py.Dataset | None:
     field_name = _embeddings_h5_key(embedding_type)
     emb_field = r0.get(field_name)
     if emb_field is None or not isinstance(emb_field, h5py.Group):
@@ -104,10 +108,11 @@ def _embedding_token_list_group(
     if not new_h5_format:
         return emb_field
     res_grp = emb_field.get("res")
-    if res_grp is None or not isinstance(res_grp, h5py.Group):
+    if res_grp is None or not isinstance(res_grp, (h5py.Group, h5py.Dataset)):
         if strict:
             raise ValueError(
-                f"{path}: example {example_id} responses/0/{field_name} must contain group 'res' when --new_h5_format is set."
+                f"{path}: example {example_id} responses/0/{field_name} must contain 'res' "
+                "group or dataset when --new_h5_format is set."
             )
         return None
     return res_grp
@@ -121,9 +126,14 @@ def _unwrap_res_list(emb_field, *, new_h5_format: bool, ex_id: str, field_name: 
             f"Example {ex_id} responses/0/{field_name} must be a dict containing 'res' when --new_h5_format is set."
         )
     emb_list = emb_field["res"]
-    if not isinstance(emb_list, list):
-        raise ValueError(f"Example {ex_id} responses/0/{field_name}/res must be a list.")
-    return emb_list
+    if isinstance(emb_list, list):
+        return emb_list
+    if isinstance(emb_list, np.ndarray):
+        # New HDF5 mean fields can store `res` as a single embedding tensor.
+        return [emb_list]
+    raise ValueError(
+        f"Example {ex_id} responses/0/{field_name}/res must be a list or ndarray when --new_h5_format is set."
+    )
 
 
 def _h5_response0_group(example_group: h5py.Group) -> h5py.Group | None:
@@ -155,13 +165,20 @@ def _read_token_embedding_dataset(
     emb_grp = _embedding_token_list_group(r0, embedding_type, new_h5_format=new_h5_format)
     if emb_grp is None:
         return None
-    ds = emb_grp.get(str(token_pos))
+    if isinstance(emb_grp, h5py.Dataset):
+        if token_pos != 0:
+            return None
+        ds = emb_grp
+    else:
+        ds = emb_grp.get(str(token_pos))
     if ds is None or not isinstance(ds, h5py.Dataset):
         return None
     return ds
 
 
-def _embedding_list_len(emb_grp: h5py.Group) -> int:
+def _embedding_list_len(emb_grp: h5py.Group | h5py.Dataset) -> int:
+    if isinstance(emb_grp, h5py.Dataset):
+        return 1
     return int(emb_grp.attrs.get("__len__", len(emb_grp.keys())))
 
 
@@ -294,6 +311,8 @@ def _validate_h5_embedding_lengths(
             for embedding_type, expected_tokens in (
                 ("guess", expected_guess_tokens),
                 ("probability", expected_probability_tokens),
+                ("mean_prompt", 1),
+                ("mean_sem_answer", 1),
             ):
                 emb_grp = _embedding_token_list_group(
                     r0,
@@ -317,6 +336,8 @@ def scan_common_token_positions(*, expected_guess_tokens: int, expected_probabil
     return {
         "guess": list(range(expected_guess_tokens)),
         "probability": list(range(expected_probability_tokens)),
+        "mean_prompt": [0],
+        "mean_sem_answer": [0],
     }
 
 
@@ -416,8 +437,11 @@ def _get_run_base_dir(output_dir: Path) -> Path:
 
 
 def _parse_token_dir_name(token_name: str):
-    """Parse token directory name like tok_3_guess or tok_2_probability."""
-    match = re.fullmatch(r"tok_(\d+)_(guess|probability|prob)", token_name)
+    """Parse token directory name like tok_3_guess or tok_0_mean_prompt."""
+    match = re.fullmatch(
+        r"tok_(\d+)_(guess|probability|prob|mean_prompt|mean_sem_answer)",
+        token_name,
+    )
     if match is None:
         return None, None
     token_pos = int(match.group(1))
@@ -427,9 +451,15 @@ def _parse_token_dir_name(token_name: str):
 
 def _token_sort_key(token_name: str):
     token_pos, embedding_type = _parse_token_dir_name(token_name)
-    type_order = 0 if embedding_type == "guess" else 1
+    type_order_map = {
+        "guess": 0,
+        "probability": 1,
+        "mean_prompt": 2,
+        "mean_sem_answer": 3,
+    }
+    type_order = type_order_map.get(embedding_type, 4)
     if token_pos is None:
-        return (2, float("inf"), token_name)
+        return (5, float("inf"), token_name)
     return (type_order, token_pos, token_name)
 
 
@@ -459,11 +489,22 @@ def _marker_for_token_pos(token_pos: int) -> str:
     return marker_cycle[token_pos % len(marker_cycle)]
 
 
-def _plot_group_lines(ax, token_items, metric_idx: int, cmap_name: str, split_mode: str = "both"):
+def _plot_group_lines(
+    ax,
+    token_items,
+    metric_idx: int,
+    cmap_name: str,
+    split_mode: str = "both",
+    fixed_color: str | None = None,
+    label_name: str | None = None,
+):
     if len(token_items) == 0:
         return
-    color_map = plt.get_cmap(cmap_name)
-    colors = color_map(np.linspace(0.45, 0.85, len(token_items)))
+    if fixed_color is None:
+        color_map = plt.get_cmap(cmap_name)
+        colors = color_map(np.linspace(0.45, 0.85, len(token_items)))
+    else:
+        colors = [fixed_color] * len(token_items)
     for order_idx, (token_name, metrics_dict, token_pos) in enumerate(token_items):
         style = _style_for_token_order(order_idx, len(token_items))
         layer_numbers = metrics_dict["layers"]
@@ -471,12 +512,13 @@ def _plot_group_lines(ax, token_items, metric_idx: int, cmap_name: str, split_mo
         test_vals = metrics_dict["test"][metric_idx]
         color = colors[order_idx]
         marker = _marker_for_token_pos(token_pos)
+        series_label = label_name if label_name is not None else token_name
 
         if split_mode in ("both", "train"):
             ax.plot(
                 layer_numbers,
                 train_vals,
-                label=f"{token_name} (Train)",
+                label=f"{series_label} (Train)",
                 marker=marker,
                 markersize=4,
                 color=color,
@@ -488,7 +530,7 @@ def _plot_group_lines(ax, token_items, metric_idx: int, cmap_name: str, split_mo
             ax.plot(
                 layer_numbers,
                 test_vals,
-                label=f"{token_name} (Test)",
+                label=f"{series_label} (Test)",
                 marker=marker,
                 markersize=4,
                 color=color,
@@ -604,7 +646,7 @@ def _plot_all_metrics_by_layer(output_dir: Path, layer_numbers, train_metrics_li
 
 def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: bool = False):
     """
-    Create cross-token graphs for guess/probability/combined families.
+    Create cross-token graphs for guess/probability/prompt/sem-answer/combined families.
     For each family and each metric, save:
     - both splits in one chart
     - train-only chart
@@ -622,6 +664,8 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: boo
 
     guess_token_items = _sorted_token_items(all_token_metrics, "guess")
     prob_token_items = _sorted_token_items(all_token_metrics, "probability")
+    prompt_token_items = _sorted_token_items(all_token_metrics, "mean_prompt")
+    sem_answer_token_items = _sorted_token_items(all_token_metrics, "mean_sem_answer")
 
     if len(guess_token_items) > 0:
         for metric_name, metric_label, metric_idx in metrics_config:
@@ -681,14 +725,83 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: boo
                 plt.close(fig)
                 logging.info("Saved %s", out_path)
 
-    if len(guess_token_items) > 0 or len(prob_token_items) > 0:
+    if len(prompt_token_items) > 0:
+        for metric_name, metric_label, metric_idx in metrics_config:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            _plot_group_lines(
+                ax,
+                prompt_token_items,
+                metric_idx,
+                cmap_name="Greens",
+                split_mode="both",
+                fixed_color="green",
+                label_name="prompt",
+            )
+            ax.set_xlabel("Layer number")
+            ax.set_ylabel(metric_label)
+            ax.set_title(f"{metric_label} by layer - Mean prompt token")
+            ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            out_path = run_base / f"{metric_name}_all_tokens_prompt.png"
+            fig.savefig(out_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            logging.info("Saved %s", out_path)
+
+    if len(sem_answer_token_items) > 0:
+        for metric_name, metric_label, metric_idx in metrics_config:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            _plot_group_lines(
+                ax,
+                sem_answer_token_items,
+                metric_idx,
+                cmap_name="Purples",
+                split_mode="both",
+                fixed_color="purple",
+                label_name="sem_answer",
+            )
+            ax.set_xlabel("Layer number")
+            ax.set_ylabel(metric_label)
+            ax.set_title(f"{metric_label} by layer - Mean semantic answer token")
+            ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            out_path = run_base / f"{metric_name}_all_tokens_sem_answer.png"
+            fig.savefig(out_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            logging.info("Saved %s", out_path)
+
+    if (
+        len(guess_token_items) > 0
+        or len(prob_token_items) > 0
+        or len(prompt_token_items) > 0
+        or len(sem_answer_token_items) > 0
+    ):
         for metric_name, metric_label, metric_idx in metrics_config:
             fig, ax = plt.subplots(figsize=(11, 6))
             _plot_group_lines(ax, guess_token_items, metric_idx, cmap_name="Blues", split_mode="both")
             _plot_group_lines(ax, prob_token_items, metric_idx, cmap_name="Oranges", split_mode="both")
+            _plot_group_lines(
+                ax,
+                prompt_token_items,
+                metric_idx,
+                cmap_name="Greens",
+                split_mode="both",
+                fixed_color="green",
+                label_name="prompt",
+            )
+            _plot_group_lines(
+                ax,
+                sem_answer_token_items,
+                metric_idx,
+                cmap_name="Purples",
+                split_mode="both",
+                fixed_color="purple",
+                label_name="sem_answer",
+            )
             ax.set_xlabel("Layer number")
             ax.set_ylabel(metric_label)
-            ax.set_title(f"{metric_label} by layer - Combined guess + probability tokens")
+            ax.set_title(f"{metric_label} by layer - Combined guess + probability + prompt + sem_answer tokens")
             ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
             ax.grid(True, alpha=0.3)
             fig.tight_layout()
@@ -701,9 +814,30 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: boo
                 fig, ax = plt.subplots(figsize=(11, 6))
                 _plot_group_lines(ax, guess_token_items, metric_idx, cmap_name="Blues", split_mode=split_mode)
                 _plot_group_lines(ax, prob_token_items, metric_idx, cmap_name="Oranges", split_mode=split_mode)
+                _plot_group_lines(
+                    ax,
+                    prompt_token_items,
+                    metric_idx,
+                    cmap_name="Greens",
+                    split_mode=split_mode,
+                    fixed_color="green",
+                    label_name="prompt",
+                )
+                _plot_group_lines(
+                    ax,
+                    sem_answer_token_items,
+                    metric_idx,
+                    cmap_name="Purples",
+                    split_mode=split_mode,
+                    fixed_color="purple",
+                    label_name="sem_answer",
+                )
                 ax.set_xlabel("Layer number")
                 ax.set_ylabel(metric_label)
-                ax.set_title(f"{metric_label} by layer - Combined guess + probability tokens ({split_label} only)")
+                ax.set_title(
+                    f"{metric_label} by layer - Combined guess + probability + prompt + sem_answer tokens "
+                    f"({split_label} only)"
+                )
                 ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
                 ax.grid(True, alpha=0.3)
                 fig.tight_layout()
@@ -855,13 +989,13 @@ def main():
         expected_probability_tokens=args.expected_probability_tokens,
     )
 
-    if not common_by_kind.get("guess") and not common_by_kind.get("probability"):
+    if not any(common_by_kind.get(k) for k in ("guess", "probability", "mean_prompt", "mean_sem_answer")):
         logging.error("No valid data (no common token positions). Exiting.")
         return
 
     all_token_metrics = {}
 
-    for embedding_type in ["guess", "probability"]:
+    for embedding_type in ["guess", "probability", "mean_prompt", "mean_sem_answer"]:
         token_positions = common_by_kind.get(embedding_type) or []
         if not token_positions:
             logging.info("No data for %s embeddings, skipping...", embedding_type)

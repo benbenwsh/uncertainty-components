@@ -10,11 +10,13 @@ Output:
   HDF5 + JSON with one processed response per example containing:
     - response (original model completion string)
     - verbalised_confidence
-    - embeddings_mean_prompt
+    - embeddings_mean_prompt (default mode)
     - embeddings_guess
-    - embeddings_mean_sem_answer
+    - embeddings_mean_sem_answer (default mode)
     - embeddings_probability
     - embeddings_mean_prob_val
+    - embeddings_prompt_k_tokens (tokenwise K mode)
+    - embeddings_sem_answer_k_tokens (tokenwise K mode)
 """
 
 import argparse
@@ -39,6 +41,8 @@ _EMBEDDING_KEYS = frozenset(
         "embeddings_mean_sem_answer",
         "embeddings_probability",
         "embeddings_mean_prob_val",
+        "embeddings_prompt_k_tokens",
+        "embeddings_sem_answer_k_tokens",
     }
 )
 
@@ -164,6 +168,8 @@ def _compute_embeddings_from_source(
     expected_probability_tokens: int,
     example_id,
     source_label: str,
+    extend_probability_span: bool = False,
+    attention_score_tokenwise_k_mode: bool = False,
 ) -> dict:
     if source_embeddings is None:
         raise ValueError(f"{source_label}: missing source embeddings")
@@ -185,6 +191,9 @@ def _compute_embeddings_from_source(
         raise ValueError(f"{source_label}: prompt has zero tokens")
     prompt_only_embeddings = prompt_plus_first_gen[:, :, :-1, :]
     embeddings_mean_prompt = np.mean(prompt_only_embeddings, axis=2, keepdims=True)
+    embeddings_prompt_k_tokens = [
+        prompt_only_embeddings[:, :, i : i + 1, :] for i in range(prompt_only_embeddings.shape[2])
+    ]
 
     # Guess token embeddings:
     # - start from the last sequence position of source_embeddings[0] (index shape[2]-1
@@ -228,12 +237,35 @@ def _compute_embeddings_from_source(
             f"{source_label}: empty semantic-answer token window ({last_guess_token_index},{first_prob_token_index})"
         )
     embeddings_mean_sem_answer = _mean_across_tokens(sem_answer_token_embeddings)
+    embeddings_sem_answer_k_tokens = []
+    for token_idx in range(sem_answer_slice_start, sem_answer_slice_end):
+        emb = _tensor_to_numpy(source_embeddings[token_idx])
+        if emb.ndim != 4:
+            raise ValueError(
+                f"{source_label}: source_embeddings[{token_idx}] has wrong rank: {emb.shape}"
+            )
+        if token_idx == 0:
+            if emb.shape[2] <= 1:
+                raise ValueError(
+                    f"{source_label}: source_embeddings[0] has seq_len <= 1: {emb.shape}"
+                )
+            embeddings_sem_answer_k_tokens.append(_last_token_position(emb))
+            continue
+        if emb.shape[2] != 1:
+            raise ValueError(
+                f"{source_label}: source_embeddings[{token_idx}] expected seq_len=1, got shape {emb.shape}"
+            )
+        embeddings_sem_answer_k_tokens.append(emb)
 
-    # Probability span as in prior script.
-    embeddings_probability = source_embeddings[first_prob_token_index:end_prob_token_index+1]
-    if len(embeddings_probability) != expected_probability_tokens:
+    # Probability span as in prior script, with optional fixed +2 extension.
+    prob_span_end_index = end_prob_token_index + (2 if extend_probability_span else 0)
+    effective_expected_probability_tokens = (
+        expected_probability_tokens + 2 if extend_probability_span else expected_probability_tokens
+    )
+    embeddings_probability = source_embeddings[first_prob_token_index:prob_span_end_index+1]
+    if len(embeddings_probability) != effective_expected_probability_tokens:
         raise ValueError(
-            f"{source_label}: got {len(embeddings_probability)} probability embeddings, expected {expected_probability_tokens}"
+            f"{source_label}: got {len(embeddings_probability)} probability embeddings, expected {effective_expected_probability_tokens}"
         )
     embeddings_probability = [_tensor_to_numpy(e) for e in embeddings_probability]
     if (
@@ -249,6 +281,21 @@ def _compute_embeddings_from_source(
     if len(prob_value_token_embeddings) == 0:
         raise ValueError(f"{source_label}: empty probability-value token window")
     embeddings_mean_prob_val = _mean_across_tokens(prob_value_token_embeddings)
+
+    if attention_score_tokenwise_k_mode:
+        if source_label != "k":
+            raise ValueError(
+                f"{source_label}: tokenwise K prompt/sem-answer mode is only valid for source_label='k'"
+            )
+        return {
+            "embeddings_prompt_k_tokens": [_tensor_to_numpy(e) for e in embeddings_prompt_k_tokens],
+            "embeddings_guess": [_tensor_to_numpy(e) for e in embeddings_guess],
+            "embeddings_sem_answer_k_tokens": [
+                _tensor_to_numpy(e) for e in embeddings_sem_answer_k_tokens
+            ],
+            "embeddings_probability": embeddings_probability,
+            "embeddings_mean_prob_val": _tensor_to_numpy(embeddings_mean_prob_val),
+        }
 
     return {
         "embeddings_mean_prompt": _tensor_to_numpy(embeddings_mean_prompt),
@@ -383,7 +430,7 @@ def _first_and_last_layer_values_for_list_of_arrays(arr_list, n: int = 5):
 def convert_for_json(obj, parent_key=None, in_embedding_field=False):
     if parent_key in _EMBEDDING_KEYS:
         in_embedding_field = True
-    elif in_embedding_field and parent_key in {"res", "attn", "mlp"}:
+    elif in_embedding_field and parent_key in {"res", "attn", "mlp", "q", "k", "v", "o", "concat"}:
         in_embedding_field = True
 
     if isinstance(obj, np.ndarray):
@@ -419,6 +466,10 @@ def process_example(
     expected_probability_tokens: int,
     collect_attn_block_embeddings: bool,
     collect_mlp_block_embeddings: bool,
+    collect_qkvo_embeddings: bool,
+    collect_concat_embeddings: bool,
+    attention_score_tokenwise_k_mode: bool,
+    extend_probability_span: bool,
 ) -> dict | None:
     most_likely = example.get("most_likely_answer")
     question = example.get("question")
@@ -431,6 +482,11 @@ def process_example(
     all_embeddings = most_likely.get("all_embeddings")
     all_attn_embeddings = most_likely.get("all_attn_embeddings")
     all_mlp_embeddings = most_likely.get("all_mlp_embeddings")
+    all_q_embeddings = most_likely.get("all_q_embeddings")
+    all_k_embeddings = most_likely.get("all_k_embeddings")
+    all_v_embeddings = most_likely.get("all_v_embeddings")
+    all_o_embeddings = most_likely.get("all_o_embeddings")
+    all_concat_embeddings = most_likely.get("all_concat_embeddings")
 
     if response_str is None or decoded_tokens is None or all_embeddings is None:
         logging.warning(
@@ -476,6 +532,15 @@ def process_example(
             response_str,
         )
         return None
+    if extend_probability_span and end_prob_token_index + 2 >= len(decoded_tokens):
+        logging.warning(
+            "Skipping example %s: need 2 extra probability tokens after index %d, but decoded_tokens has len=%d. response=%r",
+            example_id,
+            end_prob_token_index,
+            len(decoded_tokens),
+            response_str,
+        )
+        return None
 
     try:
         res_processed = _compute_embeddings_from_source(
@@ -490,6 +555,7 @@ def process_example(
             expected_probability_tokens=expected_probability_tokens,
             example_id=example_id,
             source_label="res",
+            extend_probability_span=extend_probability_span,
         )
     except ValueError as exc:
         logging.warning("Skipping example %s: %s", example_id, exc)
@@ -516,6 +582,7 @@ def process_example(
                     expected_probability_tokens=expected_probability_tokens,
                     example_id=example_id,
                     source_label="attn",
+                    extend_probability_span=extend_probability_span,
                 )
             except ValueError as exc:
                 logging.error(
@@ -545,6 +612,7 @@ def process_example(
                     expected_probability_tokens=expected_probability_tokens,
                     example_id=example_id,
                     source_label="mlp",
+                    extend_probability_span=extend_probability_span,
                 )
             except ValueError as exc:
                 logging.error(
@@ -553,46 +621,190 @@ def process_example(
                     exc,
                 )
 
-    processed_response = {
-        "response": response_str,
-        "verbalised_confidence": float(prob),
-        "embeddings_mean_prompt": {"res": res_processed["embeddings_mean_prompt"]},
-        "embeddings_guess": {"res": res_processed["embeddings_guess"]},
-        "embeddings_mean_sem_answer": {"res": res_processed["embeddings_mean_sem_answer"]},
-        "embeddings_probability": {"res": res_processed["embeddings_probability"]},
-        "embeddings_mean_prob_val": {"res": res_processed["embeddings_mean_prob_val"]},
+    optional_sources = {
+        "q": {
+            "enabled": collect_qkvo_embeddings,
+            "source_embeddings": all_q_embeddings,
+            "missing_log": (
+                "Example %s missing all_q_embeddings while --collect_qkvo_embeddings is enabled; "
+                "setting q outputs to null."
+            ),
+            "invalid_log": "Example %s has invalid all_q_embeddings: %s. Setting q outputs to null.",
+            "processed": None,
+        },
+        "k": {
+            "enabled": collect_qkvo_embeddings,
+            "source_embeddings": all_k_embeddings,
+            "missing_log": (
+                "Example %s missing all_k_embeddings while --collect_qkvo_embeddings is enabled; "
+                "setting k outputs to null."
+            ),
+            "invalid_log": "Example %s has invalid all_k_embeddings: %s. Setting k outputs to null.",
+            "processed": None,
+        },
+        "v": {
+            "enabled": collect_qkvo_embeddings,
+            "source_embeddings": all_v_embeddings,
+            "missing_log": (
+                "Example %s missing all_v_embeddings while --collect_qkvo_embeddings is enabled; "
+                "setting v outputs to null."
+            ),
+            "invalid_log": "Example %s has invalid all_v_embeddings: %s. Setting v outputs to null.",
+            "processed": None,
+        },
+        "o": {
+            "enabled": collect_qkvo_embeddings,
+            "source_embeddings": all_o_embeddings,
+            "missing_log": (
+                "Example %s missing all_o_embeddings while --collect_qkvo_embeddings is enabled; "
+                "setting o outputs to null."
+            ),
+            "invalid_log": "Example %s has invalid all_o_embeddings: %s. Setting o outputs to null.",
+            "processed": None,
+        },
+        "concat": {
+            "enabled": collect_concat_embeddings,
+            "source_embeddings": all_concat_embeddings,
+            "missing_log": (
+                "Example %s missing all_concat_embeddings while --collect_concat_embeddings is enabled; "
+                "setting concat outputs to null."
+            ),
+            "invalid_log": (
+                "Example %s has invalid all_concat_embeddings: %s. Setting concat outputs to null."
+            ),
+            "processed": None,
+        },
     }
-    if collect_attn_block_embeddings:
-        processed_response["embeddings_mean_prompt"]["attn"] = (
-            None if attn_processed is None else attn_processed["embeddings_mean_prompt"]
+
+    k_tokenwise_processed = None
+    if attention_score_tokenwise_k_mode:
+        if all_k_embeddings is None:
+            logging.error(
+                "Example %s missing all_k_embeddings while --attention_score_tokenwise_k_mode is enabled; skipping example.",
+                example_id,
+            )
+            return None
+        try:
+            k_tokenwise_processed = _compute_embeddings_from_source(
+                source_embeddings=all_k_embeddings,
+                decoded_tokens=decoded_tokens,
+                last_guess_token_index=last_guess_token_index,
+                first_prob_token_index=first_prob_token_index,
+                end_prob_token_index=end_prob_token_index,
+                prob_value_start_token_index=prob_value_start_token_index,
+                prob_value_end_token_index=prob_value_end_token_index,
+                expected_guess_tokens=expected_guess_tokens,
+                expected_probability_tokens=expected_probability_tokens,
+                example_id=example_id,
+                source_label="k",
+                extend_probability_span=extend_probability_span,
+                attention_score_tokenwise_k_mode=True,
+            )
+        except ValueError as exc:
+            logging.error(
+                "Example %s has invalid all_k_embeddings for --attention_score_tokenwise_k_mode: %s. Skipping example.",
+                example_id,
+                exc,
+            )
+            return None
+    for source_label, config in optional_sources.items():
+        if not config["enabled"]:
+            continue
+        if config["source_embeddings"] is None:
+            logging.error(config["missing_log"], example_id)
+            continue
+        try:
+            config["processed"] = _compute_embeddings_from_source(
+                source_embeddings=config["source_embeddings"],
+                decoded_tokens=decoded_tokens,
+                last_guess_token_index=last_guess_token_index,
+                first_prob_token_index=first_prob_token_index,
+                end_prob_token_index=end_prob_token_index,
+                prob_value_start_token_index=prob_value_start_token_index,
+                prob_value_end_token_index=prob_value_end_token_index,
+                expected_guess_tokens=expected_guess_tokens,
+                expected_probability_tokens=expected_probability_tokens,
+                example_id=example_id,
+                source_label=source_label,
+                extend_probability_span=extend_probability_span,
+            )
+        except ValueError as exc:
+            logging.error(config["invalid_log"], example_id, exc)
+
+    if attention_score_tokenwise_k_mode:
+        processed_response = {
+            "response": response_str,
+            "decoded_tokens": decoded_tokens,
+            "verbalised_confidence": float(prob),
+            "embeddings_prompt_k_tokens": {"k": k_tokenwise_processed["embeddings_prompt_k_tokens"]},
+            "embeddings_guess": {"res": res_processed["embeddings_guess"]},
+            "embeddings_sem_answer_k_tokens": {
+                "k": k_tokenwise_processed["embeddings_sem_answer_k_tokens"]
+            },
+            "embeddings_probability": {"res": res_processed["embeddings_probability"]},
+            "embeddings_mean_prob_val": {"res": res_processed["embeddings_mean_prob_val"]},
+        }
+    else:
+        processed_response = {
+            "response": response_str,
+            "verbalised_confidence": float(prob),
+            "embeddings_mean_prompt": {"res": res_processed["embeddings_mean_prompt"]},
+            "embeddings_guess": {"res": res_processed["embeddings_guess"]},
+            "embeddings_mean_sem_answer": {"res": res_processed["embeddings_mean_sem_answer"]},
+            "embeddings_probability": {"res": res_processed["embeddings_probability"]},
+            "embeddings_mean_prob_val": {"res": res_processed["embeddings_mean_prob_val"]},
+        }
+        if collect_attn_block_embeddings:
+            processed_response["embeddings_mean_prompt"]["attn"] = (
+                None if attn_processed is None else attn_processed["embeddings_mean_prompt"]
+            )
+            processed_response["embeddings_guess"]["attn"] = (
+                None if attn_processed is None else attn_processed["embeddings_guess"]
+            )
+            processed_response["embeddings_mean_sem_answer"]["attn"] = (
+                None if attn_processed is None else attn_processed["embeddings_mean_sem_answer"]
+            )
+            processed_response["embeddings_probability"]["attn"] = (
+                None if attn_processed is None else attn_processed["embeddings_probability"]
+            )
+            processed_response["embeddings_mean_prob_val"]["attn"] = (
+                None if attn_processed is None else attn_processed["embeddings_mean_prob_val"]
+            )
+        if collect_mlp_block_embeddings:
+            processed_response["embeddings_mean_prompt"]["mlp"] = (
+                None if mlp_processed is None else mlp_processed["embeddings_mean_prompt"]
+            )
+            processed_response["embeddings_guess"]["mlp"] = (
+                None if mlp_processed is None else mlp_processed["embeddings_guess"]
+            )
+            processed_response["embeddings_mean_sem_answer"]["mlp"] = (
+                None if mlp_processed is None else mlp_processed["embeddings_mean_sem_answer"]
+            )
+            processed_response["embeddings_probability"]["mlp"] = (
+                None if mlp_processed is None else mlp_processed["embeddings_probability"]
+            )
+            processed_response["embeddings_mean_prob_val"]["mlp"] = (
+                None if mlp_processed is None else mlp_processed["embeddings_mean_prob_val"]
+            )
+    for source_label, config in optional_sources.items():
+        if not config["enabled"]:
+            continue
+        source_processed = config["processed"]
+        if not attention_score_tokenwise_k_mode:
+            processed_response["embeddings_mean_prompt"][source_label] = (
+                None if source_processed is None else source_processed["embeddings_mean_prompt"]
+            )
+            processed_response["embeddings_mean_sem_answer"][source_label] = (
+                None if source_processed is None else source_processed["embeddings_mean_sem_answer"]
+            )
+        processed_response["embeddings_guess"][source_label] = (
+            None if source_processed is None else source_processed["embeddings_guess"]
         )
-        processed_response["embeddings_guess"]["attn"] = (
-            None if attn_processed is None else attn_processed["embeddings_guess"]
+        processed_response["embeddings_probability"][source_label] = (
+            None if source_processed is None else source_processed["embeddings_probability"]
         )
-        processed_response["embeddings_mean_sem_answer"]["attn"] = (
-            None if attn_processed is None else attn_processed["embeddings_mean_sem_answer"]
-        )
-        processed_response["embeddings_probability"]["attn"] = (
-            None if attn_processed is None else attn_processed["embeddings_probability"]
-        )
-        processed_response["embeddings_mean_prob_val"]["attn"] = (
-            None if attn_processed is None else attn_processed["embeddings_mean_prob_val"]
-        )
-    if collect_mlp_block_embeddings:
-        processed_response["embeddings_mean_prompt"]["mlp"] = (
-            None if mlp_processed is None else mlp_processed["embeddings_mean_prompt"]
-        )
-        processed_response["embeddings_guess"]["mlp"] = (
-            None if mlp_processed is None else mlp_processed["embeddings_guess"]
-        )
-        processed_response["embeddings_mean_sem_answer"]["mlp"] = (
-            None if mlp_processed is None else mlp_processed["embeddings_mean_sem_answer"]
-        )
-        processed_response["embeddings_probability"]["mlp"] = (
-            None if mlp_processed is None else mlp_processed["embeddings_probability"]
-        )
-        processed_response["embeddings_mean_prob_val"]["mlp"] = (
-            None if mlp_processed is None else mlp_processed["embeddings_mean_prob_val"]
+        processed_response["embeddings_mean_prob_val"][source_label] = (
+            None if source_processed is None else source_processed["embeddings_mean_prob_val"]
         )
 
     return {
@@ -680,6 +892,36 @@ def main():
         action=argparse.BooleanOptionalAction,
         help="Include mlp subblock outputs under each embedding field as key 'mlp'.",
     )
+    parser.add_argument(
+        "--collect_qkvo_embeddings",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Include q/k/v/o_proj outputs under each embedding field as keys 'q', 'k', 'v', 'o'.",
+    )
+    parser.add_argument(
+        "--collect_concat_embeddings",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Include concat (input to o_proj/W_O) outputs under each embedding field as key 'concat'.",
+    )
+    parser.add_argument(
+        "--attention_score_tokenwise_k_mode",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Store tokenwise K prompt/semantic-answer fields for downstream attention "
+            "score analysis (`embeddings_prompt_k_tokens`, `embeddings_sem_answer_k_tokens`)."
+        ),
+    )
+    parser.add_argument(
+        "--extend_probability_span",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Extend embeddings_probability by 2 tokens past the first probability-value token "
+            "(for example, 7 to 9 with default --expected_probability_tokens)."
+        ),
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -747,6 +989,10 @@ def main():
                 expected_probability_tokens=args.expected_probability_tokens,
                 collect_attn_block_embeddings=args.collect_attn_block_embeddings,
                 collect_mlp_block_embeddings=args.collect_mlp_block_embeddings,
+                collect_qkvo_embeddings=args.collect_qkvo_embeddings,
+                collect_concat_embeddings=args.collect_concat_embeddings,
+                attention_score_tokenwise_k_mode=args.attention_score_tokenwise_k_mode,
+                extend_probability_span=args.extend_probability_span,
             )
             if out is None:
                 n_reject += 1

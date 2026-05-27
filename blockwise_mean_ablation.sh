@@ -23,8 +23,9 @@ uptime
 python3 ./blockwise_mean_ablation/run_blockwise_mean_ablation.py \
   --input_h5 ./process_generations/processed_generations_more_h5/1_200_with_prob_val/train_verbalised_embeddings.h5 \
   --no-enable_brief \
-  --num_samples 1000 \
+  --num_samples 200 \
   --device cuda:0 \
   --ablate_subblocks attn mlp \
-  --ablate_layers 10-16 \
-  --no-mean_from_low_confidence
+  --ablate_layers 0-6 \
+  --no-mean_from_low_confidence \
+  # --ablation_mode none current_generated_token_mean_replace

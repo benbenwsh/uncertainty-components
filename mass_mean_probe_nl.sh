@@ -22,11 +22,10 @@ python3 ./mass_mean_probe_nl/run_mass_mean_probe_nl.py \
   --input_h5 ./process_generations/processed_generations_more_h5/3_200_subblocks_one_more_prob_tok/train_verbalised_embeddings.h5 \
   --num_samples 200 \
   --device cuda:0 \
-  --ablate_layers 18-24 \
+  --ablate_layers 10-16 \
   --alpha -1 0.0 0.5 1.0 2.0 \
   --ablation_targets low high \
   --low_conf_threshold 0.1 \
   --high_conf_threshold 0.9 \
   --no-enable_brief \
   --new_h5_format \
-  --ablation_mode none current_generated_token_mean_replace current_generated_window5_mean_replace
