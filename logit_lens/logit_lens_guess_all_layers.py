@@ -223,7 +223,7 @@ def _write_top_tokens_report(
     lines.append("=" * 80)
     lines.append(f"top_n: {top_n}")
     lines.append(f"token_positions: 0..{NUM_GUESS_TOKENS - 1}")
-    lines.append(f"layers: 1..{n_layers}")
+    lines.append(f"layers: 0..{n_layers - 1}")
     lines.append("")
 
     ref_probs = train_mean_probs[REF_TOKEN_INDEX, n_layers - 1]
@@ -246,7 +246,7 @@ def _write_top_tokens_report(
                     f"{rank + 1}. {_format_token(tokenizer, int(tok_id))} prob={float(prob):.8f}"
                     for rank, (tok_id, prob) in enumerate(zip(top_ids, top_vals))
                 ]
-                lines.append(f"  layer_{layer_idx + 1}:")
+                lines.append(f"  layer_{layer_idx}:")
                 lines.extend([f"    {entry}" for entry in entries])
             lines.append("")
         lines.append("")
@@ -277,7 +277,7 @@ def _plot_token_similarity_by_layer(
     if show_error_bars:
         ax.fill_between(layer_numbers, train_mean - train_std, train_mean + train_std, alpha=0.2)
         ax.fill_between(layer_numbers, val_mean - val_std, val_mean + val_std, alpha=0.2)
-    ax.set_xlabel("Layer number")
+    ax.set_xlabel("Layer index")
     ax.set_ylabel("Cosine similarity")
     ax.set_title(f"Logit-lens cosine by layer (token position {token_pos})")
     ax.legend()
@@ -301,7 +301,7 @@ def _plot_combined_tokens(layer_numbers: list[int], means: np.ndarray, split_nam
             label=f"Token {token_pos}",
             color=colors[token_pos],
         )
-    ax.set_xlabel("Layer number")
+    ax.set_xlabel("Layer index")
     ax.set_ylabel("Cosine similarity")
     ax.set_title(f"Logit-lens cosine across token positions ({split_name})")
     ax.legend()
@@ -442,7 +442,7 @@ def main():
 
     train_cos_mean, train_cos_std = _aggregate_cosine(train_cos)
     val_cos_mean, val_cos_std = _aggregate_cosine(val_cos)
-    layer_numbers = np.arange(1, n_layers + 1, dtype=np.int32)
+    layer_numbers = np.arange(n_layers, dtype=np.int32)
 
     np.savez(
         run_base / "logit_lens_stats.npz",

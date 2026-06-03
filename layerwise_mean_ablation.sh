@@ -25,7 +25,7 @@ python3 ./layerwise_mean_ablation/run_mean_ablation.py \
   --no-enable_brief \
   --num_samples 200 \
   --device cuda:0 \
-  --ablate_layers 10-16 \
+  --ablate_layers 26-31 \
   --new_h5_format \
-  --ablation_mode none semantic_answer_mean_replace \
   --no-mean_from_low_confidence
+  

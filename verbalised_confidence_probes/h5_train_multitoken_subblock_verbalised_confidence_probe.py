@@ -553,7 +553,7 @@ def _plot_token_metrics_by_layer(token_dir: Path, token_pos: int, layer_numbers:
             alpha=0.75,
         )
 
-    ax.set_xlabel("Layer number")
+    ax.set_xlabel("Layer index")
     ax.set_ylabel(metric_label)
     ax.set_title(f"{metric_label} by layer - token {token_pos}")
     ax.legend()
@@ -683,9 +683,9 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics):
             if guess_token_items:
                 fig, ax = plt.subplots(figsize=(12, 6))
                 _plot_group_lines(ax, guess_token_items, metric_idx, split=split)
-                ax.set_xlabel("Layer number")
+                ax.set_xlabel("Layer index")
                 ax.set_ylabel(metric_label)
-                ax.set_title(f"{metric_label} by layer - Guess tokens ({split.capitalize()})")
+                ax.set_title(f"{metric_label} by layer - Guess prefix tokens ({split.capitalize()})")
                 ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
                 ax.grid(True, alpha=0.3)
                 fig.tight_layout()
@@ -697,9 +697,9 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics):
             if prob_token_items:
                 fig, ax = plt.subplots(figsize=(12, 6))
                 _plot_group_lines(ax, prob_token_items, metric_idx, split=split)
-                ax.set_xlabel("Layer number")
+                ax.set_xlabel("Layer index")
                 ax.set_ylabel(metric_label)
-                ax.set_title(f"{metric_label} by layer - Probability tokens ({split.capitalize()})")
+                ax.set_title(f"{metric_label} by layer - Probability prefix tokens ({split.capitalize()})")
                 ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
                 ax.grid(True, alpha=0.3)
                 fig.tight_layout()
@@ -847,7 +847,7 @@ def main():
             layer_numbers = []
 
             for layer_idx in range(n_layers):
-                layer_dir = token_dir / f"layer_{layer_idx + 1}"
+                layer_dir = token_dir / f"layer_{layer_idx}"
                 layer_dir.mkdir(parents=True, exist_ok=True)
                 layer_payloads = {}
                 skip_layer = False
@@ -878,7 +878,7 @@ def main():
                     ):
                         logging.warning(
                             "Skipping layer %s for %s token %s component %s due to missing/shape mismatch.",
-                            layer_idx + 1,
+                            layer_idx,
                             embedding_type,
                             token_pos,
                             component,
@@ -909,7 +909,7 @@ def main():
                 if skip_layer or len(layer_payloads) != 2:
                     continue
 
-                layer_numbers.append(layer_idx + 1)
+                layer_numbers.append(layer_idx)
                 for component in _COMPONENTS:
                     payload = layer_payloads[component]
                     metrics = payload["metrics"]

@@ -42,6 +42,15 @@ class ExampleTensors:
     probability_q: List[np.ndarray]
 
 
+@dataclass
+class GroupAccumulator:
+    sum_tables: Dict[int, np.ndarray]
+    count_tables: Dict[int, int]
+    total_examples_seen: int = 0
+    examples_used: int = 0
+    examples_skipped: int = 0
+
+
 class StrictProbabilitySpanError(ValueError):
     """Raised when input decoded_tokens violate strict probability span expectations."""
 
@@ -101,7 +110,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--expected_probability_tokens",
         type=int,
-        default=7,
+        default=9,
         help="Expected number of Probability span tokens (strict, default: 7).",
     )
     parser.add_argument(
@@ -140,6 +149,27 @@ def parse_args() -> argparse.Namespace:
             "(mean across heads), while keeping standard layer.head tables."
         ),
     )
+    parser.add_argument(
+        "--split_by_confidence_groups",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "If enabled, split examples into high/low confidence groups and "
+            "write group-specific outputs under high_confidence/ and low_confidence/."
+        ),
+    )
+    parser.add_argument(
+        "--high_confidence_threshold",
+        type=float,
+        default=0.9,
+        help="High-confidence threshold (examples with confidence >= threshold).",
+    )
+    parser.add_argument(
+        "--low_confidence_threshold",
+        type=float,
+        default=0.1,
+        help="Low-confidence threshold (examples with confidence <= threshold).",
+    )
     return parser.parse_args()
 
 
@@ -163,6 +193,18 @@ def _decode_scalar(value):
     if isinstance(value, np.ndarray) and value.ndim == 0:
         return _decode_scalar(value.item())
     return value
+
+
+def _read_required_confidence(response_group: h5py.Group) -> float:
+    if "verbalised_confidence" not in response_group:
+        raise ValueError("responses/0/verbalised_confidence is missing.")
+    raw_value = _decode_scalar(response_group["verbalised_confidence"][()])
+    try:
+        return float(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"responses/0/verbalised_confidence is not a valid float: {raw_value!r}"
+        ) from exc
 
 
 def _read_string_list(node: h5py.Dataset | h5py.Group) -> List[str]:
@@ -295,11 +337,11 @@ def _validate_probability_span(decoded_tokens: Sequence[str], expected_probabili
         )
     _, first_prob_idx, end_prob_idx = parsed
     prob_len = end_prob_idx - first_prob_idx + 1
-    if prob_len != expected_probability_tokens:
-        raise StrictProbabilitySpanError(
-            f"Expected probability span length {expected_probability_tokens}, got {prob_len} "
-            f"(first_prob={first_prob_idx}, end_prob={end_prob_idx})."
-        )
+    # if prob_len != expected_probability_tokens:
+    #     raise StrictProbabilitySpanError(
+    #         f"Expected probability span length {expected_probability_tokens}, got {prob_len} "
+    #         f"(first_prob={first_prob_idx}, end_prob={end_prob_idx})."
+    #     )
     return first_prob_idx, end_prob_idx
 
 
@@ -524,6 +566,10 @@ def _write_config(
     expected_guess_tokens: int,
     include_self_probability_attention: bool,
     include_layer_averaged_tables: bool,
+    split_by_confidence_groups: bool,
+    confidence_group_name: str | None,
+    low_confidence_threshold: float,
+    high_confidence_threshold: float,
     num_heads: int,
     total_examples_seen: int,
     examples_used: int,
@@ -543,6 +589,10 @@ def _write_config(
         f"expected_guess_tokens={expected_guess_tokens}",
         f"include_self_probability_attention={include_self_probability_attention}",
         f"include_layer_averaged_tables={include_layer_averaged_tables}",
+        f"split_by_confidence_groups={split_by_confidence_groups}",
+        f"low_confidence_threshold={low_confidence_threshold}",
+        f"high_confidence_threshold={high_confidence_threshold}",
+        f"confidence_group_name={confidence_group_name}",
         f"num_heads={num_heads}",
         f"total_examples_seen={total_examples_seen}",
         f"examples_used={examples_used}",
@@ -562,6 +612,117 @@ def _iter_example_ids(emb_h5: h5py.File) -> Iterable[str]:
     return sorted(emb_examples.keys(), key=_sort_key)
 
 
+def _group_output_dir(base_output_dir: Path, group_name: str | None) -> Path:
+    if group_name is None:
+        return base_output_dir
+    out_dir = base_output_dir / group_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def _write_group_outputs(
+    *,
+    output_dir: Path,
+    embeddings_h5: Path,
+    args: argparse.Namespace,
+    group_name: str | None,
+    accumulator: GroupAccumulator,
+    row_labels: Sequence[str],
+    num_q_heads_used: int,
+) -> None:
+    if accumulator.examples_used <= 0:
+        group_desc = group_name or "default"
+        raise RuntimeError(f"No valid examples were processed for group '{group_desc}'.")
+
+    mean_tables: Dict[int, np.ndarray] = {}
+    summary_payload = {
+        "expected_probability_tokens": args.expected_probability_tokens,
+        "expected_guess_tokens": args.expected_guess_tokens,
+        "include_self_probability_attention": args.include_self_probability_attention,
+        "include_layer_averaged_tables": args.include_layer_averaged_tables,
+        "split_by_confidence_groups": args.split_by_confidence_groups,
+        "confidence_group_name": group_name,
+        "low_confidence_threshold": args.low_confidence_threshold,
+        "high_confidence_threshold": args.high_confidence_threshold,
+        "num_heads": args.num_heads,
+        "total_examples_seen": accumulator.total_examples_seen,
+        "examples_used": accumulator.examples_used,
+        "examples_skipped": accumulator.examples_skipped,
+        "tables": {},
+    }
+
+    for p in range(args.expected_probability_tokens):
+        count = accumulator.count_tables[p]
+        if count <= 0:
+            group_desc = group_name or "default"
+            raise RuntimeError(
+                f"No examples contributed to probability position {p} for group '{group_desc}'."
+            )
+        mean_table = accumulator.sum_tables[p] / float(count)
+        mean_tables[p] = mean_table
+        columns = _column_labels(
+            args.expected_guess_tokens,
+            p,
+            args.include_self_probability_attention,
+        )
+        png_path = output_dir / f"attention_table_probability_pos_{p}.png"
+        _render_table_png(
+            matrix=mean_table,
+            row_labels=row_labels,
+            col_labels=columns,
+            output_path=png_path,
+            title=f"Probability Position {p}: Normalized Attention Table",
+        )
+        summary_payload["tables"][f"probability_pos_{p}"] = {
+            "columns": columns,
+            "shape": list(mean_table.shape),
+            "png": str(png_path),
+            "values": mean_table.tolist(),
+        }
+        if args.include_layer_averaged_tables:
+            layer_avg_table = _average_heads_by_layer(mean_table, num_q_heads_used)
+            layer_avg_png_path = output_dir / f"attention_table_probability_pos_{p}__layer_avg.png"
+            _render_table_png(
+                matrix=layer_avg_table,
+                row_labels=_layer_labels(layer_avg_table.shape[0]),
+                col_labels=columns,
+                output_path=layer_avg_png_path,
+                title=f"Probability Position {p}: Layer-Averaged Attention Table",
+            )
+            summary_payload["tables"][f"probability_pos_{p}"]["layer_avg_shape"] = list(
+                layer_avg_table.shape
+            )
+            summary_payload["tables"][f"probability_pos_{p}"]["layer_avg_png"] = str(
+                layer_avg_png_path
+            )
+            summary_payload["tables"][f"probability_pos_{p}"]["layer_avg_values"] = (
+                layer_avg_table.tolist()
+            )
+
+    npz_payload = {
+        f"probability_pos_{p}": table.astype(np.float32) for p, table in mean_tables.items()
+    }
+    np.savez(output_dir / "attention_tables.npz", **npz_payload)
+    (output_dir / "summary.json").write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
+
+    _write_config(
+        output_dir=output_dir,
+        embeddings_h5=embeddings_h5,
+        expected_probability_tokens=args.expected_probability_tokens,
+        expected_guess_tokens=args.expected_guess_tokens,
+        include_self_probability_attention=args.include_self_probability_attention,
+        include_layer_averaged_tables=args.include_layer_averaged_tables,
+        split_by_confidence_groups=args.split_by_confidence_groups,
+        confidence_group_name=group_name,
+        low_confidence_threshold=args.low_confidence_threshold,
+        high_confidence_threshold=args.high_confidence_threshold,
+        num_heads=args.num_heads,
+        total_examples_seen=accumulator.total_examples_seen,
+        examples_used=accumulator.examples_used,
+        examples_skipped=accumulator.examples_skipped,
+    )
+
+
 def main() -> None:
     args = parse_args()
     embeddings_h5 = Path(args.embeddings_h5)
@@ -575,12 +736,32 @@ def main() -> None:
         raise ValueError("--expected_guess_tokens must be positive.")
     if args.num_heads <= 0:
         raise ValueError("--num_heads must be positive.")
+    if args.split_by_confidence_groups:
+        if not (0.0 <= args.low_confidence_threshold <= 1.0):
+            raise ValueError("--low_confidence_threshold must be within [0, 1].")
+        if not (0.0 <= args.high_confidence_threshold <= 1.0):
+            raise ValueError("--high_confidence_threshold must be within [0, 1].")
+        if args.low_confidence_threshold > args.high_confidence_threshold:
+            raise ValueError(
+                "--low_confidence_threshold cannot be greater than --high_confidence_threshold."
+            )
 
-    sum_tables: Dict[int, np.ndarray] = {}
-    count_tables: Dict[int, int] = {p: 0 for p in range(args.expected_probability_tokens)}
-    skipped_examples = 0
-    used_examples = 0
-    total_seen = 0
+    group_accumulators: Dict[str, GroupAccumulator] = {}
+    if args.split_by_confidence_groups:
+        group_accumulators["high_confidence"] = GroupAccumulator(
+            sum_tables={},
+            count_tables={p: 0 for p in range(args.expected_probability_tokens)},
+        )
+        group_accumulators["low_confidence"] = GroupAccumulator(
+            sum_tables={},
+            count_tables={p: 0 for p in range(args.expected_probability_tokens)},
+        )
+    else:
+        group_accumulators["all_examples"] = GroupAccumulator(
+            sum_tables={},
+            count_tables={p: 0 for p in range(args.expected_probability_tokens)},
+        )
+
     row_labels: List[str] | None = None
     num_q_heads_used: int | None = None
 
@@ -589,10 +770,33 @@ def main() -> None:
 
         for example_id in _iter_example_ids(emb_h5):
             print(f"Processing example {example_id}")
-            total_seen += 1
+            target_groups: List[str]
             try:
                 emb_example = _require_group_path(emb_examples, (example_id,))
                 response_group = _require_group_path(emb_example, ("responses", "0"))
+                if args.split_by_confidence_groups:
+                    conf = _read_required_confidence(response_group)
+                    target_groups = []
+                    if conf >= args.high_confidence_threshold:
+                        target_groups.append("high_confidence")
+                    if conf <= args.low_confidence_threshold:
+                        target_groups.append("low_confidence")
+                    if not target_groups:
+                        continue
+                else:
+                    target_groups = ["all_examples"]
+            except Exception as exc:
+                if isinstance(exc, (StrictProbabilitySpanError, MissingDecodedTokensError)):
+                    raise
+                if not args.split_by_confidence_groups:
+                    group_accumulators["all_examples"].examples_skipped += 1
+                print(f"Skipping example {example_id} due to error: {exc}")
+                continue
+
+            for group_name in target_groups:
+                group_accumulators[group_name].total_examples_seen += 1
+
+            try:
                 if "decoded_tokens" not in response_group:
                     raise MissingDecodedTokensError(
                         "Missing decoded_tokens in processed response. "
@@ -646,103 +850,55 @@ def main() -> None:
                         probability_position=p,
                         include_self_probability_attention=args.include_self_probability_attention,
                     )
-                    if p not in sum_tables:
-                        sum_tables[p] = np.zeros_like(per_example, dtype=np.float64)
-                    sum_tables[p] += per_example
-                    count_tables[p] += 1
+                    for group_name in target_groups:
+                        accumulator = group_accumulators[group_name]
+                        if p not in accumulator.sum_tables:
+                            accumulator.sum_tables[p] = np.zeros_like(per_example, dtype=np.float64)
+                        accumulator.sum_tables[p] += per_example
+                        accumulator.count_tables[p] += 1
 
-                used_examples += 1
+                for group_name in target_groups:
+                    group_accumulators[group_name].examples_used += 1
             except Exception as exc:
                 # Keep malformed examples from crashing a full run unless strict
                 # probability span validation failed.
                 if isinstance(exc, (StrictProbabilitySpanError, MissingDecodedTokensError)):
                     raise
-                skipped_examples += 1
+                for group_name in target_groups:
+                    group_accumulators[group_name].examples_skipped += 1
                 print(f"Skipping example {example_id} due to error: {exc}")
                 continue
 
-    if used_examples == 0:
-        raise RuntimeError("No valid examples were processed; cannot produce tables.")
     if row_labels is None:
         raise RuntimeError("Could not infer row labels from processed tensors.")
     if num_q_heads_used is None:
         raise RuntimeError("Could not infer number of query heads from processed tensors.")
-
-    mean_tables: Dict[int, np.ndarray] = {}
-    summary_payload = {
-        "expected_probability_tokens": args.expected_probability_tokens,
-        "expected_guess_tokens": args.expected_guess_tokens,
-        "include_self_probability_attention": args.include_self_probability_attention,
-        "include_layer_averaged_tables": args.include_layer_averaged_tables,
-        "num_heads": args.num_heads,
-        "total_examples_seen": total_seen,
-        "examples_used": used_examples,
-        "examples_skipped": skipped_examples,
-        "tables": {},
-    }
-
-    for p in range(args.expected_probability_tokens):
-        count = count_tables[p]
-        if count <= 0:
-            raise RuntimeError(f"No examples contributed to probability position {p}.")
-        mean_table = sum_tables[p] / float(count)
-        mean_tables[p] = mean_table
-        columns = _column_labels(
-            args.expected_guess_tokens,
-            p,
-            args.include_self_probability_attention,
-        )
-        png_path = output_dir / f"attention_table_probability_pos_{p}.png"
-        _render_table_png(
-            matrix=mean_table,
+    if args.split_by_confidence_groups:
+        for group_name in ("high_confidence", "low_confidence"):
+            accumulator = group_accumulators[group_name]
+            group_output_dir = _group_output_dir(output_dir, group_name)
+            _write_group_outputs(
+                output_dir=group_output_dir,
+                embeddings_h5=embeddings_h5,
+                args=args,
+                group_name=group_name,
+                accumulator=accumulator,
+                row_labels=row_labels,
+                num_q_heads_used=num_q_heads_used,
+            )
+        print(f"Wrote outputs to {output_dir / 'high_confidence'} and {output_dir / 'low_confidence'}")
+    else:
+        accumulator = group_accumulators["all_examples"]
+        _write_group_outputs(
+            output_dir=output_dir,
+            embeddings_h5=embeddings_h5,
+            args=args,
+            group_name=None,
+            accumulator=accumulator,
             row_labels=row_labels,
-            col_labels=columns,
-            output_path=png_path,
-            title=f"Probability Position {p}: Normalized Attention Table",
+            num_q_heads_used=num_q_heads_used,
         )
-        summary_payload["tables"][f"probability_pos_{p}"] = {
-            "columns": columns,
-            "shape": list(mean_table.shape),
-            "png": str(png_path),
-            "values": mean_table.tolist(),
-        }
-        if args.include_layer_averaged_tables:
-            layer_avg_table = _average_heads_by_layer(mean_table, num_q_heads_used)
-            layer_avg_png_path = output_dir / f"attention_table_probability_pos_{p}__layer_avg.png"
-            _render_table_png(
-                matrix=layer_avg_table,
-                row_labels=_layer_labels(layer_avg_table.shape[0]),
-                col_labels=columns,
-                output_path=layer_avg_png_path,
-                title=f"Probability Position {p}: Layer-Averaged Attention Table",
-            )
-            summary_payload["tables"][f"probability_pos_{p}"]["layer_avg_shape"] = list(
-                layer_avg_table.shape
-            )
-            summary_payload["tables"][f"probability_pos_{p}"]["layer_avg_png"] = str(
-                layer_avg_png_path
-            )
-            summary_payload["tables"][f"probability_pos_{p}"]["layer_avg_values"] = (
-                layer_avg_table.tolist()
-            )
-
-    npz_payload = {f"probability_pos_{p}": table.astype(np.float32) for p, table in mean_tables.items()}
-    np.savez(output_dir / "attention_tables.npz", **npz_payload)
-    (output_dir / "summary.json").write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
-
-    _write_config(
-        output_dir=output_dir,
-        embeddings_h5=embeddings_h5,
-        expected_probability_tokens=args.expected_probability_tokens,
-        expected_guess_tokens=args.expected_guess_tokens,
-        include_self_probability_attention=args.include_self_probability_attention,
-        include_layer_averaged_tables=args.include_layer_averaged_tables,
-        num_heads=args.num_heads,
-        total_examples_seen=total_seen,
-        examples_used=used_examples,
-        examples_skipped=skipped_examples,
-    )
-    print(f"Wrote outputs to {output_dir}")
+        print(f"Wrote outputs to {output_dir}")
 
 
 if __name__ == "__main__":

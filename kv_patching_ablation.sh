@@ -20,12 +20,12 @@ uptime
 # done
 
 python3 ./kv_patching_ablation/run_kv_patching_ablation.py \
-  --input_h5 ./process_generations/processed_generations_more_h5/1_1000_qkvo_concat/train_verbalised_embeddings.h5 \
+  --input_h5 ./process_generations/processed_generations_more_h5/2_200_concat/train_verbalised_embeddings.h5 \
   --no-enable_brief \
-  --num_samples 1000 \
+  --num_samples 200 \
   --device cuda:0 \
-  --ablate_layers 10-31 \
-  --ablation_mode none current_generated_token_after_prob_prefix_mean_replace probability_value_tokens_kv_mean_replace \
+  --ablate_layers 0-16 \
+  --ablation_mode none probability_value_tokens_kv_mean_replace \
   --kv_patch_method last_query_span_read \
   --no-mean_from_low_confidence
 

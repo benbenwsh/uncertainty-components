@@ -489,6 +489,11 @@ def _marker_for_token_pos(token_pos: int) -> str:
     return marker_cycle[token_pos % len(marker_cycle)]
 
 
+def _set_y_axis_from_zero(ax) -> None:
+    """Ensure the y-axis lower bound is 0."""
+    ax.set_ylim(bottom=0)
+
+
 def _plot_group_lines(
     ax,
     token_items,
@@ -619,11 +624,12 @@ def _plot_metrics_by_layer(layer_numbers, train_metrics, test_metrics, metric_na
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(layer_numbers, train_metrics, "o-", label="Train", markersize=4)
     ax.plot(layer_numbers, test_metrics, "s-", label="Test", markersize=4)
-    ax.set_xlabel("Layer number")
+    ax.set_xlabel("Layer index")
     ax.set_ylabel(metric_label)
     ax.set_title(f"{metric_label} by layer")
     ax.legend()
     ax.grid(True, alpha=0.3)
+    _set_y_axis_from_zero(ax)
     fig.tight_layout()
     out_path = output_dir / f"{metric_name}_by_layer.png"
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -647,10 +653,9 @@ def _plot_all_metrics_by_layer(output_dir: Path, layer_numbers, train_metrics_li
 def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: bool = False):
     """
     Create cross-token graphs for guess/probability/prompt/sem-answer/combined families.
-    For each family and each metric, save:
-    - both splits in one chart
-    - train-only chart
-    - test-only chart
+    For guess/probability/combined families and each metric, save both splits in one chart
+    plus train-only and test-only charts. For mean_prompt and mean_sem_answer, save
+    train-only and test-only charts only.
 
     Token order is encoded via increasing line width/opacity by token index.
     """
@@ -671,11 +676,12 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: boo
         for metric_name, metric_label, metric_idx in metrics_config:
             fig, ax = plt.subplots(figsize=(10, 6))
             _plot_group_lines(ax, guess_token_items, metric_idx, cmap_name="Blues", split_mode="both")
-            ax.set_xlabel("Layer number")
+            ax.set_xlabel("Layer index")
             ax.set_ylabel(metric_label)
-            ax.set_title(f"{metric_label} by layer - Guess tokens")
+            ax.set_title(f"{metric_label} by layer - Guess prefix tokens")
             ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
             ax.grid(True, alpha=0.3)
+            _set_y_axis_from_zero(ax)
             fig.tight_layout()
             out_path = run_base / f"{metric_name}_all_tokens_guess.png"
             fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -685,11 +691,12 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: boo
             for split_mode, split_label in [("train", "Train"), ("test", "Test")]:
                 fig, ax = plt.subplots(figsize=(10, 6))
                 _plot_group_lines(ax, guess_token_items, metric_idx, cmap_name="Blues", split_mode=split_mode)
-                ax.set_xlabel("Layer number")
+                ax.set_xlabel("Layer index")
                 ax.set_ylabel(metric_label)
-                ax.set_title(f"{metric_label} by layer - Guess tokens ({split_label} only)")
+                ax.set_title(f"{metric_label} by layer - Guess prefix tokens ({split_label} only)")
                 ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
                 ax.grid(True, alpha=0.3)
+                _set_y_axis_from_zero(ax)
                 fig.tight_layout()
                 out_path = run_base / f"{metric_name}_all_tokens_guess_{split_mode}.png"
                 fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -700,11 +707,12 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: boo
         for metric_name, metric_label, metric_idx in metrics_config:
             fig, ax = plt.subplots(figsize=(10, 6))
             _plot_group_lines(ax, prob_token_items, metric_idx, cmap_name="Oranges", split_mode="both")
-            ax.set_xlabel("Layer number")
+            ax.set_xlabel("Layer index")
             ax.set_ylabel(metric_label)
-            ax.set_title(f"{metric_label} by layer - Probability tokens")
+            ax.set_title(f"{metric_label} by layer - Probability prefix tokens")
             ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
             ax.grid(True, alpha=0.3)
+            _set_y_axis_from_zero(ax)
             fig.tight_layout()
             out_path = run_base / f"{metric_name}_all_tokens_probability.png"
             fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -714,11 +722,12 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: boo
             for split_mode, split_label in [("train", "Train"), ("test", "Test")]:
                 fig, ax = plt.subplots(figsize=(10, 6))
                 _plot_group_lines(ax, prob_token_items, metric_idx, cmap_name="Oranges", split_mode=split_mode)
-                ax.set_xlabel("Layer number")
+                ax.set_xlabel("Layer index")
                 ax.set_ylabel(metric_label)
-                ax.set_title(f"{metric_label} by layer - Probability tokens ({split_label} only)")
+                ax.set_title(f"{metric_label} by layer - Probability prefix tokens ({split_label} only)")
                 ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
                 ax.grid(True, alpha=0.3)
+                _set_y_axis_from_zero(ax)
                 fig.tight_layout()
                 out_path = run_base / f"{metric_name}_all_tokens_probability_{split_mode}.png"
                 fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -727,49 +736,53 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: boo
 
     if len(prompt_token_items) > 0:
         for metric_name, metric_label, metric_idx in metrics_config:
-            fig, ax = plt.subplots(figsize=(10, 6))
-            _plot_group_lines(
-                ax,
-                prompt_token_items,
-                metric_idx,
-                cmap_name="Greens",
-                split_mode="both",
-                fixed_color="green",
-                label_name="prompt",
-            )
-            ax.set_xlabel("Layer number")
-            ax.set_ylabel(metric_label)
-            ax.set_title(f"{metric_label} by layer - Mean prompt token")
-            ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
-            ax.grid(True, alpha=0.3)
-            fig.tight_layout()
-            out_path = run_base / f"{metric_name}_all_tokens_prompt.png"
-            fig.savefig(out_path, dpi=150, bbox_inches="tight")
-            plt.close(fig)
-            logging.info("Saved %s", out_path)
+            for split_mode, split_label in [("train", "Train"), ("test", "Test")]:
+                fig, ax = plt.subplots(figsize=(10, 6))
+                _plot_group_lines(
+                    ax,
+                    prompt_token_items,
+                    metric_idx,
+                    cmap_name="Greens",
+                    split_mode=split_mode,
+                    fixed_color="green",
+                    label_name="prompt",
+                )
+                ax.set_xlabel("Layer index")
+                ax.set_ylabel(metric_label)
+                ax.set_title(f"{metric_label} by layer - Mean prompt token ({split_label} only)")
+                ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
+                ax.grid(True, alpha=0.3)
+                _set_y_axis_from_zero(ax)
+                fig.tight_layout()
+                out_path = run_base / f"{metric_name}_all_tokens_prompt_{split_mode}.png"
+                fig.savefig(out_path, dpi=150, bbox_inches="tight")
+                plt.close(fig)
+                logging.info("Saved %s", out_path)
 
     if len(sem_answer_token_items) > 0:
         for metric_name, metric_label, metric_idx in metrics_config:
-            fig, ax = plt.subplots(figsize=(10, 6))
-            _plot_group_lines(
-                ax,
-                sem_answer_token_items,
-                metric_idx,
-                cmap_name="Purples",
-                split_mode="both",
-                fixed_color="purple",
-                label_name="sem_answer",
-            )
-            ax.set_xlabel("Layer number")
-            ax.set_ylabel(metric_label)
-            ax.set_title(f"{metric_label} by layer - Mean semantic answer token")
-            ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
-            ax.grid(True, alpha=0.3)
-            fig.tight_layout()
-            out_path = run_base / f"{metric_name}_all_tokens_sem_answer.png"
-            fig.savefig(out_path, dpi=150, bbox_inches="tight")
-            plt.close(fig)
-            logging.info("Saved %s", out_path)
+            for split_mode, split_label in [("train", "Train"), ("test", "Test")]:
+                fig, ax = plt.subplots(figsize=(10, 6))
+                _plot_group_lines(
+                    ax,
+                    sem_answer_token_items,
+                    metric_idx,
+                    cmap_name="Purples",
+                    split_mode=split_mode,
+                    fixed_color="purple",
+                    label_name="sem_answer",
+                )
+                ax.set_xlabel("Layer index")
+                ax.set_ylabel(metric_label)
+                ax.set_title(f"{metric_label} by layer - Mean semantic answer token ({split_label} only)")
+                ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
+                ax.grid(True, alpha=0.3)
+                _set_y_axis_from_zero(ax)
+                fig.tight_layout()
+                out_path = run_base / f"{metric_name}_all_tokens_sem_answer_{split_mode}.png"
+                fig.savefig(out_path, dpi=150, bbox_inches="tight")
+                plt.close(fig)
+                logging.info("Saved %s", out_path)
 
     if (
         len(guess_token_items) > 0
@@ -799,11 +812,12 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: boo
                 fixed_color="purple",
                 label_name="sem_answer",
             )
-            ax.set_xlabel("Layer number")
+            ax.set_xlabel("Layer index")
             ax.set_ylabel(metric_label)
-            ax.set_title(f"{metric_label} by layer - Combined guess + probability + prompt + sem_answer tokens")
+            ax.set_title(f"{metric_label} by layer - Combined guess prefix + probability prefix + prompt + sem_answer tokens")
             ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
             ax.grid(True, alpha=0.3)
+            _set_y_axis_from_zero(ax)
             fig.tight_layout()
             out_path = run_base / f"{metric_name}_all_tokens_combined.png"
             fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -832,14 +846,15 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: boo
                     fixed_color="purple",
                     label_name="sem_answer",
                 )
-                ax.set_xlabel("Layer number")
+                ax.set_xlabel("Layer index")
                 ax.set_ylabel(metric_label)
                 ax.set_title(
-                    f"{metric_label} by layer - Combined guess + probability + prompt + sem_answer tokens "
+                    f"{metric_label} by layer - Combined guess prefix + probability prefix + prompt + sem_answer tokens "
                     f"({split_label} only)"
                 )
                 ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
                 ax.grid(True, alpha=0.3)
+                _set_y_axis_from_zero(ax)
                 fig.tight_layout()
                 out_path = run_base / f"{metric_name}_all_tokens_combined_{split_mode}.png"
                 fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -1047,7 +1062,7 @@ def main():
             test_mse, test_mae, test_r2 = [], [], []
 
             for layer_idx in range(n_layers):
-                layer_name = f"layer_{layer_idx + 1}"
+                layer_name = f"layer_{layer_idx}"
                 layer_dir = token_dir / layer_name
                 layer_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1063,7 +1078,7 @@ def main():
                         "Streaming build shape mismatch for %s token %s layer %s: skipping layer.",
                         embedding_type,
                         token_pos,
-                        layer_idx + 1,
+                        layer_idx,
                     )
                     continue
 
@@ -1072,7 +1087,7 @@ def main():
                         "No examples for %s token %s layer %s (train=%s test=%s); skipping layer.",
                         embedding_type,
                         token_pos,
-                        layer_idx + 1,
+                        layer_idx,
                         X_train.shape[0],
                         X_test.shape[0],
                     )
@@ -1091,7 +1106,7 @@ def main():
                     verbose=False,
                 )
 
-                layer_numbers.append(layer_idx + 1)
+                layer_numbers.append(layer_idx)
                 train_mse.append(metrics["train"]["mse"])
                 train_mae.append(metrics["train"]["mae"])
                 train_r2.append(metrics["train"]["r2"])

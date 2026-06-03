@@ -478,7 +478,7 @@ def _save_topk_table_png(
 
     rows = []
     for layer_idx in range(n_layers):
-        row = [f"layer_{layer_idx + 1}"]
+        row = [f"layer_{layer_idx}"]
         for k in range(top_k):
             tok_id = int(top_ids[layer_idx, k])
             prob = float(top_vals[layer_idx, k])
@@ -532,7 +532,7 @@ def _write_top_tokens_report(
     lines.append(f"written_examples: {len(report_examples)}")
     lines.append(f"top_n: {top_n}")
     lines.append(f"token_positions: 0..{NUM_GUESS_TOKENS - 1}")
-    lines.append(f"layers: 1..{n_layers}")
+    lines.append(f"layers: 0..{n_layers - 1}")
     lines.append("")
 
     for ex_idx, ex_record in enumerate(report_examples, start=1):
@@ -550,7 +550,7 @@ def _write_top_tokens_report(
                     f"{rank + 1}. {_format_token(tokenizer, int(tok_id))} prob={float(prob):.8f}"
                     for rank, (tok_id, prob) in enumerate(zip(top_ids, top_vals))
                 ]
-                lines.append(f"  layer_{layer_idx + 1}:")
+                lines.append(f"  layer_{layer_idx}:")
                 lines.extend([f"    {entry}" for entry in entries])
             lines.append("")
         lines.append("")
@@ -581,7 +581,7 @@ def _write_topk_tables_and_example_curves(
             token_label = _format_token(tokenizer, final_top1_id)
             top1_curve = np.asarray(ex_record["final_top1_curves"][token_pos], dtype=np.float32)
             _plot_metric_by_layer(
-                layer_numbers=list(range(1, n_layers + 1)),
+                layer_numbers=list(range(n_layers)),
                 values=top1_curve,
                 std_values=None,
                 token_pos=token_pos,
@@ -595,7 +595,7 @@ def _write_topk_tables_and_example_curves(
             if token_pos < REF_TOKEN_INDEX:
                 ref_curve = np.asarray(ex_record["ref_token_curves"][token_pos], dtype=np.float32)
                 _plot_metric_by_layer(
-                    layer_numbers=list(range(1, n_layers + 1)),
+                    layer_numbers=list(range(n_layers)),
                     values=ref_curve,
                     std_values=None,
                     token_pos=token_pos,
@@ -607,7 +607,7 @@ def _write_topk_tables_and_example_curves(
                 )
 
         _plot_combined_ref_overlay_tokens(
-            layer_numbers=list(range(1, n_layers + 1)),
+            layer_numbers=list(range(n_layers)),
             means=np.asarray(ex_record["ref_token_curves"], dtype=np.float32),
             title=f"Example {ex_idx}: ref tok5 final top-1 probability by layer (combined)",
             ylabel=f"P(ref_token={ref_label})",
@@ -637,7 +637,7 @@ def _plot_metric_by_layer(
     ax.plot(layer_numbers, values, "o-", markersize=4)
     if show_error_bars and std_values is not None:
         ax.fill_between(layer_numbers, values - std_values, values + std_values, alpha=0.2)
-    ax.set_xlabel("Layer number")
+    ax.set_xlabel("Layer index")
     ax.set_ylabel(ylabel)
     ax.set_title(f"{title} (token position {token_pos})")
     ax.grid(True, alpha=0.3)
@@ -683,7 +683,7 @@ def _plot_combined_tokens(
             linewidth=style["linewidth"],
             alpha=style["alpha"],
         )
-    ax.set_xlabel("Layer number")
+    ax.set_xlabel("Layer index")
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.legend()
@@ -718,7 +718,7 @@ def _plot_combined_ref_overlay_tokens(
             linewidth=style["linewidth"],
             alpha=style["alpha"],
         )
-    ax.set_xlabel("Layer number")
+    ax.set_xlabel("Layer index")
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.legend()
@@ -909,7 +909,7 @@ def main():
     cosine_mean, cosine_std = _aggregate_metric(cosine_values)
     kl_mean, kl_std = _aggregate_metric(kl_values)
     ce_mean, ce_std = _aggregate_metric(ce_values)
-    layer_numbers = np.arange(1, n_layers + 1, dtype=np.int32)
+    layer_numbers = np.arange(n_layers, dtype=np.int32)
 
     np.savez(
         run_base / "logit_lens_stats.npz",
