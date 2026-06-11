@@ -14,7 +14,8 @@ Then, for each selected ablation target group and alpha:
 
 Ablation modes apply additive direction perturbation along span-specific directions
 (``*_mean_replace`` names are kept for compatibility with mean-ablation scripts).
-Includes full and subset ``Probability:`` span modes (see ``--ablation_mode`` help).
+Includes full and subset ``Probability:`` span modes, including row-index subsets
+(see ``--ablation_mode`` help).
 """
 
 from __future__ import annotations
@@ -94,6 +95,25 @@ GUESS_PREFIX = "\n\nGuess:"
 PROBABILITY_MARKER = "\nProbability:"
 CONFIDENCE_MARKER = "\nConfidence:"
 
+PROBABILITY_ROW_INDEX_MODES: Dict[str, Tuple[int, ...]] = {
+    "probability_first_token_mean_replace": (0,),
+    "probability_first_two_tokens_mean_replace": (0, 1),
+    "probability_first_two_and_index6_tokens_mean_replace": (0, 1, 6),
+}
+
+DEFAULT_SEMANTIC_SIMILARITY_MODEL = "all-MiniLM-L6-v2"
+
+SEMANTIC_SIMILARITY_MODES = frozenset({
+    "guess_tokens_mean_replace",
+    "all_pre_guess_tokens_mean_replace",
+    "guess_then_guess_probability_mean_replace",
+    "semantic_answer_mean_replace",
+    "current_generated_token_mean_replace",
+    "current_generated_window5_mean_replace",
+    "prompt_tokens_mean_replace",
+    "sem_ans_tokens_during_gen",
+})
+
 
 def _marker_for_linguistic_confidence(linguistic_confidence_prompt: bool) -> str:
     return CONFIDENCE_MARKER if linguistic_confidence_prompt else PROBABILITY_MARKER
@@ -123,8 +143,6 @@ def parse_guess_and_marker_indices(
     first token after the marker (inclusive of marker through that token).
     """
     full_str = "".join(decoded_tokens)
-    logging.info(f"decoded_tokens: {decoded_tokens}")
-    logging.info(f"linguistic_confidence_prompt: {linguistic_confidence_prompt}")
     if not full_str.startswith(GUESS_PREFIX):
         return None
 
@@ -257,7 +275,11 @@ def mode_to_output_key(mode: str) -> str:
         "guess_then_guess_probability_mean_replace",
         "current_generated_token_mean_replace",
         "current_generated_window5_mean_replace",
+        "prompt_tokens_mean_replace",
+        "sem_ans_tokens_during_gen",
     }:
+        return mode
+    if mode in PROBABILITY_ROW_INDEX_MODES:
         return mode
     raise ValueError(f"Unknown mode: {mode}")
 
@@ -311,6 +333,78 @@ def parse_mode_confidence_from_response(response: str, *, linguistic_prompt: boo
     return float(parsed) if parsed is not None else None
 
 
+def parse_semantic_answer_from_response(
+    response_str: str,
+    *,
+    linguistic_confidence_prompt: bool = False,
+) -> Optional[str]:
+    """Extract guess text between ``Guess:`` and the last marker span."""
+    if not response_str or not isinstance(response_str, str):
+        return None
+    if linguistic_confidence_prompt:
+        pattern = r"guess\s*:\s*(.*?)\s*confidence\s*:"
+    else:
+        pattern = r"guess\s*:\s*(.*?)\s*probability\s*:"
+    match = re.search(pattern, response_str, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    answer = match.group(1).strip()
+    return answer if answer else None
+
+
+def compute_verbalised_confidence_effect(
+    baseline_conf: float,
+    mode_conf: float,
+    *,
+    mean_from_low_confidence: bool,
+) -> Optional[float]:
+    if mean_from_low_confidence:
+        diff = max(0.0, float(baseline_conf) - float(mode_conf))
+        denom = float(baseline_conf)
+    else:
+        diff = max(0.0, float(mode_conf) - float(baseline_conf))
+        denom = 1.0 - float(baseline_conf)
+    if denom <= 0.0:
+        return None
+    return diff / denom
+
+
+def compute_uncertainty_score(semantic_similarity: float, verbalised_confidence_effect: float) -> float:
+    return float(semantic_similarity) * float(verbalised_confidence_effect)
+
+
+def load_sentence_transformer_for_metrics(model_name: str = DEFAULT_SEMANTIC_SIMILARITY_MODEL):
+    from sentence_transformers import SentenceTransformer
+
+    return SentenceTransformer(model_name)
+
+
+def batch_compute_semantic_similarities(
+    sentence_model,
+    pairs: Sequence[Tuple[str, str]],
+) -> List[float]:
+    if not pairs:
+        return []
+    from sentence_transformers import util
+
+    texts_a = [text_a for text_a, _text_b in pairs]
+    texts_b = [_text_b for _text_a, _text_b in pairs]
+    emb_a = sentence_model.encode(texts_a, convert_to_tensor=True)
+    emb_b = sentence_model.encode(texts_b, convert_to_tensor=True)
+    sims = util.cos_sim(emb_a, emb_b).diag()
+    return [max(0.0, float(sim.item())) for sim in sims]
+
+
+def _mean_and_count(values: Sequence[float]) -> Tuple[Optional[float], int]:
+    if not values:
+        return None, 0
+    return float(np.mean(values)), len(values)
+
+
+def _entry_key_for_mode_target_alpha(mode: str, target: str, alpha: float) -> str:
+    return f"{mode_to_output_key(mode)}__target_{target}__alpha_{_format_alpha(alpha)}"
+
+
 def write_config_txt(
     path: str,
     *,
@@ -323,6 +417,7 @@ def write_config_txt(
     high_conf_count: int,
     h5_example_count: int,
     finished_at: str,
+    summary_payload: Optional[Dict[str, object]] = None,
 ) -> None:
     lines = [
         "Mass Mean Probe Configuration",
@@ -372,6 +467,33 @@ def write_config_txt(
         f"low_conf_selected_count={low_conf_count}",
         f"high_conf_selected_count={high_conf_count}",
     ]
+    if summary_payload is not None:
+        lines.extend(["", "[Derived metrics]", "Per-mode aggregates from summary.json (all targets/alphas).", ""])
+        for mode_name in [m for m in args.ablation_mode if m != "none"]:
+            mode_block = summary_payload.get(mode_name)
+            if not isinstance(mode_block, dict):
+                continue
+            for target in args.ablation_targets:
+                target_block = mode_block.get(target)
+                if not isinstance(target_block, dict):
+                    continue
+                for alpha_key, metrics in sorted(target_block.items()):
+                    if not isinstance(metrics, dict):
+                        continue
+                    parts = [f"{mode_name} target={target} alpha={alpha_key}"]
+                    mean_conf = metrics.get("mean_confidence")
+                    if mean_conf is not None:
+                        parts.append(f"mean_confidence={float(mean_conf):.6f}")
+                    sem_mean = metrics.get("mean_semantic_similarity")
+                    if sem_mean is not None:
+                        parts.append(f"mean_semantic_similarity={float(sem_mean):.6f}")
+                    vce_mean = metrics.get("mean_verbalised_confidence_effect")
+                    if vce_mean is not None:
+                        parts.append(f"mean_verbalised_confidence_effect={float(vce_mean):.6f}")
+                    unc_mean = metrics.get("mean_uncertainty_score")
+                    if unc_mean is not None:
+                        parts.append(f"mean_uncertainty_score={float(unc_mean):.6f}")
+                    lines.append(" ".join(parts))
     lines.extend(["", "[Run]", f"finished_at={finished_at}"])
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -385,6 +507,9 @@ def _build_summary_json(
     mode_confidence_values: Dict[str, Dict[str, Dict[float, List[float]]]],
     mode_responses_identical_true: Dict[str, Dict[str, Dict[float, int]]],
     baseline_values_by_target: Dict[str, List[float]],
+    mode_semantic_similarity_values: Optional[Dict[str, Dict[str, Dict[float, List[float]]]]] = None,
+    mode_verbalised_confidence_effect_values: Optional[Dict[str, Dict[str, Dict[float, List[float]]]]] = None,
+    mode_uncertainty_score_values: Optional[Dict[str, Dict[str, Dict[float, List[float]]]]] = None,
 ) -> Dict[str, object]:
     summary: Dict[str, object] = {}
     for mode in non_none_modes:
@@ -397,7 +522,7 @@ def _build_summary_json(
                 alpha_key = _format_alpha(alpha)
                 values = mode_confidence_values.get(mode, {}).get(target, {}).get(alpha, [])
                 mean_conf = float(np.mean(values)) if values else None
-                per_alpha_payload[alpha_key] = {
+                alpha_metrics: Dict[str, Optional[float] | int] = {
                     "alpha_value": float(alpha),
                     "mean_confidence": mean_conf,
                     "sample_count": len(values),
@@ -405,6 +530,22 @@ def _build_summary_json(
                         mode_responses_identical_true.get(mode, {}).get(target, {}).get(alpha, 0)
                     ),
                 }
+                if mode_semantic_similarity_values is not None:
+                    sem_values = mode_semantic_similarity_values.get(mode, {}).get(target, {}).get(alpha, [])
+                    sem_mean, sem_count = _mean_and_count(sem_values)
+                    alpha_metrics["mean_semantic_similarity"] = sem_mean
+                    alpha_metrics["semantic_similarity_sample_count"] = sem_count
+                if mode_verbalised_confidence_effect_values is not None:
+                    vce_values = mode_verbalised_confidence_effect_values.get(mode, {}).get(target, {}).get(alpha, [])
+                    vce_mean, vce_count = _mean_and_count(vce_values)
+                    alpha_metrics["mean_verbalised_confidence_effect"] = vce_mean
+                    alpha_metrics["verbalised_confidence_effect_sample_count"] = vce_count
+                if mode_uncertainty_score_values is not None:
+                    unc_values = mode_uncertainty_score_values.get(mode, {}).get(target, {}).get(alpha, [])
+                    unc_mean, unc_count = _mean_and_count(unc_values)
+                    alpha_metrics["mean_uncertainty_score"] = unc_mean
+                    alpha_metrics["uncertainty_score_sample_count"] = unc_count
+                per_alpha_payload[alpha_key] = alpha_metrics
             mode_payload[target] = per_alpha_payload
         summary[mode] = mode_payload
 
@@ -717,6 +858,33 @@ def _absolute_prob_positions(
     return final_tokens
 
 
+def _absolute_prob_positions_at_row_indices(
+    prompt_len: int,
+    decoded_tokens: List[str],
+    row_indices: Sequence[int],
+    *,
+    expected_probability_tokens: int,
+    expected_confidence_tokens: int,
+    linguistic_confidence_prompt: bool = False,
+) -> List[int]:
+    """Absolute positions for selected rows of the H5 probability-prefix span (0-indexed)."""
+    full_positions = _absolute_prob_positions(
+        prompt_len,
+        decoded_tokens,
+        expected_probability_tokens=expected_probability_tokens,
+        expected_confidence_tokens=expected_confidence_tokens,
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
+    )
+    if not full_positions:
+        return []
+    out: List[int] = []
+    for idx in row_indices:
+        if idx < 0 or idx >= len(full_positions):
+            return []
+        out.append(full_positions[idx])
+    return out
+
+
 def _absolute_prob_last_token_only(
     prompt_len: int,
     decoded_tokens: List[str],
@@ -790,6 +958,32 @@ def _absolute_sem_answer_positions(
     seq_len = prompt_len + len(decoded_tokens)
     out: List[int] = []
     for k in range(last_guess_token_index, first_span_token_index):
+        p = _completion_token_index_to_abs_pos(prompt_len, k)
+        if 0 <= p < seq_len:
+            out.append(p)
+    return out
+
+
+def _absolute_sem_answer_positions_during_gen(
+    prompt_len: int,
+    decoded_tokens: List[str],
+    *,
+    linguistic_confidence_prompt: bool = False,
+) -> List[int]:
+    """Semantic-answer positions during generation (guess parsed) or after full parse."""
+    full_positions = _absolute_sem_answer_positions(
+        prompt_len,
+        decoded_tokens,
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
+    )
+    if full_positions:
+        return full_positions
+    guess_start = parse_guess_start_index(decoded_tokens)
+    if guess_start is None:
+        return []
+    seq_len = prompt_len + len(decoded_tokens)
+    out: List[int] = []
+    for k in range(guess_start, len(decoded_tokens)):
         p = _completion_token_index_to_abs_pos(prompt_len, k)
         if 0 <= p < seq_len:
             out.append(p)
@@ -992,6 +1186,33 @@ def _direction_mode_activation_applier_builder(
                 return activation
 
             return _apply_probability_tokens_mean_replace
+
+        if mode in PROBABILITY_ROW_INDEX_MODES:
+            row_indices = PROBABILITY_ROW_INDEX_MODES[mode]
+
+            def _apply_probability_row_indices_mean_replace(
+                activation: torch.Tensor,
+                layer_delta: Dict[str, torch.Tensor],
+            ) -> torch.Tensor:
+                prob_vecs = layer_delta["probability"].to(activation.dtype)
+                prob_positions = _absolute_prob_positions_at_row_indices(
+                    prompt_len,
+                    decoded_tokens_provider(),
+                    row_indices,
+                    expected_probability_tokens=expected_probability_tokens,
+                    expected_confidence_tokens=expected_confidence_tokens,
+                    linguistic_confidence_prompt=linguistic_confidence_prompt,
+                )
+                if not prob_positions:
+                    return activation
+                for row_idx, abs_pos in zip(row_indices, prob_positions):
+                    if row_idx < 0 or row_idx >= prob_vecs.shape[0]:
+                        return activation
+                    if 0 <= abs_pos < activation.shape[1]:
+                        activation[:, abs_pos, :] = activation[:, abs_pos, :] + prob_vecs[row_idx]
+                return activation
+
+            return _apply_probability_row_indices_mean_replace
 
         if mode == "probability_last_token_mean_replace":
             def _apply_probability_last_token_mean_replace(
@@ -1270,6 +1491,41 @@ def _direction_mode_activation_applier_builder(
                 return activation
 
             return _apply_current_generated_window5_mean_replace
+
+        if mode == "prompt_tokens_mean_replace":
+            def _apply_prompt_tokens_mean_replace(
+                activation: torch.Tensor,
+                layer_delta: Dict[str, torch.Tensor],
+            ) -> torch.Tensor:
+                if parse_guess_start_index(decoded_tokens_provider()) is None:
+                    return activation
+                prompt_vec = layer_delta["prompt_mean"].to(activation.dtype)
+                for abs_pos in range(0, prompt_len - 1):
+                    if 0 <= abs_pos < activation.shape[1]:
+                        activation[:, abs_pos, :] = activation[:, abs_pos, :] + prompt_vec
+                return activation
+
+            return _apply_prompt_tokens_mean_replace
+
+        if mode == "sem_ans_tokens_during_gen":
+            def _apply_sem_ans_tokens_during_gen(
+                activation: torch.Tensor,
+                layer_delta: Dict[str, torch.Tensor],
+            ) -> torch.Tensor:
+                sem_answer_vec = layer_delta["sem_answer_mean"].to(activation.dtype)
+                sem_positions = _absolute_sem_answer_positions_during_gen(
+                    prompt_len,
+                    decoded_tokens_provider(),
+                    linguistic_confidence_prompt=linguistic_confidence_prompt,
+                )
+                if not sem_positions:
+                    return activation
+                for abs_pos in sem_positions:
+                    if 0 <= abs_pos < activation.shape[1]:
+                        activation[:, abs_pos, :] = activation[:, abs_pos, :] + sem_answer_vec
+                return activation
+
+            return _apply_sem_ans_tokens_during_gen
 
         raise ValueError(f"Unknown ablation mode for perturb hooks: {mode!r}")
 
@@ -1599,8 +1855,13 @@ def main() -> None:
             "guess_tokens_mean_replace",
             "all_pre_guess_tokens_mean_replace",
             "guess_then_guess_probability_mean_replace",
+            "prompt_tokens_mean_replace",
+            "sem_ans_tokens_during_gen",
             "current_generated_token_mean_replace",
             "current_generated_window5_mean_replace",
+            "probability_first_token_mean_replace",
+            "probability_first_two_tokens_mean_replace",
+            "probability_first_two_and_index6_tokens_mean_replace",
         ],
         choices=[
             "none",
@@ -1613,8 +1874,13 @@ def main() -> None:
             "guess_tokens_mean_replace",
             "all_pre_guess_tokens_mean_replace",
             "guess_then_guess_probability_mean_replace",
+            "prompt_tokens_mean_replace",
+            "sem_ans_tokens_during_gen",
             "current_generated_token_mean_replace",
             "current_generated_window5_mean_replace",
+            "probability_first_token_mean_replace",
+            "probability_first_two_tokens_mean_replace",
+            "probability_first_two_and_index6_tokens_mean_replace",
         ],
         help=(
             "Ablation mode(s) to run. probability_last_token_mean_replace: perturb only the "
@@ -1625,9 +1891,17 @@ def main() -> None:
             "at each decode step using the probability-last direction. "
             "current_generated_window5_mean_replace: perturb the current last 5 sequence tokens "
             "at each decode step using the probability-last direction. "
+            "probability_first_token_mean_replace: same gating as probability_tokens_mean_replace but "
+            "only H5 probability row 0. probability_first_two_tokens_mean_replace: rows 0 and 1. "
+            "probability_first_two_and_index6_tokens_mean_replace: same gating as "
+            "probability_tokens_mean_replace but only H5 probability rows 0, 1, and 6 (fixed index 6, not -1). "
             "semantic_answer_mean_replace: no-op until Guess/Probability(or Confidence) parse "
             "succeeds, then perturb only semantic-answer tokens using the shared "
             "sem_answer_mean direction. "
+            "prompt_tokens_mean_replace: no-op until Guess: prefix parses, then perturb all "
+            "prompt token positions with the shared prompt_mean direction. "
+            "sem_ans_tokens_during_gen: no-op until Guess: prefix parses; perturb semantic-answer "
+            "tokens generated so far (and keep ablating those positions after the span is complete). "
             "Both subset modes apply only with the numeric Probability: prompt."
         ),
     )
@@ -1709,7 +1983,9 @@ def main() -> None:
             "guess_then_guess_probability_mean_replace",
             "current_generated_token_mean_replace",
             "current_generated_window5_mean_replace",
-        }
+            "prompt_tokens_mean_replace",
+            "sem_ans_tokens_during_gen",
+        } | set(PROBABILITY_ROW_INDEX_MODES)
         unsupported_modes = [mode for mode in args.ablation_mode if mode not in normalization_supported_modes]
         if unsupported_modes:
             raise ValueError(
@@ -1800,6 +2076,15 @@ def main() -> None:
 
     out_path = resolve_output_json_path(args.output_json)
 
+    sentence_transformer = None
+    compute_derived_metrics = "none" in args.ablation_mode and len(args.ablation_mode) > 1
+    if compute_derived_metrics and any(m in SEMANTIC_SIMILARITY_MODES for m in args.ablation_mode):
+        logging.info(
+            "Loading sentence-transformers model %s for semantic_similarity.",
+            DEFAULT_SEMANTIC_SIMILARITY_MODEL,
+        )
+        sentence_transformer = load_sentence_transformer_for_metrics()
+
     results = {"train": {}, "validation": {}}
     mini_results = {"train": {}, "validation": {}}
     mode_confidence_values: Dict[str, Dict[str, Dict[float, List[float]]]] = {
@@ -1810,6 +2095,21 @@ def main() -> None:
         mode: {target: {float(alpha): 0 for alpha in args.alpha} for target in args.ablation_targets}
         for mode in [m for m in args.ablation_mode if m != "none"]
     }
+    mode_semantic_similarity_values: Dict[str, Dict[str, Dict[float, List[float]]]] = {
+        mode: {target: {float(alpha): [] for alpha in args.alpha} for target in args.ablation_targets}
+        for mode in [m for m in args.ablation_mode if m != "none"]
+    }
+    mode_verbalised_confidence_effect_values: Dict[str, Dict[str, Dict[float, List[float]]]] = {
+        mode: {target: {float(alpha): [] for alpha in args.alpha} for target in args.ablation_targets}
+        for mode in [m for m in args.ablation_mode if m != "none"]
+    }
+    mode_uncertainty_score_values: Dict[str, Dict[str, Dict[float, List[float]]]] = {
+        mode: {target: {float(alpha): [] for alpha in args.alpha} for target in args.ablation_targets}
+        for mode in [m for m in args.ablation_mode if m != "none"]
+    }
+    pending_semantic_similarity: List[
+        Tuple[str, str, str, str, float, str, str, str]
+    ] = []
     baseline_values_by_target: Dict[str, List[float]] = {"low": [], "high": []}
     non_none_modes = [m for m in args.ablation_mode if m != "none"]
 
@@ -1854,6 +2154,13 @@ def main() -> None:
             if args.parse_mode_verbalised_confidence:
                 entry["no_replacement"]["verbalised_confidence"] = baseline_confidence
                 mini_entry["no_replacement"]["verbalised_confidence"] = baseline_confidence
+            baseline_semantic_answer = parse_semantic_answer_from_response(
+                baseline_response,
+                linguistic_confidence_prompt=args.linguistic_confidence_prompt,
+            )
+            if baseline_semantic_answer is not None:
+                entry["no_replacement"]["semantic_answer"] = baseline_semantic_answer
+                mini_entry["no_replacement"]["semantic_answer"] = baseline_semantic_answer
 
             ex_is_low = ex_id in low_ids
             ex_is_high = ex_id in high_ids
@@ -1912,9 +2219,16 @@ def main() -> None:
                             else None
                         )
 
-                        key = f"{mode_to_output_key(mode)}__target_{target}__alpha_{_format_alpha(alpha)}"
+                        key = _entry_key_for_mode_target_alpha(mode, target, alpha)
                         entry[key] = {"response": response, "decoded_tokens": decoded_tokens}
                         mini_entry[key] = {"response": response}
+                        mode_semantic_answer = parse_semantic_answer_from_response(
+                            response,
+                            linguistic_confidence_prompt=args.linguistic_confidence_prompt,
+                        )
+                        if mode_semantic_answer is not None:
+                            entry[key]["semantic_answer"] = mode_semantic_answer
+                            mini_entry[key]["semantic_answer"] = mode_semantic_answer
                         responses_identical = response == baseline_response
                         entry[key]["responses_identical"] = responses_identical
                         mini_entry[key]["responses_identical"] = responses_identical
@@ -1934,9 +2248,91 @@ def main() -> None:
                             entry[key]["meets_none_confidence_direction"] = meets_none_confidence_direction
                             mini_entry[key]["meets_none_confidence_direction"] = meets_none_confidence_direction
 
+            if compute_derived_metrics:
+                if args.parse_mode_verbalised_confidence and baseline_confidence is not None:
+                    for target in args.ablation_targets:
+                        if target == "low" and not ex_is_low:
+                            continue
+                        if target == "high" and not ex_is_high:
+                            continue
+                        mean_from_low_confidence = target == "high"
+                        for mode in non_none_modes:
+                            for alpha in args.alpha:
+                                key = _entry_key_for_mode_target_alpha(mode, target, alpha)
+                                if key not in entry:
+                                    continue
+                                mode_confidence = entry[key].get("verbalised_confidence")
+                                if mode_confidence is None:
+                                    continue
+                                vce = compute_verbalised_confidence_effect(
+                                    float(baseline_confidence),
+                                    float(mode_confidence),
+                                    mean_from_low_confidence=mean_from_low_confidence,
+                                )
+                                if vce is not None:
+                                    entry[key]["verbalised_confidence_effect"] = vce
+                                    mini_entry[key]["verbalised_confidence_effect"] = vce
+                                    mode_verbalised_confidence_effect_values[mode][target][float(alpha)].append(
+                                        float(vce)
+                                    )
+
+                if sentence_transformer is not None and baseline_semantic_answer is not None:
+                    for mode in non_none_modes:
+                        if mode not in SEMANTIC_SIMILARITY_MODES:
+                            continue
+                        for target in args.ablation_targets:
+                            if target == "low" and not ex_is_low:
+                                continue
+                            if target == "high" and not ex_is_high:
+                                continue
+                            for alpha in args.alpha:
+                                key = _entry_key_for_mode_target_alpha(mode, target, alpha)
+                                if key not in entry:
+                                    continue
+                                mode_semantic_answer = entry[key].get("semantic_answer")
+                                if mode_semantic_answer is None:
+                                    continue
+                                pending_semantic_similarity.append(
+                                    (
+                                        split_name,
+                                        ex_id,
+                                        mode,
+                                        target,
+                                        float(alpha),
+                                        key,
+                                        str(baseline_semantic_answer),
+                                        str(mode_semantic_answer),
+                                    )
+                                )
+
             results[split_name][ex_id] = entry
             mini_results[split_name][ex_id] = mini_entry
             logging.info("[%s %d/%d] %s first line: %r", split_name, i + 1, len(selected_ids), ex_id, baseline_response[:120])
+
+    if pending_semantic_similarity and sentence_transformer is not None:
+        pairs = [(baseline_text, mode_text) for *_rest, baseline_text, mode_text in pending_semantic_similarity]
+        similarities = batch_compute_semantic_similarities(sentence_transformer, pairs)
+        for task, similarity in zip(pending_semantic_similarity, similarities):
+            split_name, ex_id, mode, target, alpha, key, _baseline_text, _mode_text = task
+            entry = results[split_name][ex_id][key]
+            mini_entry = mini_results[split_name][ex_id][key]
+            entry["semantic_similarity"] = similarity
+            mini_entry["semantic_similarity"] = similarity
+            mode_semantic_similarity_values[mode][target][alpha].append(similarity)
+            vce = entry.get("verbalised_confidence_effect")
+            if vce is not None:
+                uncertainty = compute_uncertainty_score(similarity, float(vce))
+                entry["uncertainty_score"] = uncertainty
+                mini_entry["uncertainty_score"] = uncertainty
+                mode_uncertainty_score_values[mode][target][alpha].append(uncertainty)
+
+    derived_metric_kwargs: Dict[str, object] = {}
+    if compute_derived_metrics:
+        derived_metric_kwargs = {
+            "mode_semantic_similarity_values": mode_semantic_similarity_values,
+            "mode_verbalised_confidence_effect_values": mode_verbalised_confidence_effect_values,
+            "mode_uncertainty_score_values": mode_uncertainty_score_values,
+        }
 
     summary_payload = _build_summary_json(
         non_none_modes=non_none_modes,
@@ -1945,6 +2341,7 @@ def main() -> None:
         mode_confidence_values=mode_confidence_values,
         mode_responses_identical_true=mode_responses_identical_true,
         baseline_values_by_target=baseline_values_by_target,
+        **derived_metric_kwargs,
     )
 
     with open(out_path, "w", encoding="utf-8") as f:
@@ -1978,6 +2375,7 @@ def main() -> None:
         high_conf_count=len(high_ids),
         h5_example_count=len(examples_h5),
         finished_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+        summary_payload=summary_payload if compute_derived_metrics else None,
     )
     logging.info("Wrote %s", out_path)
     logging.info("Wrote %s", mini_out_path)

@@ -46,6 +46,7 @@ from mass_mean_probe.run_mass_mean_probe import (
     _absolute_guess_span_positions,
     _absolute_pre_probability_positions,
     _absolute_prob_positions,
+    _absolute_prob_positions_at_row_indices,
     _as_layer_hidden,
     _dedupe_preserve_order,
     _format_alpha,
@@ -60,6 +61,7 @@ from mass_mean_probe.run_mass_mean_probe import (
     mode_to_output_key,
     parse_ablate_layers,
     parse_mode_confidence_from_response,
+    PROBABILITY_ROW_INDEX_MODES,
     split_answerable_indices,
 )
 
@@ -336,6 +338,33 @@ def _direction_mode_activation_applier_builder(
                 return activation
 
             return _apply_probability_tokens_mean_replace
+
+        if mode in PROBABILITY_ROW_INDEX_MODES:
+            row_indices = PROBABILITY_ROW_INDEX_MODES[mode]
+
+            def _apply_probability_row_indices_mean_replace(
+                activation: torch.Tensor,
+                layer_delta: Dict[str, torch.Tensor],
+            ) -> torch.Tensor:
+                prob_vecs = layer_delta["probability"].to(activation.dtype)
+                prob_positions = _absolute_prob_positions_at_row_indices(
+                    prompt_len,
+                    decoded_tokens_provider(),
+                    row_indices,
+                    expected_probability_tokens=expected_probability_tokens,
+                    expected_confidence_tokens=expected_confidence_tokens,
+                    linguistic_confidence_prompt=linguistic_confidence_prompt,
+                )
+                if not prob_positions:
+                    return activation
+                for row_idx, abs_pos in zip(row_indices, prob_positions):
+                    if row_idx < 0 or row_idx >= prob_vecs.shape[0]:
+                        return activation
+                    if 0 <= abs_pos < activation.shape[1]:
+                        activation[:, abs_pos, :] = activation[:, abs_pos, :] + prob_vecs[row_idx]
+                return activation
+
+            return _apply_probability_row_indices_mean_replace
 
         if mode == "guess_tokens_mean_replace":
 
@@ -927,6 +956,9 @@ def main() -> None:
         default=[
             "none",
             "probability_tokens_mean_replace",
+            "probability_first_token_mean_replace",
+            "probability_first_two_tokens_mean_replace",
+            "probability_first_two_and_index6_tokens_mean_replace",
             "all_pre_probability_tokens_mean_replace",
             "guess_tokens_mean_replace",
             "all_pre_guess_tokens_mean_replace",
@@ -935,6 +967,9 @@ def main() -> None:
         choices=[
             "none",
             "probability_tokens_mean_replace",
+            "probability_first_token_mean_replace",
+            "probability_first_two_tokens_mean_replace",
+            "probability_first_two_and_index6_tokens_mean_replace",
             "all_pre_probability_tokens_mean_replace",
             "guess_tokens_mean_replace",
             "all_pre_guess_tokens_mean_replace",
@@ -1028,7 +1063,7 @@ def main() -> None:
             "probability_tokens_mean_replace",
             "guess_tokens_mean_replace",
             "guess_then_guess_probability_mean_replace",
-        }
+        } | set(PROBABILITY_ROW_INDEX_MODES)
         unsupported_modes = [mode for mode in args.ablation_mode if mode not in normalization_supported_modes]
         if unsupported_modes:
             raise ValueError(

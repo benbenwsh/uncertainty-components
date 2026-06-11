@@ -385,6 +385,10 @@ def mode_to_output_key(mode: str) -> str:
         return "probability_value_mean_replace"
     if mode == "semantic_answer_mean_replace":
         return "semantic_answer_mean_replace"
+    if mode == "prompt_tokens_mean_replace":
+        return "prompt_tokens_mean_replace"
+    if mode == "sem_ans_tokens_during_gen":
+        return "sem_ans_tokens_during_gen"
     raise ValueError(f"Unknown ablation mode: {mode!r}")
 
 
@@ -962,6 +966,23 @@ def _absolute_sem_answer_positions(prompt_len: int, decoded_tokens: List[str]) -
     seq_len = prompt_len + len(decoded_tokens)
     out: List[int] = []
     for k in range(last_guess_token_index, first_prob_token_index):
+        p = _completion_token_index_to_abs_pos(prompt_len, k)
+        if 0 <= p < seq_len:
+            out.append(p)
+    return out
+
+
+def _absolute_sem_answer_positions_during_gen(prompt_len: int, decoded_tokens: List[str]) -> List[int]:
+    """Semantic-answer positions during generation (guess parsed) or after full parse."""
+    full_positions = _absolute_sem_answer_positions(prompt_len, decoded_tokens)
+    if full_positions:
+        return full_positions
+    guess_start = parse_guess_start_index(decoded_tokens)
+    if guess_start is None:
+        return []
+    seq_len = prompt_len + len(decoded_tokens)
+    out: List[int] = []
+    for k in range(guess_start, len(decoded_tokens)):
         p = _completion_token_index_to_abs_pos(prompt_len, k)
         if 0 <= p < seq_len:
             out.append(p)
@@ -1839,6 +1860,134 @@ def greedy_generate_semantic_answer_mean_replaced(
     return _greedy_extend_with_fwd_hooks(model, local_prompt, max_new_tokens, tokens, decoded_tokens, hooks)
 
 
+def build_prompt_tokens_mean_replace_hooks(
+    layer_to_verbalised_embedding_means: Dict[int, Dict[str, torch.Tensor]],
+    *,
+    prompt_len: int,
+    decoded_tokens_provider: Callable[[], List[str]],
+) -> List[Tuple[str, Callable]]:
+    """
+    Dynamic hooks for prompt ablation:
+    - no-op until ``parse_guess_start_index`` succeeds;
+    - replace every prompt token position with the shared ``prompt_mean`` vector.
+    """
+    hooks: List[Tuple[str, Callable]] = []
+    for layer in layer_to_verbalised_embedding_means:
+        hook_name = f"blocks.{layer}.hook_resid_post"
+
+        def _make_hook(layer_idx: int):
+            def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
+                del hook
+                if parse_guess_start_index(decoded_tokens_provider()) is None:
+                    return activation
+
+                region = layer_to_verbalised_embedding_means[layer_idx]
+                prompt_mean = region["prompt_mean"]
+                if prompt_mean.ndim != 1:
+                    raise ValueError(
+                        f"Layer {layer_idx} prompt_mean must be rank-1 [hidden]. "
+                        f"Got {tuple(prompt_mean.shape)}."
+                    )
+
+                shared_vec = prompt_mean.to(activation.dtype)
+                for abs_pos in range(max(0, prompt_len - 1)):
+                    if 0 <= abs_pos < activation.shape[1]:
+                        activation[:, abs_pos, :] = shared_vec
+                return activation
+
+            return hook_fn
+
+        hooks.append((hook_name, _make_hook(layer)))
+    return hooks
+
+
+def greedy_generate_prompt_tokens_mean_replaced(
+    model: HookedTransformer,
+    local_prompt: str,
+    max_new_tokens: int,
+    layer_to_verbalised_embedding_means: Dict[int, Dict[str, torch.Tensor]],
+) -> Tuple[str, List[str]]:
+    tokens = model.to_tokens(local_prompt)
+    prompt_len = int(tokens.shape[1])
+    decoded_tokens: List[str] = []
+
+    def _decoded_tokens() -> List[str]:
+        return decoded_tokens
+
+    hooks = build_prompt_tokens_mean_replace_hooks(
+        layer_to_verbalised_embedding_means=layer_to_verbalised_embedding_means,
+        prompt_len=prompt_len,
+        decoded_tokens_provider=_decoded_tokens,
+    )
+    return _greedy_extend_with_fwd_hooks(model, local_prompt, max_new_tokens, tokens, decoded_tokens, hooks)
+
+
+def build_sem_ans_tokens_during_gen_hooks(
+    layer_to_verbalised_embedding_means: Dict[int, Dict[str, torch.Tensor]],
+    *,
+    prompt_len: int,
+    decoded_tokens_provider: Callable[[], List[str]],
+) -> List[Tuple[str, Callable]]:
+    """
+    Dynamic hooks for semantic-answer ablation during generation:
+    - no-op until ``parse_guess_start_index`` succeeds;
+    - replace semantic-answer tokens generated so far (and keep ablating those positions
+      after the span is complete).
+    """
+    hooks: List[Tuple[str, Callable]] = []
+    for layer in layer_to_verbalised_embedding_means:
+        hook_name = f"blocks.{layer}.hook_resid_post"
+
+        def _make_hook(layer_idx: int):
+            def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
+                del hook
+                sem_positions = _absolute_sem_answer_positions_during_gen(
+                    prompt_len, decoded_tokens_provider()
+                )
+                if not sem_positions:
+                    return activation
+
+                region = layer_to_verbalised_embedding_means[layer_idx]
+                sem_answer_mean = region["sem_answer_mean"]
+                if sem_answer_mean.ndim != 1:
+                    raise ValueError(
+                        f"Layer {layer_idx} sem_answer_mean must be rank-1 [hidden]. "
+                        f"Got {tuple(sem_answer_mean.shape)}."
+                    )
+
+                shared_vec = sem_answer_mean.to(activation.dtype)
+                for abs_pos in sem_positions:
+                    if 0 <= abs_pos < activation.shape[1]:
+                        activation[:, abs_pos, :] = shared_vec
+                return activation
+
+            return hook_fn
+
+        hooks.append((hook_name, _make_hook(layer)))
+    return hooks
+
+
+def greedy_generate_sem_ans_tokens_during_gen(
+    model: HookedTransformer,
+    local_prompt: str,
+    max_new_tokens: int,
+    layer_to_verbalised_embedding_means: Dict[int, Dict[str, torch.Tensor]],
+) -> Tuple[str, List[str]]:
+    tokens = model.to_tokens(local_prompt)
+    prompt_len = int(tokens.shape[1])
+    decoded_tokens: List[str] = []
+
+    def _decoded_tokens() -> List[str]:
+        return decoded_tokens
+
+    hooks = build_sem_ans_tokens_during_gen_hooks(
+        layer_to_verbalised_embedding_means=layer_to_verbalised_embedding_means,
+        prompt_len=prompt_len,
+        decoded_tokens_provider=_decoded_tokens,
+    )
+    return _greedy_extend_with_fwd_hooks(model, local_prompt, max_new_tokens, tokens, decoded_tokens, hooks)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1894,6 +2043,8 @@ def main() -> None:
             "probability_first_two_and_index6_tokens_mean_replace",
             "probability_value_mean_replace",
             "semantic_answer_mean_replace",
+            "prompt_tokens_mean_replace",
+            "sem_ans_tokens_during_gen",
         ],
         choices=[
             "none",
@@ -1909,6 +2060,8 @@ def main() -> None:
             "probability_first_two_and_index6_tokens_mean_replace",
             "probability_value_mean_replace",
             "semantic_answer_mean_replace",
+            "prompt_tokens_mean_replace",
+            "sem_ans_tokens_during_gen",
         ],
         help=(
             "One or more modes to run. none: no hooks. probability_tokens_mean_replace: "
@@ -1930,6 +2083,10 @@ def main() -> None:
             "probability[-1] for the first position and embeddings_mean_prob_val mean for later positions. "
             "semantic_answer_mean_replace: no hooks until Guess/Probability parse succeeds; then replace "
             "every semantic-answer token with the shared embeddings_mean_sem_answer group mean. "
+            "prompt_tokens_mean_replace: no-op until Guess: prefix parses; then replace all prompt token "
+            "positions with the shared embeddings_mean_prompt group mean. "
+            "sem_ans_tokens_during_gen: no-op until Guess: prefix parses; replace semantic-answer tokens "
+            "generated so far (and keep ablating those positions after the span is complete). "
         ),
     )
     parser.add_argument("--low_conf_threshold", type=float, default=0.1)
@@ -2018,6 +2175,8 @@ def main() -> None:
         or "guess_then_guess_and_probability_tokens_mean_replace" in modes
         or "probability_value_mean_replace" in modes
         or "semantic_answer_mean_replace" in modes
+        or "prompt_tokens_mean_replace" in modes
+        or "sem_ans_tokens_during_gen" in modes
     )
 
     low_ids: set[str]
@@ -2391,6 +2550,38 @@ def main() -> None:
                                 "Mode semantic_answer_mean_replace requested but verbalised embedding means are unavailable."
                             )
                         response, decoded_tokens = greedy_generate_semantic_answer_mean_replaced(
+                            model=model,
+                            local_prompt=local_prompt,
+                            max_new_tokens=args.model_max_new_tokens,
+                            layer_to_verbalised_embedding_means=layer_to_verbalised_embedding_means_eval,
+                        )
+                        mode_confidence = (
+                            parse_mode_confidence_from_response(response)
+                            if args.parse_mode_verbalised_confidence
+                            else None
+                        )
+                    elif mode == "prompt_tokens_mean_replace":
+                        if layer_to_verbalised_embedding_means_eval is None:
+                            raise ValueError(
+                                "Mode prompt_tokens_mean_replace requested but verbalised embedding means are unavailable."
+                            )
+                        response, decoded_tokens = greedy_generate_prompt_tokens_mean_replaced(
+                            model=model,
+                            local_prompt=local_prompt,
+                            max_new_tokens=args.model_max_new_tokens,
+                            layer_to_verbalised_embedding_means=layer_to_verbalised_embedding_means_eval,
+                        )
+                        mode_confidence = (
+                            parse_mode_confidence_from_response(response)
+                            if args.parse_mode_verbalised_confidence
+                            else None
+                        )
+                    elif mode == "sem_ans_tokens_during_gen":
+                        if layer_to_verbalised_embedding_means_eval is None:
+                            raise ValueError(
+                                "Mode sem_ans_tokens_during_gen requested but verbalised embedding means are unavailable."
+                            )
+                        response, decoded_tokens = greedy_generate_sem_ans_tokens_during_gen(
                             model=model,
                             local_prompt=local_prompt,
                             max_new_tokens=args.model_max_new_tokens,

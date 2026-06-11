@@ -29,3 +29,5 @@ python3 ./mass_mean_probe_nl/run_mass_mean_probe_nl.py \
   --high_conf_threshold 0.9 \
   --no-enable_brief \
   --new_h5_format \
+  --probability_last_direction_only \
+  --ablation_mode none generated_tokens_mean_replace

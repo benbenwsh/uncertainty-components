@@ -28,6 +28,7 @@ from blockwise_zero_ablation.run_blockwise_zero_ablation import (
     _absolute_prob_except_last_token_positions,
     _absolute_prob_last_token_only_positions,
     _absolute_prob_positions,
+    _absolute_prob_positions_at_row_indices,
     _normalize_per_layer_mode_means,
     collect_confidence_group_ids,
     construct_fewshot_prompt_from_indices,
@@ -43,6 +44,7 @@ from blockwise_zero_ablation.run_blockwise_zero_ablation import (
     write_individual_layer_plots,
 )
 from layerwise_mean_ablation.run_mean_ablation import (
+    PROBABILITY_ROW_INDEX_MODES,
     _absolute_probability_value_start_position,
     _as_layer_hidden,
     _is_expected_or_plus_one,
@@ -375,6 +377,19 @@ def _positions_and_replacements_for_mode(
         vectors = [probability[i] for i in range(min(len(positions), int(probability.shape[0])))]
         return positions[: len(vectors)], vectors
 
+    if mode in PROBABILITY_ROW_INDEX_MODES:
+        row_indices = PROBABILITY_ROW_INDEX_MODES[mode]
+        positions = _absolute_prob_positions_at_row_indices(
+            prompt_len,
+            decoded_tokens,
+            row_indices,
+            expected_probability_tokens=int(probability.shape[0]),
+        )
+        if not positions:
+            return [], []
+        vectors = [probability[i] for i in row_indices]
+        return positions, vectors
+
     if mode == "probability_last_token_mean_replace":
         positions = _absolute_prob_last_token_only_positions(
             prompt_len,
@@ -599,6 +614,9 @@ def main() -> None:
         default=[
             "none",
             "probability_tokens_mean_replace",
+            "probability_first_token_mean_replace",
+            "probability_first_two_tokens_mean_replace",
+            "probability_first_two_and_index6_tokens_mean_replace",
             "probability_last_token_mean_replace",
             "probability_span_except_last_token_mean_replace",
             "all_pre_probability_tokens_mean_replace",
@@ -611,6 +629,9 @@ def main() -> None:
         choices=[
             "none",
             "probability_tokens_mean_replace",
+            "probability_first_token_mean_replace",
+            "probability_first_two_tokens_mean_replace",
+            "probability_first_two_and_index6_tokens_mean_replace",
             "probability_last_token_mean_replace",
             "probability_span_except_last_token_mean_replace",
             "all_pre_probability_tokens_mean_replace",
@@ -621,7 +642,12 @@ def main() -> None:
             "current_generated_token_mean_replace",
         ],
         help=(
-            "One or more ablation modes. probability_last_token_mean_replace: mean-replace only the "
+            "One or more ablation modes. probability_first_token_mean_replace: same gating as "
+            "probability_tokens_mean_replace but only H5 probability row 0. "
+            "probability_first_two_tokens_mean_replace: rows 0 and 1. "
+            "probability_first_two_and_index6_tokens_mean_replace: "
+            "same gating as probability_tokens_mean_replace but only H5 probability rows 0, 1, and 6 "
+            "(fixed index 6, not -1). probability_last_token_mean_replace: mean-replace only the "
             "last token of the H5 probability span (end_prob; first value digit). "
             "probability_span_except_last_token_mean_replace: mean-replace all probability-span tokens "
             "except that last token (all marker-span tokens before end_prob). "

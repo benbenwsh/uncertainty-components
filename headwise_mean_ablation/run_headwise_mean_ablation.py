@@ -6,7 +6,7 @@ import random
 import sys
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -65,7 +65,7 @@ ABLATION_MODES_DEFAULT = [
     "probability_value_mean_replace",
     "current_generated_token_mean_replace",
 ]
-ABLATION_UNIT_MODES = ["head", "grouped_head", "whole_concat"]
+ABLATION_UNIT_MODES = ["head", "whole_concat"]
 
 
 def resolve_output_json_path(cli_output_path: Optional[str]) -> str:
@@ -88,23 +88,56 @@ def config_txt_path(mini_output_path: str) -> str:
     return os.path.join(os.path.dirname(mini_output_path), "config.txt")
 
 
-def parse_head_indices(spec: Optional[str], n_heads: int) -> List[int]:
-    if spec is None or spec.strip().lower() == "all":
-        return list(range(n_heads))
-    spec = spec.strip()
-    if "-" in spec and "," not in spec:
-        a, b = spec.split("-", 1)
-        heads = list(range(int(a.strip()), int(b.strip()) + 1))
-    else:
-        heads = [int(x.strip()) for x in spec.split(",") if x.strip()]
-    for head_idx in heads:
+def parse_layer_head_pairs(spec: str, *, n_layers: int, n_heads: int) -> Dict[int, List[int]]:
+    raw = (spec or "").strip()
+    if not raw:
+        raise ValueError("--ablate_heads_by_layer must be a non-empty comma-separated <layer>.<head> list.")
+    out: Dict[int, Set[int]] = {}
+    for token in raw.split(","):
+        item = token.strip()
+        if not item:
+            continue
+        if item.count(".") != 1:
+            raise ValueError(
+                f"Invalid head token {item!r}. Expected format <layer_idx>.<head_idx>, e.g. 12.3."
+            )
+        layer_str, head_str = item.split(".", 1)
+        try:
+            layer_idx = int(layer_str)
+            head_idx = int(head_str)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid head token {item!r}. layer/head must be integers in <layer_idx>.<head_idx>."
+            ) from exc
+        if layer_idx < 0 or layer_idx >= n_layers:
+            raise ValueError(f"Layer index {layer_idx} out of range [0, {n_layers}).")
         if head_idx < 0 or head_idx >= n_heads:
             raise ValueError(f"Head index {head_idx} out of range [0, {n_heads}).")
-    return heads
+        out.setdefault(layer_idx, set()).add(head_idx)
+    if not out:
+        raise ValueError("No valid <layer_idx>.<head_idx> entries found in --ablate_heads_by_layer.")
+    return {layer: sorted(heads) for layer, heads in sorted(out.items())}
 
 
-def _is_all_heads_spec(spec: Optional[str]) -> bool:
-    return spec is None or spec.strip().lower() == "all"
+def format_layer_head_pairs(layer_to_heads: Dict[int, Sequence[int]]) -> str:
+    parts: List[str] = []
+    for layer_idx in sorted(layer_to_heads):
+        for head_idx in sorted(set(int(h) for h in layer_to_heads[layer_idx])):
+            parts.append(f"{layer_idx}.{head_idx}")
+    return ",".join(parts)
+
+
+def selected_kv_heads_by_layer(
+    selected_heads_by_layer: Dict[int, Sequence[int]],
+    *,
+    kv_heads_per_query_group: int,
+) -> Dict[int, List[int]]:
+    out: Dict[int, Set[int]] = {}
+    for layer, heads in selected_heads_by_layer.items():
+        for head_idx in heads:
+            kv_idx = int(head_idx) // int(kv_heads_per_query_group)
+            out.setdefault(int(layer), set()).add(kv_idx)
+    return {layer: sorted(heads) for layer, heads in sorted(out.items())}
 
 
 def resolve_n_key_value_heads(model_cfg, n_heads: int) -> int:
@@ -126,21 +159,6 @@ def resolve_n_key_value_heads(model_cfg, n_heads: int) -> int:
                 )
             return n_kv_heads
     return int(n_heads)
-
-
-def build_grouped_head_units(*, n_heads: int, n_kv_heads: int) -> Dict[str, List[int]]:
-    if n_kv_heads <= 0:
-        raise ValueError(f"n_kv_heads must be > 0, got {n_kv_heads}.")
-    if n_heads % n_kv_heads != 0:
-        raise ValueError(
-            f"Cannot build grouped heads: n_heads={n_heads} not divisible by n_kv_heads={n_kv_heads}."
-        )
-    n_rep = n_heads // n_kv_heads
-    grouped_units: Dict[str, List[int]] = {}
-    for kv_idx in range(n_kv_heads):
-        start = kv_idx * n_rep
-        grouped_units[f"group_{kv_idx}"] = list(range(start, start + n_rep))
-    return grouped_units
 
 
 def _validate_concat_field(resp0: dict, ex_id: str, field_name: str):
@@ -712,14 +730,16 @@ def _build_layer_head_means(
     means: Dict[str, np.ndarray],
     *,
     ablate_layers: Sequence[int],
-    head_indices: Sequence[int],
+    selected_heads_by_layer: Dict[int, Sequence[int]],
     device: str,
     torch_dtype: torch.dtype,
 ) -> Dict[int, Dict[int, Dict[str, torch.Tensor]]]:
+    layer_to_local_idx = {int(layer): i for i, layer in enumerate(ablate_layers)}
     out: Dict[int, Dict[int, Dict[str, torch.Tensor]]] = {}
-    for layer_i, layer in enumerate(ablate_layers):
+    for layer in ablate_layers:
+        layer_i = layer_to_local_idx[int(layer)]
         out[int(layer)] = {}
-        for head_idx in head_indices:
+        for head_idx in selected_heads_by_layer.get(int(layer), []):
             out[int(layer)][int(head_idx)] = {
                 "prompt_mean": torch.tensor(
                     means["prompt_mean"][layer_i, head_idx], device=device, dtype=torch_dtype
@@ -742,14 +762,16 @@ def _build_layer_kv_head_means(
     means: Dict[str, np.ndarray],
     *,
     ablate_layers: Sequence[int],
-    kv_head_indices: Sequence[int],
+    selected_kv_heads_by_layer: Dict[int, Sequence[int]],
     device: str,
     torch_dtype: torch.dtype,
 ) -> Dict[int, Dict[int, Dict[str, torch.Tensor]]]:
+    layer_to_local_idx = {int(layer): i for i, layer in enumerate(ablate_layers)}
     out: Dict[int, Dict[int, Dict[str, torch.Tensor]]] = {}
-    for layer_i, layer in enumerate(ablate_layers):
+    for layer in ablate_layers:
+        layer_i = layer_to_local_idx[int(layer)]
         out[int(layer)] = {}
-        for kv_head_idx in kv_head_indices:
+        for kv_head_idx in selected_kv_heads_by_layer.get(int(layer), []):
             out[int(layer)][int(kv_head_idx)] = {
                 "prompt_mean": torch.tensor(
                     means["prompt_mean"][layer_i, kv_head_idx], device=device, dtype=torch_dtype
@@ -947,139 +969,25 @@ def _positions_and_replacements_for_mode(
     raise ValueError(f"Unsupported mode for mean replacement: {mode!r}")
 
 
-def build_headwise_mean_replace_hooks(
-    layer_indices: Sequence[int],
-    *,
-    mode: str,
-    prompt_len: int,
-    decoded_tokens_provider: Callable[[], List[str]],
-    layer_to_means: Dict[int, Dict[str, torch.Tensor]],
-    head_idx: int,
-) -> List[Tuple[str, Callable]]:
-    head_idx = int(head_idx)
-    hooks: List[Tuple[str, Callable]] = []
-    for layer in layer_indices:
-        hook_name = f"blocks.{layer}.attn.hook_z"
-        layer_means = layer_to_means[int(layer)]
-
-        def _make_hook(local_layer_means: Dict[str, torch.Tensor]) -> Callable:
-            def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
-                del hook
-                if activation.ndim != 4:
-                    raise ValueError(
-                        f"Expected hook_z activation with shape [batch, seq, heads, d_head], got {tuple(activation.shape)}."
-                    )
-                if not (0 <= head_idx < activation.shape[2]):
-                    raise ValueError(
-                        f"Head index {head_idx} out of range for hook_z activation with {activation.shape[2]} heads."
-                    )
-                decoded_tokens = decoded_tokens_provider()
-                positions, vectors = _positions_and_replacements_for_mode(
-                    mode=mode,
-                    prompt_len=prompt_len,
-                    decoded_tokens=decoded_tokens,
-                    layer_head_means=local_layer_means,
-                )
-                if not positions:
-                    return activation
-                for abs_pos, vector in zip(positions, vectors):
-                    if 0 <= abs_pos < activation.shape[1]:
-                        if int(vector.numel()) != int(activation.shape[3]):
-                            raise ValueError(
-                                f"Replacement vector size {vector.numel()} does not match d_head {activation.shape[3]}."
-                            )
-                        activation[:, abs_pos, head_idx, :] = vector.to(
-                            device=activation.device, dtype=activation.dtype
-                        )
-                return activation
-
-            return hook_fn
-
-        hooks.append((hook_name, _make_hook(layer_means)))
-    return hooks
-
-
-def greedy_generate_headwise_mean_ablated(
-    model,
-    local_prompt: str,
-    max_new_tokens: int,
-    *,
-    layer_indices: Sequence[int],
-    mode: str,
-    layer_to_means: Dict[int, Dict[str, torch.Tensor]],
-    head_idx: int,
-    kv_layer_to_k_means: Optional[Dict[int, Dict[str, torch.Tensor]]] = None,
-    kv_layer_to_v_means: Optional[Dict[int, Dict[str, torch.Tensor]]] = None,
-    kv_head_idx: Optional[int] = None,
-) -> Tuple[str, List[str]]:
-    tokens = model.to_tokens(local_prompt)
-    prompt_len = int(tokens.shape[1])
-    decoded_tokens: List[str] = []
-
-    def _decoded_tokens_provider() -> List[str]:
-        return decoded_tokens
-
-    hooks = build_headwise_mean_replace_hooks(
-        layer_indices=layer_indices,
-        mode=mode,
-        prompt_len=prompt_len,
-        decoded_tokens_provider=_decoded_tokens_provider,
-        layer_to_means=layer_to_means,
-        head_idx=head_idx,
-    )
-    if kv_layer_to_k_means is not None and kv_layer_to_v_means is not None:
-        if kv_head_idx is None:
-            raise ValueError("kv_head_idx is required when KV mean replacement is enabled.")
-        hooks.extend(
-            build_kv_headwise_mean_replace_hooks(
-                layer_indices=layer_indices,
-                kv_name="k",
-                mode=mode,
-                prompt_len=prompt_len,
-                decoded_tokens_provider=_decoded_tokens_provider,
-                layer_to_means=kv_layer_to_k_means,
-                kv_head_idx=kv_head_idx,
-            )
-        )
-        hooks.extend(
-            build_kv_headwise_mean_replace_hooks(
-                layer_indices=layer_indices,
-                kv_name="v",
-                mode=mode,
-                prompt_len=prompt_len,
-                decoded_tokens_provider=_decoded_tokens_provider,
-                layer_to_means=kv_layer_to_v_means,
-                kv_head_idx=kv_head_idx,
-            )
-        )
-    return greedy_generate(
-        model=model,
-        local_prompt=local_prompt,
-        max_new_tokens=max_new_tokens,
-        fwd_hooks=hooks,
-        decoded_tokens_buffer=decoded_tokens,
-    )
-
-
-def build_grouped_head_mean_replace_hooks(
+def build_selected_layer_heads_mean_replace_hooks(
     layer_indices: Sequence[int],
     *,
     mode: str,
     prompt_len: int,
     decoded_tokens_provider: Callable[[], List[str]],
     layer_to_head_means: Dict[int, Dict[int, Dict[str, torch.Tensor]]],
-    grouped_head_indices: Sequence[int],
+    selected_heads_by_layer: Dict[int, Sequence[int]],
 ) -> List[Tuple[str, Callable]]:
     hooks: List[Tuple[str, Callable]] = []
-    grouped_head_indices = [int(head_idx) for head_idx in grouped_head_indices]
-    if not grouped_head_indices:
-        raise ValueError("grouped_head_indices cannot be empty.")
     for layer in layer_indices:
         hook_name = f"blocks.{layer}.attn.hook_z"
         layer_head_means = layer_to_head_means[int(layer)]
+        local_heads = [int(h) for h in selected_heads_by_layer.get(int(layer), [])]
+        if not local_heads:
+            raise ValueError(f"No selected heads for layer {layer}.")
 
         def _make_hook(
-            local_layer_head_means: Dict[int, Dict[str, torch.Tensor]], *, local_layer: int
+            local_layer_head_means: Dict[int, Dict[str, torch.Tensor]], *, local_layer: int, heads_for_layer: List[int]
         ) -> Callable:
             def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
                 del hook
@@ -1088,9 +996,7 @@ def build_grouped_head_mean_replace_hooks(
                         f"Expected hook_z activation with shape [batch, seq, heads, d_head], got {tuple(activation.shape)}."
                     )
                 decoded_tokens = decoded_tokens_provider()
-                positions: Optional[List[int]] = None
-                replacements_by_head: Dict[int, List[torch.Tensor]] = {}
-                for head_idx in grouped_head_indices:
+                for head_idx in heads_for_layer:
                     if not (0 <= head_idx < activation.shape[2]):
                         raise ValueError(
                             f"Head index {head_idx} out of range for hook_z activation with {activation.shape[2]} heads."
@@ -1098,29 +1004,16 @@ def build_grouped_head_mean_replace_hooks(
                     head_means = local_layer_head_means.get(head_idx)
                     if head_means is None:
                         raise ValueError(
-                            f"Missing grouped-head means for layer {local_layer}, head {head_idx}."
+                            f"Missing head means for layer {local_layer}, head {head_idx}."
                         )
-                    head_positions, head_vectors = _positions_and_replacements_for_mode(
+                    positions, vectors = _positions_and_replacements_for_mode(
                         mode=mode,
                         prompt_len=prompt_len,
                         decoded_tokens=decoded_tokens,
                         layer_head_means=head_means,
                     )
-                    if positions is None:
-                        positions = head_positions
-                    elif positions != head_positions:
-                        raise ValueError(
-                            f"Inconsistent replacement positions for grouped heads at layer {local_layer}: "
-                            f"expected {positions}, got {head_positions} for head {head_idx}."
-                        )
-                    replacements_by_head[head_idx] = head_vectors
-
-                if not positions:
-                    return activation
-                for pos_i, abs_pos in enumerate(positions):
-                    if 0 <= abs_pos < activation.shape[1]:
-                        for head_idx in grouped_head_indices:
-                            vector = replacements_by_head[head_idx][pos_i]
+                    for abs_pos, vector in zip(positions, vectors):
+                        if 0 <= abs_pos < activation.shape[1]:
                             if int(vector.numel()) != int(activation.shape[3]):
                                 raise ValueError(
                                     f"Replacement vector size {vector.numel()} does not match d_head {activation.shape[3]}."
@@ -1132,11 +1025,11 @@ def build_grouped_head_mean_replace_hooks(
 
             return hook_fn
 
-        hooks.append((hook_name, _make_hook(layer_head_means, local_layer=int(layer))))
+        hooks.append((hook_name, _make_hook(layer_head_means, local_layer=int(layer), heads_for_layer=local_heads)))
     return hooks
 
 
-def greedy_generate_grouped_head_mean_ablated(
+def greedy_generate_selected_layer_heads_mean_ablated(
     model,
     local_prompt: str,
     max_new_tokens: int,
@@ -1144,10 +1037,10 @@ def greedy_generate_grouped_head_mean_ablated(
     layer_indices: Sequence[int],
     mode: str,
     layer_to_head_means: Dict[int, Dict[int, Dict[str, torch.Tensor]]],
-    grouped_head_indices: Sequence[int],
-    kv_layer_to_k_means: Optional[Dict[int, Dict[str, torch.Tensor]]] = None,
-    kv_layer_to_v_means: Optional[Dict[int, Dict[str, torch.Tensor]]] = None,
-    kv_head_idx: Optional[int] = None,
+    selected_heads_by_layer: Dict[int, Sequence[int]],
+    kv_layer_to_k_head_means: Optional[Dict[int, Dict[int, Dict[str, torch.Tensor]]]] = None,
+    kv_layer_to_v_head_means: Optional[Dict[int, Dict[int, Dict[str, torch.Tensor]]]] = None,
+    selected_kv_heads_by_layer: Optional[Dict[int, Sequence[int]]] = None,
 ) -> Tuple[str, List[str]]:
     tokens = model.to_tokens(local_prompt)
     prompt_len = int(tokens.shape[1])
@@ -1156,37 +1049,37 @@ def greedy_generate_grouped_head_mean_ablated(
     def _decoded_tokens_provider() -> List[str]:
         return decoded_tokens
 
-    hooks = build_grouped_head_mean_replace_hooks(
+    hooks = build_selected_layer_heads_mean_replace_hooks(
         layer_indices=layer_indices,
         mode=mode,
         prompt_len=prompt_len,
         decoded_tokens_provider=_decoded_tokens_provider,
         layer_to_head_means=layer_to_head_means,
-        grouped_head_indices=grouped_head_indices,
+        selected_heads_by_layer=selected_heads_by_layer,
     )
-    if kv_layer_to_k_means is not None and kv_layer_to_v_means is not None:
-        if kv_head_idx is None:
-            raise ValueError("kv_head_idx is required when KV mean replacement is enabled.")
+    if kv_layer_to_k_head_means is not None and kv_layer_to_v_head_means is not None:
+        if selected_kv_heads_by_layer is None:
+            raise ValueError("selected_kv_heads_by_layer is required when KV mean replacement is enabled.")
         hooks.extend(
-            build_kv_headwise_mean_replace_hooks(
+            build_selected_layer_kv_heads_mean_replace_hooks(
                 layer_indices=layer_indices,
                 kv_name="k",
                 mode=mode,
                 prompt_len=prompt_len,
                 decoded_tokens_provider=_decoded_tokens_provider,
-                layer_to_means=kv_layer_to_k_means,
-                kv_head_idx=kv_head_idx,
+                layer_to_kv_head_means=kv_layer_to_k_head_means,
+                selected_kv_heads_by_layer=selected_kv_heads_by_layer,
             )
         )
         hooks.extend(
-            build_kv_headwise_mean_replace_hooks(
+            build_selected_layer_kv_heads_mean_replace_hooks(
                 layer_indices=layer_indices,
                 kv_name="v",
                 mode=mode,
                 prompt_len=prompt_len,
                 decoded_tokens_provider=_decoded_tokens_provider,
-                layer_to_means=kv_layer_to_v_means,
-                kv_head_idx=kv_head_idx,
+                layer_to_kv_head_means=kv_layer_to_v_head_means,
+                selected_kv_heads_by_layer=selected_kv_heads_by_layer,
             )
         )
     return greedy_generate(
@@ -1250,6 +1143,75 @@ def build_concat_mean_replace_hooks(
             return hook_fn
 
         hooks.append((hook_name, _make_hook(layer_means)))
+    return hooks
+
+
+def build_selected_layer_kv_heads_mean_replace_hooks(
+    layer_indices: Sequence[int],
+    *,
+    kv_name: str,
+    mode: str,
+    prompt_len: int,
+    decoded_tokens_provider: Callable[[], List[str]],
+    layer_to_kv_head_means: Dict[int, Dict[int, Dict[str, torch.Tensor]]],
+    selected_kv_heads_by_layer: Dict[int, Sequence[int]],
+) -> List[Tuple[str, Callable]]:
+    if kv_name not in ("k", "v"):
+        raise ValueError(f"Unsupported kv_name {kv_name!r}; expected 'k' or 'v'.")
+    hooks: List[Tuple[str, Callable]] = []
+    for layer in layer_indices:
+        hook_name = f"blocks.{layer}.attn.hook_{kv_name}"
+        layer_kv_head_means = layer_to_kv_head_means[int(layer)]
+        local_kv_heads = [int(h) for h in selected_kv_heads_by_layer.get(int(layer), [])]
+        if not local_kv_heads:
+            raise ValueError(f"No selected KV heads for layer {layer}.")
+
+        def _make_hook(
+            local_layer_kv_head_means: Dict[int, Dict[str, torch.Tensor]],
+            *,
+            local_layer: int,
+            kv_heads_for_layer: List[int],
+        ) -> Callable:
+            def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
+                del hook
+                if activation.ndim != 4:
+                    raise ValueError(
+                        f"Expected hook_{kv_name} activation with shape [batch, seq, kv_heads, d_head], got {tuple(activation.shape)}."
+                    )
+                decoded_tokens = decoded_tokens_provider()
+                for kv_head_idx in kv_heads_for_layer:
+                    if not (0 <= kv_head_idx < activation.shape[2]):
+                        raise ValueError(
+                            f"KV head index {kv_head_idx} out of range for hook_{kv_name} activation with {activation.shape[2]} heads."
+                        )
+                    kv_head_means = local_layer_kv_head_means.get(kv_head_idx)
+                    if kv_head_means is None:
+                        raise ValueError(
+                            f"Missing KV head means for layer {local_layer}, kv_head {kv_head_idx}."
+                        )
+                    positions, vectors = _positions_and_replacements_for_mode(
+                        mode=mode,
+                        prompt_len=prompt_len,
+                        decoded_tokens=decoded_tokens,
+                        layer_head_means=kv_head_means,
+                    )
+                    for abs_pos, vector in zip(positions, vectors):
+                        if 0 <= abs_pos < activation.shape[1]:
+                            if int(vector.numel()) != int(activation.shape[3]):
+                                raise ValueError(
+                                    f"KV replacement vector size {vector.numel()} does not match d_head {activation.shape[3]} "
+                                    f"for hook_{kv_name} at layer {local_layer}."
+                                )
+                            activation[:, abs_pos, kv_head_idx, :] = vector.to(
+                                device=activation.device, dtype=activation.dtype
+                            )
+                return activation
+
+            return hook_fn
+
+        hooks.append(
+            (hook_name, _make_hook(layer_kv_head_means, local_layer=int(layer), kv_heads_for_layer=local_kv_heads))
+        )
     return hooks
 
 
@@ -1500,46 +1462,6 @@ def write_headwise_mode_plots(
         logging.info("Wrote %s", plot_path)
 
 
-def write_grouped_mode_plots(
-    *,
-    mode_group_confidence_means: Dict[str, Dict[int, Optional[float]]],
-    ablation_modes: Sequence[str],
-    group_indices: Sequence[int],
-    output_dir: str,
-) -> None:
-    group_order = sorted(int(g) for g in group_indices)
-    baseline_none = mode_group_confidence_means.get("none", {})
-    baseline_values = [v for v in baseline_none.values() if v is not None]
-    baseline_mean = float(np.mean(baseline_values)) if baseline_values else None
-
-    for mode_name in ablation_modes:
-        if mode_name == "none":
-            continue
-        ys: List[Optional[float]] = [mode_group_confidence_means.get(mode_name, {}).get(g) for g in group_order]
-        valid_pairs = [(g, y) for g, y in zip(group_order, ys) if y is not None]
-        if not valid_pairs and baseline_mean is None:
-            continue
-
-        fig, ax = plt.subplots(figsize=(12, 5))
-        if valid_pairs:
-            xs = [g for g, _ in valid_pairs]
-            yvals = [float(y) for _, y in valid_pairs]
-            ax.plot(xs, yvals, marker="o", label=mode_name)
-        if baseline_mean is not None:
-            ax.axhline(y=baseline_mean, linestyle="--", label="none (baseline)")
-        ax.set_xlabel("Group index")
-        ax.set_ylabel("Verbalised confidence")
-        ax.set_ylim(0.0, 1.0)
-        ax.set_title(f"Grouped-head verbalised confidence ({mode_name})")
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-        fig.tight_layout()
-        plot_path = os.path.join(output_dir, f"verbalised_confidence_by_group__{mode_name}.png")
-        fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        logging.info("Wrote %s", plot_path)
-
-
 def write_config_txt(
     path: str,
     *,
@@ -1549,7 +1471,8 @@ def write_config_txt(
     model_n_heads: int,
     model_d_head: int,
     ablate_layers: Sequence[int],
-    ablate_heads: Sequence[int],
+    selected_heads_by_layer: Dict[int, Sequence[int]],
+    num_selected_layer_head_pairs: int,
     ablation_unit_mode: str,
     ablation_unit_keys: Sequence[str],
     prompt_indices: Sequence[int],
@@ -1597,12 +1520,12 @@ def write_config_txt(
         f"ablation_target_group={target_group}",
         f"ablate_layers_spec={args.ablate_layers}",
         f"ablate_layers_resolved={','.join(str(layer) for layer in ablate_layers)}",
-        f"ablate_heads_spec={args.ablate_heads}",
-        f"ablate_heads_resolved={','.join(str(head) for head in ablate_heads) if ablate_heads else 'ignored'}",
+        f"ablate_heads_by_layer_spec={args.ablate_heads_by_layer}",
+        f"ablate_heads_by_layer_resolved={format_layer_head_pairs(selected_heads_by_layer) if selected_heads_by_layer else 'ignored'}",
         f"ablation_unit_mode={ablation_unit_mode}",
         f"ablate_kv_mean={args.ablate_kv_mean}",
         f"num_ablated_layers={len(ablate_layers)}",
-        f"num_ablated_heads={len(ablate_heads) if ablation_unit_mode != 'whole_concat' else 0}",
+        f"num_ablated_layer_head_pairs={num_selected_layer_head_pairs}",
         f"num_ablation_units={len(ablation_unit_keys)}",
         f"ablation_units={','.join(ablation_unit_keys)}",
         f"expected_probability_tokens={args.expected_probability_tokens}",
@@ -1664,12 +1587,12 @@ def main() -> None:
     parser.add_argument("--use_context", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--ablate_layers", type=str, default="12-15")
     parser.add_argument(
-        "--ablate_heads",
+        "--ablate_heads_by_layer",
         type=str,
-        default="all",
+        default=None,
         help=(
-            "Head indices to ablate: 'all', inclusive range '0-31', or list '0,2,4'. "
-            "When --ablation_unit_mode=grouped_head, this must be 'all'."
+            "Optional comma-separated <layer>.<head> list, e.g. '12.3,12.7,13.2'. "
+            "When set, this selection takes precedence and --ablate_layers is ignored."
         ),
     )
     parser.add_argument(
@@ -1678,8 +1601,7 @@ def main() -> None:
         default="head",
         choices=ABLATION_UNIT_MODES,
         help=(
-            "Atomic ablation unit: 'head' ablates each selected head individually, "
-            "'grouped_head' ablates each GQA grouped-head unit (requires --ablate_heads=all), "
+            "Atomic ablation unit: 'head' ablates all selected layer-head pairs simultaneously, "
             "and 'whole_concat' ablates the full concatenated embedding as one unit."
         ),
     )
@@ -1712,10 +1634,6 @@ def main() -> None:
     if "none" not in args.ablation_mode:
         raise ValueError("Please include 'none' in --ablation_mode for baseline plotting.")
     ablation_unit_mode = str(args.ablation_unit_mode)
-    if ablation_unit_mode == "grouped_head" and not _is_all_heads_spec(args.ablate_heads):
-        raise ValueError(
-            "When --ablation_unit_mode=grouped_head, --ablate_heads must be 'all'."
-        )
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -1757,21 +1675,59 @@ def main() -> None:
     model_n_kv_heads = resolve_n_key_value_heads(model.cfg, model_n_heads)
     kv_heads_per_query_group = model_n_heads // model_n_kv_heads
 
-    ablate_layers = parse_ablate_layers(args.ablate_layers, model_n_layers)
+    ablate_layers_from_flag = parse_ablate_layers(args.ablate_layers, model_n_layers)
+    if not ablate_layers_from_flag and not args.ablate_heads_by_layer:
+        raise ValueError("No layers selected via --ablate_layers.")
+
     if ablation_unit_mode == "whole_concat":
-        ablate_heads: List[int] = []
+        run_layers = sorted(ablate_layers_from_flag)
+        selected_heads_by_layer: Dict[int, List[int]] = {}
         logging.info(
-            "ablation_unit_mode=whole_concat: ignoring --ablate_heads=%s",
-            args.ablate_heads,
+            "ablation_unit_mode=whole_concat: ignoring --ablate_heads_by_layer=%s",
+            args.ablate_heads_by_layer,
+        )
+    elif args.ablate_heads_by_layer:
+        selected_heads_by_layer = parse_layer_head_pairs(
+            args.ablate_heads_by_layer, n_layers=model_n_layers, n_heads=model_n_heads
+        )
+        run_layers = sorted(selected_heads_by_layer.keys())
+        if not run_layers:
+            raise ValueError("No layers selected via --ablate_heads_by_layer.")
+        logging.info(
+            "Using --ablate_heads_by_layer selection; ignoring --ablate_layers=%s.",
+            args.ablate_layers,
         )
     else:
-        ablate_heads = parse_head_indices(args.ablate_heads, model_n_heads)
+        run_layers = sorted(ablate_layers_from_flag)
+        selected_heads_by_layer = {layer: list(range(model_n_heads)) for layer in run_layers}
+        logging.info(
+            "No --ablate_heads_by_layer provided; using all heads across --ablate_layers=%s.",
+            args.ablate_layers,
+        )
+
+    if ablation_unit_mode == "head":
+        missing_layer_heads = [layer for layer in run_layers if not selected_heads_by_layer.get(layer)]
+        if missing_layer_heads:
+            raise ValueError(
+                "No selected heads provided for layers in this run: "
+                + ",".join(str(layer) for layer in missing_layer_heads)
+            )
+
+    selected_kv_heads_by_layer_map = (
+        selected_kv_heads_by_layer(
+            selected_heads_by_layer,
+            kv_heads_per_query_group=kv_heads_per_query_group,
+        )
+        if ablation_unit_mode == "head"
+        else {}
+    )
+    num_selected_layer_head_pairs = sum(len(heads) for heads in selected_heads_by_layer.values())
 
     examples_h5 = load_examples_h5(Path(args.input_h5))
     if ablation_unit_mode == "whole_concat":
         means, low_ids, high_ids = compute_concat_whole_means(
             examples_h5,
-            ablate_layers=ablate_layers,
+            ablate_layers=run_layers,
             low_conf_threshold=args.low_conf_threshold,
             high_conf_threshold=args.high_conf_threshold,
             mean_from_low_confidence=args.mean_from_low_confidence,
@@ -1781,7 +1737,7 @@ def main() -> None:
     else:
         means, low_ids, high_ids = compute_concat_headwise_means(
             examples_h5,
-            ablate_layers=ablate_layers,
+            ablate_layers=run_layers,
             n_heads=model_n_heads,
             d_head=model_d_head,
             low_conf_threshold=args.low_conf_threshold,
@@ -1797,7 +1753,7 @@ def main() -> None:
             kv_means_k, low_ids_k, high_ids_k = compute_kv_whole_means(
                 examples_h5,
                 component="k",
-                ablate_layers=ablate_layers,
+                ablate_layers=run_layers,
                 n_kv_heads=model_n_kv_heads,
                 d_head=model_d_head,
                 low_conf_threshold=args.low_conf_threshold,
@@ -1809,7 +1765,7 @@ def main() -> None:
             kv_means_v, low_ids_v, high_ids_v = compute_kv_whole_means(
                 examples_h5,
                 component="v",
-                ablate_layers=ablate_layers,
+                ablate_layers=run_layers,
                 n_kv_heads=model_n_kv_heads,
                 d_head=model_d_head,
                 low_conf_threshold=args.low_conf_threshold,
@@ -1822,7 +1778,7 @@ def main() -> None:
             kv_means_k, low_ids_k, high_ids_k = compute_kv_headwise_means(
                 examples_h5,
                 component="k",
-                ablate_layers=ablate_layers,
+                ablate_layers=run_layers,
                 n_kv_heads=model_n_kv_heads,
                 d_head=model_d_head,
                 low_conf_threshold=args.low_conf_threshold,
@@ -1834,7 +1790,7 @@ def main() -> None:
             kv_means_v, low_ids_v, high_ids_v = compute_kv_headwise_means(
                 examples_h5,
                 component="v",
-                ablate_layers=ablate_layers,
+                ablate_layers=run_layers,
                 n_kv_heads=model_n_kv_heads,
                 d_head=model_d_head,
                 low_conf_threshold=args.low_conf_threshold,
@@ -1865,17 +1821,14 @@ def main() -> None:
     if not ablation_target_ids:
         raise ValueError(f"No examples available in ablation target group: {target_group}.")
 
-    grouped_head_units: Dict[str, List[int]] = {}
-    grouped_layer_means_by_unit: Dict[str, Dict[int, Dict[int, Dict[str, torch.Tensor]]]] = {}
     layer_kv_k_concat_means: Optional[Dict[int, Dict[str, torch.Tensor]]] = None
     layer_kv_v_concat_means: Optional[Dict[int, Dict[str, torch.Tensor]]] = None
     layer_kv_k_head_means: Optional[Dict[int, Dict[int, Dict[str, torch.Tensor]]]] = None
     layer_kv_v_head_means: Optional[Dict[int, Dict[int, Dict[str, torch.Tensor]]]] = None
-    kv_unit_index_by_key: Dict[str, int] = {}
     if ablation_unit_mode == "whole_concat":
         layer_concat_means = _build_layer_concat_means(
             means,
-            ablate_layers=ablate_layers,
+            ablate_layers=run_layers,
             device=device,
             torch_dtype=torch_dtype,
         )
@@ -1885,21 +1838,21 @@ def main() -> None:
                 raise ValueError("KV mean replacement was enabled but KV means are missing.")
             layer_kv_k_concat_means = _build_layer_kv_concat_means(
                 kv_means_k,
-                ablate_layers=ablate_layers,
+                ablate_layers=run_layers,
                 device=device,
                 torch_dtype=torch_dtype,
             )
             layer_kv_v_concat_means = _build_layer_kv_concat_means(
                 kv_means_v,
-                ablate_layers=ablate_layers,
+                ablate_layers=run_layers,
                 device=device,
                 torch_dtype=torch_dtype,
             )
     else:
         layer_head_means = _build_layer_head_means(
             means,
-            ablate_layers=ablate_layers,
-            head_indices=ablate_heads,
+            ablate_layers=run_layers,
+            selected_heads_by_layer=selected_heads_by_layer,
             device=device,
             torch_dtype=torch_dtype,
         )
@@ -1908,58 +1861,31 @@ def main() -> None:
                 raise ValueError("KV mean replacement was enabled but KV means are missing.")
             layer_kv_k_head_means = _build_layer_kv_head_means(
                 kv_means_k,
-                ablate_layers=ablate_layers,
-                kv_head_indices=list(range(model_n_kv_heads)),
+                ablate_layers=run_layers,
+                selected_kv_heads_by_layer=selected_kv_heads_by_layer_map,
                 device=device,
                 torch_dtype=torch_dtype,
             )
             layer_kv_v_head_means = _build_layer_kv_head_means(
                 kv_means_v,
-                ablate_layers=ablate_layers,
-                kv_head_indices=list(range(model_n_kv_heads)),
+                ablate_layers=run_layers,
+                selected_kv_heads_by_layer=selected_kv_heads_by_layer_map,
                 device=device,
                 torch_dtype=torch_dtype,
             )
-        if ablation_unit_mode == "head":
-            ablation_unit_keys = [f"head_{head_idx}" for head_idx in ablate_heads]
-            kv_unit_index_by_key = {
-                f"head_{head_idx}": int(head_idx) // kv_heads_per_query_group for head_idx in ablate_heads
-            }
-        elif ablation_unit_mode == "grouped_head":
-            grouped_head_units = build_grouped_head_units(
-                n_heads=model_n_heads, n_kv_heads=model_n_kv_heads
-            )
-            ablation_unit_keys = list(grouped_head_units.keys())
-            kv_unit_index_by_key = {f"group_{kv_idx}": kv_idx for kv_idx in range(model_n_kv_heads)}
-            grouped_layer_means_by_unit = {
-                unit_key: {
-                    layer: {
-                        head_idx: layer_head_means[layer][head_idx]
-                        for head_idx in grouped_head_indices
-                    }
-                    for layer in ablate_layers
-                }
-                for unit_key, grouped_head_indices in grouped_head_units.items()
-            }
-            logging.info(
-                "ablation_unit_mode=grouped_head: n_heads=%d n_kv_heads=%d grouped_units=%d heads_per_group=%d",
-                model_n_heads,
-                model_n_kv_heads,
-                len(grouped_head_units),
-                kv_heads_per_query_group,
-            )
-        else:
-            raise ValueError(
-                f"Unsupported --ablation_unit_mode {ablation_unit_mode!r}; expected one of {ABLATION_UNIT_MODES}."
-            )
+        ablation_unit_keys = ["selected_layer_heads"]
     logging.info(
-        "Loaded %d H5 examples. low_conf=%d high_conf=%d target_group=%s target_ids=%d layers=%s ablation_units=%d ablate_kv_mean=%s",
+        (
+            "Loaded %d H5 examples. low_conf=%d high_conf=%d target_group=%s target_ids=%d "
+            "layers=%s layer_heads=%s ablation_units=%d ablate_kv_mean=%s"
+        ),
         len(examples_h5),
         len(low_ids),
         len(high_ids),
         target_group,
         len(ablation_target_ids),
-        ablate_layers,
+        run_layers,
+        format_layer_head_pairs(selected_heads_by_layer) if selected_heads_by_layer else "ignored",
         len(ablation_unit_keys),
         args.ablate_kv_mean,
     )
@@ -2026,7 +1952,7 @@ def main() -> None:
                         model=model,
                         local_prompt=local_prompt,
                         max_new_tokens=args.model_max_new_tokens,
-                        layer_indices=ablate_layers,
+                        layer_indices=run_layers,
                         mode=mode_name,
                         layer_to_means=layer_concat_means,
                         n_heads=model_n_heads,
@@ -2060,104 +1986,44 @@ def main() -> None:
                         response[:120],
                     )
                 elif ablation_unit_mode == "head":
-                    for head_idx in ablate_heads:
-                        unit_key = f"head_{head_idx}"
-                        kv_head_idx = kv_unit_index_by_key[unit_key] if args.ablate_kv_mean else None
-                        response, _ = greedy_generate_headwise_mean_ablated(
-                            model=model,
-                            local_prompt=local_prompt,
-                            max_new_tokens=args.model_max_new_tokens,
-                            layer_indices=ablate_layers,
-                            mode=mode_name,
-                            layer_to_means={layer: layer_head_means[layer][head_idx] for layer in ablate_layers},
-                            head_idx=head_idx,
-                            kv_layer_to_k_means=(
-                                {layer: layer_kv_k_head_means[layer][kv_head_idx] for layer in ablate_layers}
-                                if args.ablate_kv_mean and layer_kv_k_head_means is not None and kv_head_idx is not None
-                                else None
-                            ),
-                            kv_layer_to_v_means=(
-                                {layer: layer_kv_v_head_means[layer][kv_head_idx] for layer in ablate_layers}
-                                if args.ablate_kv_mean and layer_kv_v_head_means is not None and kv_head_idx is not None
-                                else None
-                            ),
-                            kv_head_idx=kv_head_idx,
-                        )
-                        mode_confidence = (
-                            parse_mode_confidence_from_response(response)
-                            if args.parse_mode_verbalised_confidence
-                            else None
-                        )
-                        responses_identical = response == baseline_response
-                        if responses_identical:
-                            mode_responses_identical_true[mode_name][unit_key] += 1
-                        if mode_confidence is not None:
-                            mode_head_confidence_values[mode_name][unit_key].append(float(mode_confidence))
-                        entry[key][unit_key] = {
-                            "response": response,
-                            "verbalised_confidence": mode_confidence,
-                            "responses_identical": responses_identical,
-                        }
-
-                        logging.info(
-                            "[%s %d/%d] %s %s/head_%d first line: %r",
-                            split_name,
-                            i + 1,
-                            len(selected_ids),
-                            ex_id,
-                            key,
-                            head_idx,
-                            response[:120],
-                        )
-                elif ablation_unit_mode == "grouped_head":
-                    for unit_key, grouped_head_indices in grouped_head_units.items():
-                        kv_head_idx = kv_unit_index_by_key[unit_key] if args.ablate_kv_mean else None
-                        response, _ = greedy_generate_grouped_head_mean_ablated(
-                            model=model,
-                            local_prompt=local_prompt,
-                            max_new_tokens=args.model_max_new_tokens,
-                            layer_indices=ablate_layers,
-                            mode=mode_name,
-                            layer_to_head_means=grouped_layer_means_by_unit[unit_key],
-                            grouped_head_indices=grouped_head_indices,
-                            kv_layer_to_k_means=(
-                                {layer: layer_kv_k_head_means[layer][kv_head_idx] for layer in ablate_layers}
-                                if args.ablate_kv_mean and layer_kv_k_head_means is not None and kv_head_idx is not None
-                                else None
-                            ),
-                            kv_layer_to_v_means=(
-                                {layer: layer_kv_v_head_means[layer][kv_head_idx] for layer in ablate_layers}
-                                if args.ablate_kv_mean and layer_kv_v_head_means is not None and kv_head_idx is not None
-                                else None
-                            ),
-                            kv_head_idx=kv_head_idx,
-                        )
-                        mode_confidence = (
-                            parse_mode_confidence_from_response(response)
-                            if args.parse_mode_verbalised_confidence
-                            else None
-                        )
-                        responses_identical = response == baseline_response
-                        if responses_identical:
-                            mode_responses_identical_true[mode_name][unit_key] += 1
-                        if mode_confidence is not None:
-                            mode_head_confidence_values[mode_name][unit_key].append(float(mode_confidence))
-                        entry[key][unit_key] = {
-                            "response": response,
-                            "verbalised_confidence": mode_confidence,
-                            "responses_identical": responses_identical,
-                        }
-                        logging.info(
-                            "[%s %d/%d] %s %s/%s heads=%s first line: %r",
-                            split_name,
-                            i + 1,
-                            len(selected_ids),
-                            ex_id,
-                            key,
-                            unit_key,
-                            grouped_head_indices,
-                            response[:120],
-                        )
+                    unit_key = "selected_layer_heads"
+                    response, _ = greedy_generate_selected_layer_heads_mean_ablated(
+                        model=model,
+                        local_prompt=local_prompt,
+                        max_new_tokens=args.model_max_new_tokens,
+                        layer_indices=run_layers,
+                        mode=mode_name,
+                        layer_to_head_means=layer_head_means,
+                        selected_heads_by_layer=selected_heads_by_layer,
+                        kv_layer_to_k_head_means=layer_kv_k_head_means if args.ablate_kv_mean else None,
+                        kv_layer_to_v_head_means=layer_kv_v_head_means if args.ablate_kv_mean else None,
+                        selected_kv_heads_by_layer=selected_kv_heads_by_layer_map if args.ablate_kv_mean else None,
+                    )
+                    mode_confidence = (
+                        parse_mode_confidence_from_response(response)
+                        if args.parse_mode_verbalised_confidence
+                        else None
+                    )
+                    responses_identical = response == baseline_response
+                    if responses_identical:
+                        mode_responses_identical_true[mode_name][unit_key] += 1
+                    if mode_confidence is not None:
+                        mode_head_confidence_values[mode_name][unit_key].append(float(mode_confidence))
+                    entry[key][unit_key] = {
+                        "response": response,
+                        "verbalised_confidence": mode_confidence,
+                        "responses_identical": responses_identical,
+                    }
+                    logging.info(
+                        "[%s %d/%d] %s %s/%s first line: %r",
+                        split_name,
+                        i + 1,
+                        len(selected_ids),
+                        ex_id,
+                        key,
+                        unit_key,
+                        response[:120],
+                    )
                 else:
                     raise ValueError(
                         f"Unsupported --ablation_unit_mode {ablation_unit_mode!r}; expected one of {ABLATION_UNIT_MODES}."
@@ -2184,8 +2050,9 @@ def main() -> None:
         model_n_layers=model_n_layers,
         model_n_heads=model_n_heads,
         model_d_head=model_d_head,
-        ablate_layers=ablate_layers,
-        ablate_heads=ablate_heads,
+        ablate_layers=run_layers,
+        selected_heads_by_layer=selected_heads_by_layer,
+        num_selected_layer_head_pairs=num_selected_layer_head_pairs,
         ablation_unit_mode=ablation_unit_mode,
         ablation_unit_keys=ablation_unit_keys,
         prompt_indices=prompt_indices,
@@ -2198,34 +2065,12 @@ def main() -> None:
         finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
     )
     if ablation_unit_mode == "head":
-        write_headwise_mode_plots(
-            mode_head_confidence_means={
-                mode_name: {
-                    int(unit_key.replace("head_", "")): value
-                    for unit_key, value in mode_head_confidence_means[mode_name].items()
-                }
-                for mode_name in args.ablation_mode
-            },
-            ablation_modes=args.ablation_mode,
-            head_indices=ablate_heads,
-            output_dir=os.path.dirname(out_path),
-        )
-    elif ablation_unit_mode == "grouped_head":
-        write_grouped_mode_plots(
-            mode_group_confidence_means={
-                mode_name: {
-                    int(unit_key.replace("group_", "")): value
-                    for unit_key, value in mode_head_confidence_means[mode_name].items()
-                }
-                for mode_name in args.ablation_mode
-            },
-            ablation_modes=args.ablation_mode,
-            group_indices=[int(unit_key.replace("group_", "")) for unit_key in ablation_unit_keys],
-            output_dir=os.path.dirname(out_path),
+        logging.info(
+            "ablation_unit_mode=head with selected_layer_heads: skipping per-head-index plot generation."
         )
     else:
         logging.info(
-            "ablation_unit_mode=%s: skipping plot generation (only head/grouped_head modes are plotted).",
+            "ablation_unit_mode=%s: skipping plot generation.",
             ablation_unit_mode,
         )
     logging.info("Saved mini outputs to %s", out_path)

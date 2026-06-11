@@ -24,11 +24,11 @@ python3 ./mass_mean_probe/run_mass_mean_probe.py \
   --input_h5 ./process_generations/processed_generations_more_h5/2_200_concat/train_verbalised_embeddings.h5 \
   --num_samples 200 \
   --device cuda:0 \
-  --ablate_layers 10-16 \
-  --alpha -1 0.0 0.5 1.0 2.0 \
+  --ablate_layers 14-24 \
+  --alpha 0.0 1.0 2.0 \
   --ablation_targets low high \
   --low_conf_threshold 0.1 \
   --high_conf_threshold 0.9 \
   --new_h5_format \
   --no-enable_brief \
-  --ablation_mode none semantic_answer_mean_replace \
+  --ablation_mode none probability_last_token_mean_replace current_generated_token_mean_replace

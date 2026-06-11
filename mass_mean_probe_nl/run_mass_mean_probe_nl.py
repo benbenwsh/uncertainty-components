@@ -28,8 +28,12 @@ from datasets import Dataset, load_dataset
 from transformers import AutoTokenizer
 from transformer_lens import HookedTransformer
 
+# NATURAL_LANGUAGE_PROMPT = (
+#     "Answer the following question.\n"
+#     "Question: "
+# )
 NATURAL_LANGUAGE_PROMPT = (
-    "Answer the following question.\n"
+    "Answer the following question, and express your confidence in your answer.\n"
     "Question: "
 )
 
@@ -48,6 +52,7 @@ ABLATION_MODES = [
     "first_generated_token_mean_replace",
     "current_generated_token_mean_replace",
     "current_generated_window5_mean_replace",
+    "generated_tokens_mean_replace",
 ]
 
 _NEW_H5_REQUIRED_COMPONENTS = ("res", "attn", "mlp")
@@ -392,6 +397,8 @@ def _positions_for_mode(mode: str, *, prompt_len: int, seq_len: int) -> List[int
     if mode == "current_generated_window5_mean_replace":
         positions = list(range(max(0, seq_len - 5), seq_len))
         return positions
+    if mode == "generated_tokens_mean_replace":
+        return list(range(prompt_len - 1, seq_len))
     raise ValueError(f"Unknown ablation mode for perturb hooks: {mode!r}")
 
 

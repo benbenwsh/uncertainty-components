@@ -28,6 +28,8 @@ from datasets import Dataset, load_dataset
 from transformers import AutoTokenizer
 from transformer_lens import HookedTransformer
 
+from layerwise_mean_ablation.run_mean_ablation import PROBABILITY_ROW_INDEX_MODES
+
 CONFIDENCE_PROMPT = (
     "Provide your best guess and the probability that it is correct (0.0 to 1.0) "
     "for the following question. Give ONLY the guess and probability, no other words "
@@ -257,6 +259,8 @@ def write_config_txt(
 def mode_to_output_key(mode: str) -> str:
     if mode == "none":
         return "no_replacement"
+    if mode in PROBABILITY_ROW_INDEX_MODES:
+        return mode
     if mode in {
         "probability_tokens_mean_replace",
         "probability_last_token_mean_replace",
@@ -435,6 +439,29 @@ def _absolute_prob_positions(
         return []
     rel_positions = rel_positions[:expected_probability_tokens]
     return [_completion_token_index_to_abs_pos(prompt_len, pos) for pos in rel_positions]
+
+
+def _absolute_prob_positions_at_row_indices(
+    prompt_len: int,
+    decoded_tokens: List[str],
+    row_indices: Sequence[int],
+    *,
+    expected_probability_tokens: int,
+) -> List[int]:
+    """Absolute positions for selected rows of the H5 probability-prefix span (0-indexed)."""
+    full_positions = _absolute_prob_positions(
+        prompt_len,
+        decoded_tokens,
+        expected_probability_tokens=expected_probability_tokens,
+    )
+    if not full_positions:
+        return []
+    out: List[int] = []
+    for idx in row_indices:
+        if idx < 0 or idx >= len(full_positions):
+            return []
+        out.append(full_positions[idx])
+    return out
 
 
 def _absolute_prob_last_token_only_positions(

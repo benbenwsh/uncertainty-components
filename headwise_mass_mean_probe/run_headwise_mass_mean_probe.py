@@ -5,7 +5,7 @@ Greedy decoding on TriviaQA with headwise mass mean-direction probing.
 
 This script mirrors subblock mass-mean probing, but applies additive steering at
 attention head activations inside ``hook_z`` (pre-W_O). It supports:
-  - per-head steering (selected via --ablate_heads)
+  - layer-head steering (selected via --ablate_heads_by_layer)
   - whole-concat steering (selected via --whole_concat_mode)
 """
 
@@ -19,7 +19,7 @@ import os
 import random
 import sys
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -101,19 +101,43 @@ def summary_json_path(full_output_path: str) -> str:
     return os.path.join(os.path.dirname(full_output_path), "mode_confidence_summary.json")
 
 
-def parse_head_indices(spec: Optional[str], n_heads: int) -> List[int]:
-    if spec is None or spec.strip().lower() == "all":
-        return list(range(n_heads))
-    spec = spec.strip()
-    if "-" in spec and "," not in spec:
-        a, b = spec.split("-", 1)
-        heads = list(range(int(a.strip()), int(b.strip()) + 1))
-    else:
-        heads = [int(x.strip()) for x in spec.split(",") if x.strip()]
-    for head_idx in heads:
+def parse_layer_head_pairs(spec: str, *, n_layers: int, n_heads: int) -> Dict[int, List[int]]:
+    raw = (spec or "").strip()
+    if not raw:
+        raise ValueError("--ablate_heads_by_layer must be a non-empty comma-separated <layer>.<head> list.")
+    out: Dict[int, Set[int]] = {}
+    for token in raw.split(","):
+        item = token.strip()
+        if not item:
+            continue
+        if item.count(".") != 1:
+            raise ValueError(
+                f"Invalid head token {item!r}. Expected format <layer_idx>.<head_idx>, e.g. 12.3."
+            )
+        layer_str, head_str = item.split(".", 1)
+        try:
+            layer_idx = int(layer_str)
+            head_idx = int(head_str)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid head token {item!r}. layer/head must be integers in <layer_idx>.<head_idx>."
+            ) from exc
+        if layer_idx < 0 or layer_idx >= n_layers:
+            raise ValueError(f"Layer index {layer_idx} out of range [0, {n_layers}).")
         if head_idx < 0 or head_idx >= n_heads:
             raise ValueError(f"Head index {head_idx} out of range [0, {n_heads}).")
-    return heads
+        out.setdefault(layer_idx, set()).add(head_idx)
+    if not out:
+        raise ValueError("No valid <layer_idx>.<head_idx> entries found in --ablate_heads_by_layer.")
+    return {layer: sorted(heads) for layer, heads in sorted(out.items())}
+
+
+def format_layer_head_pairs(layer_to_heads: Dict[int, Sequence[int]]) -> str:
+    parts: List[str] = []
+    for layer_idx in sorted(layer_to_heads):
+        for head_idx in sorted(set(int(h) for h in layer_to_heads[layer_idx])):
+            parts.append(f"{layer_idx}.{head_idx}")
+    return ",".join(parts)
 
 
 def _validate_concat_field(resp0: dict, ex_id: str, field_name: str):
@@ -484,65 +508,68 @@ def _positions_and_vectors_for_mode(
 
 
 def build_headwise_direction_perturb_hooks(
-    layer_to_span_delta: Dict[int, Dict[str, torch.Tensor]],
+    layer_head_to_span_delta: Dict[int, Dict[int, Dict[str, torch.Tensor]]],
     *,
+    selected_heads_by_layer: Dict[int, Sequence[int]],
     mode: str,
     prompt_len: int,
     decoded_tokens_provider: Callable[[], List[str]],
     expected_guess_tokens: int,
     expected_probability_tokens: int,
     expected_confidence_tokens: int,
-    head_idx: int,
     d_head: int,
     linguistic_confidence_prompt: bool = False,
 ) -> List[Tuple[str, Callable]]:
     hooks: List[Tuple[str, Callable]] = []
-    head_idx = int(head_idx)
     d_head = int(d_head)
 
-    for layer in layer_to_span_delta:
+    for layer in layer_head_to_span_delta:
         hook_name = f"blocks.{layer}.attn.hook_z"
+        local_heads = [int(h) for h in selected_heads_by_layer.get(int(layer), [])]
+        if not local_heads:
+            raise ValueError(f"No selected heads for layer {layer}.")
 
-        def _make_hook(layer_idx: int):
+        def _make_hook(layer_idx: int, heads_for_layer: List[int]):
             def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
                 del hook
                 if activation.ndim != 4:
                     raise ValueError(
                         f"Expected hook_z activation with shape [batch, seq, heads, d_head], got {tuple(activation.shape)}."
                     )
-                if not (0 <= head_idx < activation.shape[2]):
-                    raise ValueError(
-                        f"Head index {head_idx} out of range for hook_z activation with {activation.shape[2]} heads."
-                    )
                 if activation.shape[3] != d_head:
                     raise ValueError(
                         f"hook_z d_head mismatch: activation has {activation.shape[3]}, expected {d_head}."
                     )
-                layer_delta = layer_to_span_delta[layer_idx]
-                positions, vectors = _positions_and_vectors_for_mode(
-                    mode,
-                    prompt_len=prompt_len,
-                    decoded_tokens=decoded_tokens_provider(),
-                    layer_delta=layer_delta,
-                    expected_guess_tokens=expected_guess_tokens,
-                    expected_probability_tokens=expected_probability_tokens,
-                    expected_confidence_tokens=expected_confidence_tokens,
-                    linguistic_confidence_prompt=linguistic_confidence_prompt,
-                )
-                for abs_pos, vector in zip(positions, vectors):
-                    if 0 <= abs_pos < activation.shape[1]:
-                        if int(vector.numel()) != int(activation.shape[3]):
-                            raise ValueError(
-                                f"Steering vector size {vector.numel()} does not match d_head {activation.shape[3]}."
-                            )
-                        activation[:, abs_pos, head_idx, :] += vector.to(
-                            device=activation.device, dtype=activation.dtype
+                for head_idx in heads_for_layer:
+                    if not (0 <= head_idx < activation.shape[2]):
+                        raise ValueError(
+                            f"Head index {head_idx} out of range for hook_z activation with {activation.shape[2]} heads."
                         )
+                    layer_delta = layer_head_to_span_delta[layer_idx][head_idx]
+                    positions, vectors = _positions_and_vectors_for_mode(
+                        mode,
+                        prompt_len=prompt_len,
+                        decoded_tokens=decoded_tokens_provider(),
+                        layer_delta=layer_delta,
+                        expected_guess_tokens=expected_guess_tokens,
+                        expected_probability_tokens=expected_probability_tokens,
+                        expected_confidence_tokens=expected_confidence_tokens,
+                        linguistic_confidence_prompt=linguistic_confidence_prompt,
+                    )
+                    for abs_pos, vector in zip(positions, vectors):
+                        if 0 <= abs_pos < activation.shape[1]:
+                            if int(vector.numel()) != int(activation.shape[3]):
+                                raise ValueError(
+                                    f"Steering vector size {vector.numel()} does not match d_head {activation.shape[3]}."
+                                )
+                            activation[:, abs_pos, head_idx, :] += vector.to(
+                                device=activation.device, dtype=activation.dtype
+                            )
                 return activation
 
             return hook_fn
 
-        hooks.append((hook_name, _make_hook(layer)))
+        hooks.append((hook_name, _make_hook(int(layer), local_heads)))
     return hooks
 
 
@@ -636,12 +663,12 @@ def greedy_generate_direction_perturbed_headwise(
     local_prompt: str,
     max_new_tokens: int,
     *,
-    layer_to_span_delta: Dict[int, Dict[str, torch.Tensor]],
+    layer_head_to_span_delta: Dict[int, Dict[int, Dict[str, torch.Tensor]]],
+    selected_heads_by_layer: Dict[int, Sequence[int]],
     mode: str,
     expected_guess_tokens: int,
     expected_probability_tokens: int,
     expected_confidence_tokens: int,
-    head_idx: int,
     d_head: int,
     linguistic_confidence_prompt: bool = False,
 ) -> Tuple[str, List[str]]:
@@ -654,14 +681,14 @@ def greedy_generate_direction_perturbed_headwise(
         return decoded_tokens
 
     hooks = build_headwise_direction_perturb_hooks(
-        layer_to_span_delta=layer_to_span_delta,
+        layer_head_to_span_delta=layer_head_to_span_delta,
+        selected_heads_by_layer=selected_heads_by_layer,
         mode=mode,
         prompt_len=prompt_len,
         decoded_tokens_provider=_decoded_tokens_provider,
         expected_guess_tokens=expected_guess_tokens,
         expected_probability_tokens=expected_probability_tokens,
         expected_confidence_tokens=expected_confidence_tokens,
-        head_idx=head_idx,
         d_head=d_head,
         linguistic_confidence_prompt=linguistic_confidence_prompt,
     )
@@ -878,7 +905,7 @@ def write_config_txt(
     model_n_heads: int,
     model_d_head: int,
     ablate_layers: Sequence[int],
-    ablate_heads: Sequence[int],
+    selected_heads_by_layer: Dict[int, Sequence[int]],
     units: Sequence[str],
     prompt_indices: Sequence[int],
     low_conf_count: int,
@@ -919,8 +946,8 @@ def write_config_txt(
         f"ablation_targets={args.ablation_targets}",
         f"ablate_layers_spec={args.ablate_layers}",
         f"ablate_layers_resolved={','.join(str(layer) for layer in ablate_layers)}",
-        f"ablate_heads_spec={args.ablate_heads}",
-        f"ablate_heads_resolved={','.join(str(h) for h in ablate_heads) if ablate_heads else 'ignored'}",
+        f"ablate_heads_by_layer_spec={args.ablate_heads_by_layer}",
+        f"ablate_heads_by_layer_resolved={format_layer_head_pairs(selected_heads_by_layer) if selected_heads_by_layer else 'ignored'}",
         f"whole_concat_mode={args.whole_concat_mode}",
         f"alpha={args.alpha}",
         "non_none_mode_behavior=additive_direction_perturbation",
@@ -981,16 +1008,19 @@ def main() -> None:
         help="Inclusive range '12-15' or comma list '12,13,14,15' (zero-indexed).",
     )
     parser.add_argument(
-        "--ablate_heads",
+        "--ablate_heads_by_layer",
         type=str,
-        default="all",
-        help="Head indices to steer independently: 'all', inclusive range '0-31', or list '0,2,4'.",
+        default=None,
+        help=(
+            "Optional comma-separated <layer>.<head> list, e.g. '12.3,12.7,13.2'. "
+            "When set, this selection takes precedence and --ablate_layers is ignored."
+        ),
     )
     parser.add_argument(
         "--whole_concat_mode",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="If true, ignore --ablate_heads and steer the whole concatenated pre-W_O attention activation.",
+        help="If true, ignore --ablate_heads_by_layer and steer the whole concatenated pre-W_O attention activation.",
     )
     parser.add_argument(
         "--ablation_mode",
@@ -1117,21 +1147,51 @@ def main() -> None:
             f"Model shape mismatch: n_heads*d_head={model_n_heads*model_d_head}, d_model={model_d_model}."
         )
 
-    ablate_layers = parse_ablate_layers(args.ablate_layers, model_n_layers)
+    ablate_layers_from_flag = parse_ablate_layers(args.ablate_layers, model_n_layers)
+    if not ablate_layers_from_flag and not args.ablate_heads_by_layer:
+        raise ValueError("No layers selected via --ablate_layers.")
+
     if args.whole_concat_mode:
-        ablate_heads: List[int] = []
+        run_layers = sorted(ablate_layers_from_flag)
+        selected_heads_by_layer: Dict[int, List[int]] = {}
         units = ["whole_concat"]
-        logging.info("whole_concat_mode=True: ignoring --ablate_heads=%s", args.ablate_heads)
+        logging.info(
+            "whole_concat_mode=True: ignoring --ablate_heads_by_layer=%s",
+            args.ablate_heads_by_layer,
+        )
+    elif args.ablate_heads_by_layer:
+        selected_heads_by_layer = parse_layer_head_pairs(
+            args.ablate_heads_by_layer, n_layers=model_n_layers, n_heads=model_n_heads
+        )
+        run_layers = sorted(selected_heads_by_layer.keys())
+        if not run_layers:
+            raise ValueError("No layers selected via --ablate_heads_by_layer.")
+        logging.info(
+            "Using --ablate_heads_by_layer selection; ignoring --ablate_layers=%s.",
+            args.ablate_layers,
+        )
+        units = ["selected_layer_heads"]
     else:
-        ablate_heads = parse_head_indices(args.ablate_heads, model_n_heads)
-        if not ablate_heads:
-            raise ValueError("No heads selected. Provide --ablate_heads or disable whole_concat_mode.")
-        units = [f"head_{h}" for h in ablate_heads]
+        run_layers = sorted(ablate_layers_from_flag)
+        selected_heads_by_layer = {layer: list(range(model_n_heads)) for layer in run_layers}
+        logging.info(
+            "No --ablate_heads_by_layer provided; using all heads across --ablate_layers=%s.",
+            args.ablate_layers,
+        )
+        units = ["selected_layer_heads"]
+
+    if not args.whole_concat_mode:
+        missing_layer_heads = [layer for layer in run_layers if not selected_heads_by_layer.get(layer)]
+        if missing_layer_heads:
+            raise ValueError(
+                "No selected heads provided for layers in this run: "
+                + ",".join(str(layer) for layer in missing_layer_heads)
+            )
 
     examples_h5 = load_examples_h5(Path(args.input_h5))
     _, _, direction_by_span, low_ids, high_ids = compute_low_high_span_means_and_directions_concat(
         examples_h5,
-        ablate_layers=ablate_layers,
+        ablate_layers=run_layers,
         low_conf_threshold=args.low_conf_threshold,
         high_conf_threshold=args.high_conf_threshold,
         expected_probability_tokens=args.expected_probability_tokens,
@@ -1157,13 +1217,17 @@ def main() -> None:
             )
 
     logging.info(
-        "Loaded %d H5 examples. low_conf=%d (<=%.3f), high_conf=%d (>=%.3f), layers=%s, units=%d, alphas=%s",
+        (
+            "Loaded %d H5 examples. low_conf=%d (<=%.3f), high_conf=%d (>=%.3f), "
+            "layers=%s, layer_heads=%s, units=%d, alphas=%s"
+        ),
         len(examples_h5),
         len(low_ids),
         args.low_conf_threshold,
         len(high_ids),
         args.high_conf_threshold,
-        ablate_layers,
+        run_layers,
+        format_layer_head_pairs(selected_heads_by_layer) if selected_heads_by_layer else "ignored",
         len(units),
         list(args.alpha),
     )
@@ -1255,7 +1319,7 @@ def main() -> None:
 
                         if args.whole_concat_mode:
                             layer_to_span_delta: Dict[int, Dict[str, torch.Tensor]] = {}
-                            for layer_i, layer_idx in enumerate(ablate_layers):
+                            for layer_i, layer_idx in enumerate(run_layers):
                                 layer_to_span_delta[int(layer_idx)] = {
                                     "prompt_mean": torch.tensor(
                                         sign * alpha * direction_by_span["prompt_mean"][layer_i],
@@ -1326,10 +1390,13 @@ def main() -> None:
                                     meets_none_confidence_direction
                                 )
                         else:
-                            for head_idx in ablate_heads:
-                                layer_to_span_delta = {}
-                                for layer_i, layer_idx in enumerate(ablate_layers):
-                                    layer_to_span_delta[int(layer_idx)] = {
+                            layer_to_local_idx = {layer: i for i, layer in enumerate(run_layers)}
+                            layer_head_to_span_delta: Dict[int, Dict[int, Dict[str, torch.Tensor]]] = {}
+                            for layer_idx, head_indices in selected_heads_by_layer.items():
+                                layer_i = layer_to_local_idx[int(layer_idx)]
+                                layer_head_to_span_delta[int(layer_idx)] = {}
+                                for head_idx in head_indices:
+                                    layer_head_to_span_delta[int(layer_idx)][int(head_idx)] = {
                                         "prompt_mean": torch.tensor(
                                             sign * alpha * direction_by_span["prompt_mean"][layer_i, head_idx],
                                             device=device,
@@ -1351,53 +1418,53 @@ def main() -> None:
                                             dtype=torch_dtype,
                                         ),
                                     }
-                                response, decoded_tokens = greedy_generate_direction_perturbed_headwise(
-                                    model=model,
-                                    local_prompt=local_prompt,
-                                    max_new_tokens=args.model_max_new_tokens,
-                                    layer_to_span_delta=layer_to_span_delta,
-                                    mode=mode,
-                                    expected_guess_tokens=args.expected_guess_tokens,
-                                    expected_probability_tokens=args.expected_probability_tokens,
-                                    expected_confidence_tokens=args.expected_confidence_tokens,
-                                    head_idx=head_idx,
-                                    d_head=model_d_head,
-                                    linguistic_confidence_prompt=args.linguistic_confidence_prompt,
+                            response, decoded_tokens = greedy_generate_direction_perturbed_headwise(
+                                model=model,
+                                local_prompt=local_prompt,
+                                max_new_tokens=args.model_max_new_tokens,
+                                layer_head_to_span_delta=layer_head_to_span_delta,
+                                selected_heads_by_layer=selected_heads_by_layer,
+                                mode=mode,
+                                expected_guess_tokens=args.expected_guess_tokens,
+                                expected_probability_tokens=args.expected_probability_tokens,
+                                expected_confidence_tokens=args.expected_confidence_tokens,
+                                d_head=model_d_head,
+                                linguistic_confidence_prompt=args.linguistic_confidence_prompt,
+                            )
+                            mode_confidence = (
+                                parse_mode_confidence_from_response(
+                                    response, linguistic_prompt=args.linguistic_confidence_prompt
                                 )
-                                mode_confidence = (
-                                    parse_mode_confidence_from_response(
-                                        response, linguistic_prompt=args.linguistic_confidence_prompt
+                                if args.parse_mode_verbalised_confidence
+                                else None
+                            )
+                            unit_key = "selected_layer_heads"
+                            responses_identical = response == baseline_response
+                            entry[key][unit_key] = {"response": response, "decoded_tokens": decoded_tokens}
+                            mini_entry[key][unit_key] = {"response": response}
+                            entry[key][unit_key]["responses_identical"] = responses_identical
+                            mini_entry[key][unit_key]["responses_identical"] = responses_identical
+                            if args.parse_mode_verbalised_confidence:
+                                entry[key][unit_key]["verbalised_confidence"] = mode_confidence
+                                mini_entry[key][unit_key]["verbalised_confidence"] = mode_confidence
+                                if mode_confidence is not None:
+                                    mode_confidence_values[mode][unit_key][target][float(alpha)].append(
+                                        float(mode_confidence)
                                     )
-                                    if args.parse_mode_verbalised_confidence
-                                    else None
+                                if responses_identical:
+                                    mode_responses_identical_true[mode][unit_key][target][float(alpha)] += 1
+                                if mode_confidence is None or baseline_confidence is None:
+                                    meets_none_confidence_direction = None
+                                elif target == "low":
+                                    meets_none_confidence_direction = mode_confidence > baseline_confidence
+                                else:
+                                    meets_none_confidence_direction = mode_confidence < baseline_confidence
+                                entry[key][unit_key]["meets_none_confidence_direction"] = (
+                                    meets_none_confidence_direction
                                 )
-                                unit_key = f"head_{head_idx}"
-                                responses_identical = response == baseline_response
-                                entry[key][unit_key] = {"response": response, "decoded_tokens": decoded_tokens}
-                                mini_entry[key][unit_key] = {"response": response}
-                                entry[key][unit_key]["responses_identical"] = responses_identical
-                                mini_entry[key][unit_key]["responses_identical"] = responses_identical
-                                if args.parse_mode_verbalised_confidence:
-                                    entry[key][unit_key]["verbalised_confidence"] = mode_confidence
-                                    mini_entry[key][unit_key]["verbalised_confidence"] = mode_confidence
-                                    if mode_confidence is not None:
-                                        mode_confidence_values[mode][unit_key][target][float(alpha)].append(
-                                            float(mode_confidence)
-                                        )
-                                    if responses_identical:
-                                        mode_responses_identical_true[mode][unit_key][target][float(alpha)] += 1
-                                    if mode_confidence is None or baseline_confidence is None:
-                                        meets_none_confidence_direction = None
-                                    elif target == "low":
-                                        meets_none_confidence_direction = mode_confidence > baseline_confidence
-                                    else:
-                                        meets_none_confidence_direction = mode_confidence < baseline_confidence
-                                    entry[key][unit_key]["meets_none_confidence_direction"] = (
-                                        meets_none_confidence_direction
-                                    )
-                                    mini_entry[key][unit_key]["meets_none_confidence_direction"] = (
-                                        meets_none_confidence_direction
-                                    )
+                                mini_entry[key][unit_key]["meets_none_confidence_direction"] = (
+                                    meets_none_confidence_direction
+                                )
 
             results[split_name][ex_id] = entry
             mini_results[split_name][ex_id] = mini_entry
@@ -1441,8 +1508,8 @@ def main() -> None:
         model_n_layers=model_n_layers,
         model_n_heads=model_n_heads,
         model_d_head=model_d_head,
-        ablate_layers=ablate_layers,
-        ablate_heads=ablate_heads,
+        ablate_layers=run_layers,
+        selected_heads_by_layer=selected_heads_by_layer,
         units=units,
         prompt_indices=prompt_indices,
         low_conf_count=len(low_ids),
