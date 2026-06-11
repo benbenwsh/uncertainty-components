@@ -10,7 +10,7 @@ export PATH=/vol/bitbucket/${USER}/myvenv/bin/:$PATH
 # if using miniconda, uncomment the below line
 source ~/.bashrc
 source activate
-conda activate se_probes
+conda activate uncertainty_components
 source /vol/cuda/13.0.0/setup.sh
 /usr/bin/nvidia-smi
 uptime

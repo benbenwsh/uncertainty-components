@@ -20,7 +20,7 @@ from huggingface_hub import snapshot_download
 from uncertainty.models.base_model import BaseModel
 from uncertainty.models.base_model import STOP_SEQUENCES
 
-HF_CACHE_DIR = '/vol/bitbucket/bhw22/miniconda/envs/se_probes/lib/python3.11/site-packages/cache'
+HF_CACHE_DIR = '/vol/bitbucket/bhw22/miniconda/envs/uncertainty_components/lib/python3.11/site-packages/cache'
 
 
 class StoppingCriteriaSub(StoppingCriteria):

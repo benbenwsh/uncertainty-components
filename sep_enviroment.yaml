@@ -1,4 +1,4 @@
-name: se_probes
+name: uncertainty_components
 channels:
   - pytorch
   - nvidia
