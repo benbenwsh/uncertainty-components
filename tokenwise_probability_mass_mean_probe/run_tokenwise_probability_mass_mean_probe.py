@@ -49,6 +49,7 @@ from mass_mean_probe.run_mass_mean_probe import (
     _format_alpha,
     _is_expected_or_plus_one,
     compute_low_high_span_means_and_directions,
+    configure_prefix_tokens_for_model,
     normalize_direction_spans_to_unit_norm_budget,
     parse_guess_and_marker_indices,
     parse_mode_confidence_from_response,
@@ -709,7 +710,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Tokenwise probability direction steering inference (TransformerLens)."
     )
-    parser.add_argument("--model_name", type=str, default="mistralai/Mistral-7B-Instruct-v0.1")
+    parser.add_argument("--model_name", type=str, default="google/gemma-3-12b-it")
     parser.add_argument("--input_h5", type=str, required=True, help="Path to *_verbalised_embeddings.h5 file.")
     parser.add_argument(
         "--new_h5_format",
@@ -793,6 +794,7 @@ def main() -> None:
         help=f"Optional run directory. If unset, auto-creates under {MODULE_NAME}/results.",
     )
     args = parser.parse_args()
+    configure_prefix_tokens_for_model(args.model_name)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 

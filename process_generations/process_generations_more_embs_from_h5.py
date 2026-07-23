@@ -17,6 +17,9 @@ Output:
     - embeddings_mean_prob_val
     - embeddings_prompt_k_tokens (tokenwise K mode)
     - embeddings_sem_answer_k_tokens (tokenwise K mode)
+
+  Also writes a companion *_summary.json with the same structure but embedding
+  fields reduced to shape metadata only (no value previews).
 """
 
 import argparse
@@ -46,8 +49,45 @@ _EMBEDDING_KEYS = frozenset(
     }
 )
 
-GUESS_PREFIX = "\n\nGuess:"
-PROBABILITY_MARKER = "\nProbability:"
+# # Gemma-3 token alternatives (fixed length; each inner list = allowed tokens at that position)
+# GUESS_PREFIX_TOKENS = [
+#     ["\n", "\n\n"],
+#     ["Guess"],
+#     [":"],
+# ]
+# PROBABILITY_PREFIX_TOKENS = [
+#     ["\n"],
+#     ["Probability", " Probability"],
+#     [":"],
+#     [" "],
+# ]
+# Mistral-7B-Instruct-v0.1 (from ans_gen/generated_answers/1_svamp_mistral)
+GUESS_PREFIX_TOKENS = [
+    ["\n"],
+    ["\n"],
+    ["Gu"],
+    ["ess"],
+    [":"],
+]
+PROBABILITY_PREFIX_TOKENS = [
+    ["\n"],
+    ["Pro"],
+    ["b"],
+    ["ability"],
+    [":"],
+    [""],  # space before number decodes as empty string
+]
+# # Qwen-2.5-32B
+# GUESS_PREFIX_TOKENS = [
+#     [" Guess"],
+#     [":"],
+# ]
+# PROBABILITY_PREFIX_TOKENS = [
+#     ["\n"],
+#     [" Probability"],
+#     [":"],
+#     [" "],
+# ]
 
 
 def _tensor_to_numpy(obj):
@@ -69,37 +109,48 @@ def _token_index_for_char_offset(decoded_tokens: list, char_offset: int) -> int:
     return max(0, len(decoded_tokens) - 1)
 
 
+def _match_token_prefix(
+    decoded_tokens: list,
+    prefix_tokens: list[list[str]],
+    *,
+    start: int = 0,
+) -> int | None:
+    """Return start index of first match of prefix_tokens (2D alts) at/after `start`, else None."""
+    prefix_len = len(prefix_tokens)
+    if prefix_len == 0:
+        return None
+    for i in range(start, len(decoded_tokens) - prefix_len + 1):
+        if all(decoded_tokens[i + j] in prefix_tokens[j] for j in range(prefix_len)):
+            return i
+    return None
+
+
 def parse_guess_and_probability_indices(decoded_tokens: list) -> tuple[int, int, int] | None:
     """
     Returns:
       - last_guess_token_index: first token index of semantic answer
-      - first_prob_token_index: token index at "\\n" before "Probability:"
+      - first_prob_token_index: token index at "\\n" before "Probability:" (first occurrence)
       - end_prob_token_index: first token index of probability value
     """
-    full_str = "".join(decoded_tokens)
-    if not full_str.startswith(GUESS_PREFIX):
+    guess_start = _match_token_prefix(decoded_tokens, GUESS_PREFIX_TOKENS, start=0)
+    if guess_start is None:
         return None
 
-    last_guess_token_index = _token_index_for_char_offset(decoded_tokens, len(GUESS_PREFIX) - 1) + 1
+    last_guess_token_index = guess_start + len(GUESS_PREFIX_TOKENS)
 
-    rfind_start = full_str.rfind(PROBABILITY_MARKER)
-    if rfind_start < 0:
+    prob_start = _match_token_prefix(
+        decoded_tokens, PROBABILITY_PREFIX_TOKENS, start=last_guess_token_index
+    )
+    if prob_start is None:
         return None
 
-    first_prob_token_index = _token_index_for_char_offset(decoded_tokens, rfind_start)
-    prob_whitespace_token_index = _token_index_for_char_offset(
-        decoded_tokens, rfind_start + len(PROBABILITY_MARKER) - 1
-    ) + 1
-    if prob_whitespace_token_index >= len(decoded_tokens):
-        return None
-    if decoded_tokens[prob_whitespace_token_index].strip() != "":
-        return None
-    end_prob_token_index = prob_whitespace_token_index + 1
+    first_prob_token_index = prob_start
+    end_prob_token_index = prob_start + len(PROBABILITY_PREFIX_TOKENS)
 
     if (
         last_guess_token_index <= 0
         or last_guess_token_index >= len(decoded_tokens)
-        or end_prob_token_index >= len(decoded_tokens) # Different from the parse function in the ablation files because I want to ensure that there is a number after the whitespace
+        or end_prob_token_index >= len(decoded_tokens)  # ensure a number token after the whitespace
         or last_guess_token_index >= first_prob_token_index
         or first_prob_token_index >= end_prob_token_index
     ):
@@ -108,8 +159,8 @@ def parse_guess_and_probability_indices(decoded_tokens: list) -> tuple[int, int,
     return (last_guess_token_index, first_prob_token_index, end_prob_token_index)
 
 
-def _last_probability_value_char_span(full_str: str) -> tuple[int, int] | None:
-    """Return [start,end] char span for the last numeric value after ``Probability:``."""
+def _first_probability_value_char_span(full_str: str) -> tuple[int, int] | None:
+    """Return [start,end] char span for the first numeric value after ``Probability:``."""
     if not full_str:
         return None
     matches = list(
@@ -119,13 +170,13 @@ def _last_probability_value_char_span(full_str: str) -> tuple[int, int] | None:
         matches = list(re.finditer(r"probability\s*:\s*(\d+(?:[.,]\d+)?)", full_str, re.IGNORECASE))
     if not matches:
         return None
-    match = matches[-1]
+    match = matches[0]
     return match.start(1), match.end(1) - 1 # inclusive
 
 
 def _probability_value_token_span(decoded_tokens: list, full_str: str) -> tuple[int, int] | None:
     """Map probability numeric char span to [start,end] token indices."""
-    span = _last_probability_value_char_span(full_str)
+    span = _first_probability_value_char_span(full_str)
     if span is None:
         return None
     char_start, char_end = span
@@ -406,7 +457,7 @@ def _read_h5_node(node):
     raise TypeError(f"Unsupported HDF5 node type: {type(node)}")
 
 
-def _first_and_last_layer_values_for_list_of_arrays(arr_list, n: int = 5):
+def _first_and_last_layer_values_for_list_of_arrays(arr_list, n: int = 5, *, shape_only: bool = False):
     if not arr_list:
         return {"summary": "empty list"}
     arr0 = _tensor_to_numpy(arr_list[0])
@@ -416,6 +467,8 @@ def _first_and_last_layer_values_for_list_of_arrays(arr_list, n: int = 5):
         "first_elem_shape": list(arr0.shape) if hasattr(arr0, "shape") else None,
         "last_elem_shape": list(arr_last.shape) if hasattr(arr_last, "shape") else None,
     }
+    if shape_only:
+        return out
     try:
         if arr0.ndim >= 1 and arr0.shape[0] > 0:
             first_layer = np.asarray(arr0[0]).ravel()[:n].tolist()
@@ -427,21 +480,27 @@ def _first_and_last_layer_values_for_list_of_arrays(arr_list, n: int = 5):
     return out
 
 
-def convert_for_json(obj, parent_key=None, in_embedding_field=False):
+def convert_for_json(obj, parent_key=None, in_embedding_field=False, shape_only: bool = False):
     if parent_key in _EMBEDDING_KEYS:
         in_embedding_field = True
-    elif in_embedding_field and parent_key in {"res", "attn", "mlp", "q", "k", "v", "o", "concat"}:
+    elif in_embedding_field and parent_key in {"res", "attn", "mlp", "q", "k", "v", "o"}:
         in_embedding_field = True
 
     if isinstance(obj, np.ndarray):
         if in_embedding_field:
-            return {"shape": list(obj.shape), "preview": obj.ravel()[:5].tolist()}
+            out = {"shape": list(obj.shape)}
+            if not shape_only:
+                out["preview"] = obj.ravel()[:5].tolist()
+            return out
         return obj.tolist()
     if hasattr(obj, "tolist") and callable(getattr(obj, "tolist")):
         try:
             if in_embedding_field:
                 arr = _tensor_to_numpy(obj)
-                return {"shape": list(arr.shape), "preview": arr.ravel()[:5].tolist()}
+                out = {"shape": list(arr.shape)}
+                if not shape_only:
+                    out["preview"] = arr.ravel()[:5].tolist()
+                return out
             return obj.tolist()
         except (TypeError, ValueError):
             pass
@@ -450,11 +509,19 @@ def convert_for_json(obj, parent_key=None, in_embedding_field=False):
     if isinstance(obj, np.integer):
         return int(obj)
     if isinstance(obj, dict):
-        return {k: convert_for_json(v, parent_key=k, in_embedding_field=in_embedding_field) for k, v in obj.items()}
+        return {
+            k: convert_for_json(v, parent_key=k, in_embedding_field=in_embedding_field, shape_only=shape_only)
+            for k, v in obj.items()
+        }
     if isinstance(obj, (list, tuple)):
         if in_embedding_field and obj and hasattr(obj[0], "shape"):
-            return _first_and_last_layer_values_for_list_of_arrays([_tensor_to_numpy(x) for x in obj], 5)
-        return [convert_for_json(x, parent_key, in_embedding_field=in_embedding_field) for x in obj]
+            return _first_and_last_layer_values_for_list_of_arrays(
+                [_tensor_to_numpy(x) for x in obj], 5, shape_only=shape_only
+            )
+        return [
+            convert_for_json(x, parent_key, in_embedding_field=in_embedding_field, shape_only=shape_only)
+            for x in obj
+        ]
     return obj
 
 
@@ -467,7 +534,6 @@ def process_example(
     collect_attn_block_embeddings: bool,
     collect_mlp_block_embeddings: bool,
     collect_qkvo_embeddings: bool,
-    collect_concat_embeddings: bool,
     attention_score_tokenwise_k_mode: bool,
     extend_probability_span: bool,
 ) -> dict | None:
@@ -486,7 +552,6 @@ def process_example(
     all_k_embeddings = most_likely.get("all_k_embeddings")
     all_v_embeddings = most_likely.get("all_v_embeddings")
     all_o_embeddings = most_likely.get("all_o_embeddings")
-    all_concat_embeddings = most_likely.get("all_concat_embeddings")
 
     if response_str is None or decoded_tokens is None or all_embeddings is None:
         logging.warning(
@@ -660,18 +725,6 @@ def process_example(
                 "setting o outputs to null."
             ),
             "invalid_log": "Example %s has invalid all_o_embeddings: %s. Setting o outputs to null.",
-            "processed": None,
-        },
-        "concat": {
-            "enabled": collect_concat_embeddings,
-            "source_embeddings": all_concat_embeddings,
-            "missing_log": (
-                "Example %s missing all_concat_embeddings while --collect_concat_embeddings is enabled; "
-                "setting concat outputs to null."
-            ),
-            "invalid_log": (
-                "Example %s has invalid all_concat_embeddings: %s. Setting concat outputs to null."
-            ),
             "processed": None,
         },
     }
@@ -853,6 +906,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Process HDF5 generations into verbalised-confidence embedding HDF5."
     )
+    # Remember to change the prefix 2D list based on the model
     parser.add_argument(
         "--input",
         required=True,
@@ -871,38 +925,32 @@ def main():
     parser.add_argument(
         "--expected_guess_tokens",
         type=int,
-        default=5,
+        default=3,
         help="Expected number of stored guess embeddings (list length).",
     )
     parser.add_argument(
         "--expected_probability_tokens",
         type=int,
-        default=7,
+        default=5,
         help="Expected number of stored probability embeddings (list length).",
     )
     parser.add_argument(
         "--collect_attn_block_embeddings",
-        default=False,
+        default=True,
         action=argparse.BooleanOptionalAction,
         help="Include attn subblock outputs under each embedding field as key 'attn'.",
     )
     parser.add_argument(
         "--collect_mlp_block_embeddings",
-        default=False,
+        default=True,
         action=argparse.BooleanOptionalAction,
         help="Include mlp subblock outputs under each embedding field as key 'mlp'.",
     )
     parser.add_argument(
         "--collect_qkvo_embeddings",
-        default=False,
+        default=True,
         action=argparse.BooleanOptionalAction,
         help="Include q/k/v/o_proj outputs under each embedding field as keys 'q', 'k', 'v', 'o'.",
-    )
-    parser.add_argument(
-        "--collect_concat_embeddings",
-        default=False,
-        action=argparse.BooleanOptionalAction,
-        help="Include concat (input to o_proj/W_O) outputs under each embedding field as key 'concat'.",
     )
     parser.add_argument(
         "--attention_score_tokenwise_k_mode",
@@ -944,6 +992,7 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     h5_path = run_dir / f"{out_base}.h5"
     json_path = run_dir / f"{out_base}.json"
+    json_summary_path = run_dir / f"{out_base}_summary.json"
     samples_txt_path = run_dir / "samples.txt"
     config_path = write_config_txt(
         run_dir=run_dir,
@@ -953,6 +1002,7 @@ def main():
         output_paths={
             "h5": h5_path,
             "json": json_path,
+            "json_summary": json_summary_path,
             "samples_txt": samples_txt_path,
         },
     )
@@ -978,9 +1028,14 @@ def main():
     first_item = True
     t_start = time.perf_counter()
 
-    with h5py.File(h5_path, "a") as out_h5, open(json_path, "w") as json_file:
+    with (
+        h5py.File(h5_path, "a") as out_h5,
+        open(json_path, "w") as json_file,
+        open(json_summary_path, "w") as json_summary_file,
+    ):
         out_examples = out_h5["examples"]
         json_file.write("{\n")
+        json_summary_file.write("{\n")
         for example_id, example in iter_h5_examples(input_path):
             out = process_example(
                 example_id,
@@ -990,7 +1045,6 @@ def main():
                 collect_attn_block_embeddings=args.collect_attn_block_embeddings,
                 collect_mlp_block_embeddings=args.collect_mlp_block_embeddings,
                 collect_qkvo_embeddings=args.collect_qkvo_embeddings,
-                collect_concat_embeddings=args.collect_concat_embeddings,
                 attention_score_tokenwise_k_mode=args.attention_score_tokenwise_k_mode,
                 extend_probability_span=args.extend_probability_span,
             )
@@ -1005,16 +1059,24 @@ def main():
 
             if not first_item:
                 json_file.write(",\n")
+                json_summary_file.write(",\n")
             json_file.write(f'  "{example_id}": ')
+            json_summary_file.write(f'  "{example_id}": ')
             json_str = json.dumps(convert_for_json(out), indent=2)
+            json_summary_str = json.dumps(convert_for_json(out, shape_only=True), indent=2)
             indented = "\n".join("    " + line if line.strip() else line for line in json_str.split("\n"))
+            json_summary_indented = "\n".join(
+                "    " + line if line.strip() else line for line in json_summary_str.split("\n")
+            )
             json_file.write(indented)
+            json_summary_file.write(json_summary_indented)
             first_item = False
 
             if (n_ok % 10) == 0:
                 logging.info("Processed %d examples", n_ok)
 
         json_file.write("\n}")
+        json_summary_file.write("\n}")
 
     if n_ok == 0:
         logging.error("No valid examples processed from input file")
@@ -1023,6 +1085,7 @@ def main():
     elapsed = time.perf_counter() - t_start
     logging.info("Wrote %s", h5_path)
     logging.info("Wrote %s", json_path)
+    logging.info("Wrote %s", json_summary_path)
     logging.info("Processed %d valid and rejected %d examples in %.2fs", n_ok, n_reject, elapsed)
 
     with open(samples_txt_path, "w", encoding="utf-8") as f:

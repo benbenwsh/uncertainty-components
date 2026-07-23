@@ -48,6 +48,16 @@ from layerwise_mean_ablation.run_mean_ablation import (
     _absolute_probability_value_start_position,
     _as_layer_hidden,
     _is_expected_or_plus_one,
+    _mean_and_count,
+    batch_compute_semantic_similarities,
+    compute_uncertainty_score,
+    compute_verbalised_confidence_effect,
+    load_sentence_transformer_for_metrics,
+    parse_semantic_answer_from_response,
+)
+from mass_mean_probe.run_mass_mean_probe import (
+    DEFAULT_SEMANTIC_SIMILARITY_MODEL,
+    SEMANTIC_SIMILARITY_MODES,
 )
 
 
@@ -61,6 +71,12 @@ REQUIRED_EMBEDDING_FIELDS = (
     "embeddings_probability",
     "embeddings_mean_prob_val",
 )
+
+GENERATED_TOKENS_SOURCE_CHOICES = ("probability_prefix_last_token",)
+WHOLE_SEQUENCE_MODES = frozenset({
+    "all_tokens_mean_replace",
+    "generated_tokens_mean_replace",
+})
 
 
 def resolve_output_json_path(cli_output_path: Optional[str]) -> str:
@@ -102,6 +118,12 @@ def write_config_txt(
     mode_confidence_counts: Dict[str, Dict[str, int]],
     mode_responses_identical_true: Dict[str, Dict[str, int]],
     finished_at: str,
+    mode_semantic_similarity_means: Optional[Dict[str, Dict[str, Optional[float]]]] = None,
+    mode_semantic_similarity_counts: Optional[Dict[str, Dict[str, int]]] = None,
+    mode_verbalised_confidence_effect_means: Optional[Dict[str, Dict[str, Optional[float]]]] = None,
+    mode_verbalised_confidence_effect_counts: Optional[Dict[str, Dict[str, int]]] = None,
+    mode_uncertainty_score_means: Optional[Dict[str, Dict[str, Optional[float]]]] = None,
+    mode_uncertainty_score_counts: Optional[Dict[str, Dict[str, int]]] = None,
 ) -> None:
     source_group = "low_confidence" if args.mean_from_low_confidence else "high_confidence"
     target_group = "high_confidence" if args.mean_from_low_confidence else "low_confidence"
@@ -132,6 +154,7 @@ def write_config_txt(
         "",
         "[Ablation]",
         f"ablation_mode={args.ablation_mode}",
+        f"generated_tokens_source={args.generated_tokens_source}",
         f"ablate_subblocks={args.ablate_subblocks}",
         f"mean_from_low_confidence={args.mean_from_low_confidence}",
         f"mean_source_group={source_group}",
@@ -165,13 +188,39 @@ def write_config_txt(
             else:
                 identical_n = int(mode_responses_identical_true.get(mode_name, {}).get(subblock, 0))
                 if mode_mean is None:
-                    lines.append(
-                        f"{metric_key}=None ({valid_count}) [responses_identical: {identical_n}]"
-                    )
+                    line = f"{metric_key}=None ({valid_count}) [responses_identical: {identical_n}]"
                 else:
-                    lines.append(
+                    line = (
                         f"{metric_key}={mode_mean:.6f} ({valid_count}) [responses_identical: {identical_n}]"
                     )
+                if mode_semantic_similarity_means is not None:
+                    sem_mean = mode_semantic_similarity_means.get(mode_name, {}).get(subblock)
+                    sem_count = int(
+                        mode_semantic_similarity_counts.get(mode_name, {}).get(subblock, 0)
+                        if mode_semantic_similarity_counts
+                        else 0
+                    )
+                    if sem_mean is not None and sem_count > 0:
+                        line += f" semantic_similarity={sem_mean:.6f} ({sem_count})"
+                if mode_verbalised_confidence_effect_means is not None:
+                    vce_mean = mode_verbalised_confidence_effect_means.get(mode_name, {}).get(subblock)
+                    vce_count = int(
+                        mode_verbalised_confidence_effect_counts.get(mode_name, {}).get(subblock, 0)
+                        if mode_verbalised_confidence_effect_counts
+                        else 0
+                    )
+                    if vce_mean is not None and vce_count > 0:
+                        line += f" verbalised_confidence_effect={vce_mean:.6f} ({vce_count})"
+                if mode_uncertainty_score_means is not None:
+                    unc_mean = mode_uncertainty_score_means.get(mode_name, {}).get(subblock)
+                    unc_count = int(
+                        mode_uncertainty_score_counts.get(mode_name, {}).get(subblock, 0)
+                        if mode_uncertainty_score_counts
+                        else 0
+                    )
+                    if unc_mean is not None and unc_count > 0:
+                        line += f" uncertainty_score={unc_mean:.6f} ({unc_count})"
+                lines.append(line)
     lines.extend(["", "[Run]", f"finished_at={finished_at}"])
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -353,12 +402,52 @@ def _build_layer_means(
     return out
 
 
+def _positions_for_whole_sequence_mode(mode: str, *, prompt_len: int, seq_len: int) -> List[int]:
+    if mode == "all_tokens_mean_replace":
+        return list(range(seq_len))
+    if mode == "generated_tokens_mean_replace":
+        return list(range(prompt_len - 1, seq_len))
+    raise ValueError(f"Unknown whole-sequence ablation mode: {mode!r}")
+
+
+def _generated_token_mean_for_source(
+    layer_means: Dict[str, torch.Tensor],
+    source: str,
+) -> torch.Tensor:
+    if source == "probability_prefix_last_token":
+        return layer_means["probability"][-1]
+    raise ValueError(f"Unknown generated_tokens_source: {source!r}")
+
+
+def _whole_sequence_positions_and_replacements(
+    mode: str,
+    *,
+    prompt_len: int,
+    seq_len: int,
+    layer_means: Dict[str, torch.Tensor],
+    generated_tokens_source: str,
+) -> Tuple[List[int], List[torch.Tensor]]:
+    prompt_mean = layer_means["prompt_mean"]
+    generated_mean = _generated_token_mean_for_source(layer_means, generated_tokens_source)
+
+    positions = _positions_for_whole_sequence_mode(mode, prompt_len=prompt_len, seq_len=seq_len)
+
+    out_positions: List[int] = []
+    out_vectors: List[torch.Tensor] = []
+    for abs_pos in positions:
+        vector = prompt_mean if abs_pos < prompt_len - 1 else generated_mean
+        out_positions.append(abs_pos)
+        out_vectors.append(vector)
+    return out_positions, out_vectors
+
+
 def _positions_and_replacements_for_mode(
     *,
     mode: str,
     prompt_len: int,
     decoded_tokens: List[str],
     layer_means: Dict[str, torch.Tensor],
+    generated_tokens_source: str = "probability_prefix_last_token",
 ) -> Tuple[List[int], List[torch.Tensor]]:
     prompt_mean = layer_means["prompt_mean"]
     guess = layer_means["guess"]
@@ -512,6 +601,16 @@ def _positions_and_replacements_for_mode(
             return [], []
         return [current_abs_pos], [probability[-1]]
 
+    if mode in ("all_tokens_mean_replace", "generated_tokens_mean_replace"):
+        seq_len = prompt_len + len(decoded_tokens)
+        return _whole_sequence_positions_and_replacements(
+            mode,
+            prompt_len=prompt_len,
+            seq_len=seq_len,
+            layer_means=layer_means,
+            generated_tokens_source=generated_tokens_source,
+        )
+
     raise ValueError(f"Unsupported mode for mean replacement: {mode!r}")
 
 
@@ -523,6 +622,7 @@ def build_subblock_mean_replace_hooks(
     prompt_len: int,
     decoded_tokens_provider: Callable[[], List[str]],
     layer_to_means: Dict[int, Dict[str, torch.Tensor]],
+    generated_tokens_source: str = "probability_prefix_last_token",
 ) -> List[Tuple[str, Callable]]:
     hook_suffix = SUBBLOCK_TO_HOOK[subblock]
     hooks: List[Tuple[str, Callable]] = []
@@ -539,6 +639,7 @@ def build_subblock_mean_replace_hooks(
                     prompt_len=prompt_len,
                     decoded_tokens=decoded_tokens,
                     layer_means=local_layer_means,
+                    generated_tokens_source=generated_tokens_source,
                 )
                 if not positions:
                     return activation
@@ -562,6 +663,7 @@ def greedy_generate_mean_ablated(
     subblock: str,
     mode: str,
     layer_to_means: Dict[int, Dict[str, torch.Tensor]],
+    generated_tokens_source: str = "probability_prefix_last_token",
 ) -> Tuple[str, List[str]]:
     tokens = model.to_tokens(local_prompt)
     prompt_len = int(tokens.shape[1])
@@ -577,6 +679,7 @@ def greedy_generate_mean_ablated(
         prompt_len=prompt_len,
         decoded_tokens_provider=_decoded_tokens_provider,
         layer_to_means=layer_to_means,
+        generated_tokens_source=generated_tokens_source,
     )
     return greedy_generate(
         model=model,
@@ -625,6 +728,8 @@ def main() -> None:
             "guess_then_guess_probability_mean_replace",
             "probability_value_mean_replace",
             "current_generated_token_mean_replace",
+            "all_tokens_mean_replace",
+            "generated_tokens_mean_replace",
         ],
         choices=[
             "none",
@@ -640,6 +745,8 @@ def main() -> None:
             "guess_then_guess_probability_mean_replace",
             "probability_value_mean_replace",
             "current_generated_token_mean_replace",
+            "all_tokens_mean_replace",
+            "generated_tokens_mean_replace",
         ],
         help=(
             "One or more ablation modes. probability_first_token_mean_replace: same gating as "
@@ -655,7 +762,25 @@ def main() -> None:
             "mean-replace from first probability-value token through current last token, using "
             "probability[-1] for the first position and embeddings_mean_prob_val mean for later positions. "
             "current_generated_token_mean_replace: at each decode step, mean-replace only the current "
-            "last sequence token using probability[-1]."
+            "last sequence token using probability[-1]. "
+            "all_tokens_mean_replace: mean-replace every sequence position at each decode step; "
+            "prompt_mean for prompt positions, selected --generated_tokens_source for all other "
+            "positions (no span parsing). "
+            "generated_tokens_mean_replace: same replacement logic, but only generated positions "
+            "(prompt_len-1 onward)."
+        ),
+    )
+    parser.add_argument(
+        "--generated_tokens_source",
+        type=str,
+        nargs="+",
+        default=["probability_prefix_last_token"],
+        choices=list(GENERATED_TOKENS_SOURCE_CHOICES),
+        help=(
+            "Generated-token mean source for all_tokens_mean_replace and "
+            "generated_tokens_mean_replace. Prompt positions always use prompt_mean; every "
+            "non-prompt position uses the selected source. Currently only "
+            "probability_prefix_last_token (probability[-1]) is supported."
         ),
     )
     parser.add_argument("--ablate_subblocks", type=str, nargs="+", required=True, choices=["attn", "mlp"])
@@ -672,6 +797,13 @@ def main() -> None:
 
     if len(set(args.ablation_mode)) != len(args.ablation_mode):
         raise ValueError(f"Duplicate ablation modes are not allowed: {args.ablation_mode}")
+    if any(m in WHOLE_SEQUENCE_MODES for m in args.ablation_mode):
+        if len(args.generated_tokens_source) != 1:
+            raise ValueError(
+                "--generated_tokens_source must specify exactly one value when running "
+                f"whole-sequence modes; got {args.generated_tokens_source}"
+            )
+    generated_tokens_source = args.generated_tokens_source[0]
     if len(set(args.ablate_subblocks)) != len(args.ablate_subblocks):
         raise ValueError(f"Duplicate subblocks are not allowed: {args.ablate_subblocks}")
     if len(args.ablate_subblocks) < 1:
@@ -788,12 +920,19 @@ def main() -> None:
     def run_one_evaluation(
         layer_subset: Sequence[int],
         cached_none: Optional[Dict[str, Dict[str, Dict[str, object]]]] = None,
+        sentence_transformer=None,
     ) -> Tuple[
         dict,
         dict,
         Dict[str, Dict[str, Optional[float]]],
         Dict[str, Dict[str, int]],
         Dict[str, Dict[str, Dict[str, object]]],
+        Dict[str, Dict[str, int]],
+        Dict[str, Dict[str, Optional[float]]],
+        Dict[str, Dict[str, int]],
+        Dict[str, Dict[str, Optional[float]]],
+        Dict[str, Dict[str, int]],
+        Dict[str, Dict[str, Optional[float]]],
         Dict[str, Dict[str, int]],
     ]:
         results = {"train": {}, "validation": {}}
@@ -806,6 +945,25 @@ def main() -> None:
             for mode_name in args.ablation_mode
             if mode_name != "none"
         }
+        compute_derived_metrics = "none" in args.ablation_mode and len(args.ablation_mode) > 1
+        mode_semantic_similarity_values: Dict[str, Dict[str, List[float]]] = {
+            mode_name: {subblock: [] for subblock in args.ablate_subblocks}
+            for mode_name in args.ablation_mode
+            if mode_name != "none"
+        }
+        mode_verbalised_confidence_effect_values: Dict[str, Dict[str, List[float]]] = {
+            mode_name: {subblock: [] for subblock in args.ablate_subblocks}
+            for mode_name in args.ablation_mode
+            if mode_name != "none"
+        }
+        mode_uncertainty_score_values: Dict[str, Dict[str, List[float]]] = {
+            mode_name: {subblock: [] for subblock in args.ablate_subblocks}
+            for mode_name in args.ablation_mode
+            if mode_name != "none"
+        }
+        pending_semantic_similarity: List[
+            Tuple[str, str, str, str, str, str]
+        ] = []
         used_none_cache: Dict[str, Dict[str, Dict[str, object]]] = {"train": {}, "validation": {}}
 
         for split_name, eval_ds in [("train", train_ds), ("validation", val_ds)]:
@@ -877,6 +1035,7 @@ def main() -> None:
                                 subblock=subblock,
                                 mode=mode,
                                 layer_to_means={layer: layer_means[subblock][layer] for layer in layer_subset},
+                                generated_tokens_source=generated_tokens_source,
                             )
                             mode_confidence = (
                                 parse_mode_confidence_from_response(response)
@@ -923,8 +1082,81 @@ def main() -> None:
                             response[:120],
                         )
 
+                if compute_derived_metrics and baseline_response is not None:
+                    baseline_semantic_answer = parse_semantic_answer_from_response(str(baseline_response))
+                    if "none" in args.ablation_mode:
+                        none_key = mode_to_output_key("none")
+                        for subblock in args.ablate_subblocks:
+                            if baseline_semantic_answer is not None:
+                                entry[none_key][subblock]["semantic_answer"] = baseline_semantic_answer
+                                mini_entry[none_key][subblock]["semantic_answer"] = baseline_semantic_answer
+
+                    for mode in args.ablation_mode:
+                        if mode == "none":
+                            continue
+                        mode_key = mode_to_output_key(mode)
+                        for subblock in args.ablate_subblocks:
+                            subblock_entry = entry[mode_key][subblock]
+                            mini_subblock_entry = mini_entry[mode_key][subblock]
+                            mode_semantic_answer = parse_semantic_answer_from_response(
+                                str(subblock_entry["response"])
+                            )
+                            if mode_semantic_answer is not None:
+                                subblock_entry["semantic_answer"] = mode_semantic_answer
+                                mini_subblock_entry["semantic_answer"] = mode_semantic_answer
+
+                            if args.parse_mode_verbalised_confidence and baseline_mode_confidence is not None:
+                                mode_confidence = subblock_entry.get("verbalised_confidence")
+                                if mode_confidence is not None:
+                                    vce = compute_verbalised_confidence_effect(
+                                        float(baseline_mode_confidence),
+                                        float(mode_confidence),
+                                        mean_from_low_confidence=args.mean_from_low_confidence,
+                                    )
+                                    if vce is not None:
+                                        subblock_entry["verbalised_confidence_effect"] = vce
+                                        mini_subblock_entry["verbalised_confidence_effect"] = vce
+                                        mode_verbalised_confidence_effect_values[mode][subblock].append(
+                                            float(vce)
+                                        )
+
+                            if (
+                                mode in SEMANTIC_SIMILARITY_MODES
+                                and sentence_transformer is not None
+                                and baseline_semantic_answer is not None
+                                and mode_semantic_answer is not None
+                            ):
+                                pending_semantic_similarity.append(
+                                    (
+                                        split_name,
+                                        ex_id,
+                                        mode,
+                                        subblock,
+                                        str(baseline_semantic_answer),
+                                        str(mode_semantic_answer),
+                                    )
+                                )
+
                 results[split_name][ex_id] = entry
                 mini_results[split_name][ex_id] = mini_entry
+
+        if pending_semantic_similarity and sentence_transformer is not None:
+            pairs = [(baseline_text, mode_text) for *_rest, baseline_text, mode_text in pending_semantic_similarity]
+            similarities = batch_compute_semantic_similarities(sentence_transformer, pairs)
+            for task, similarity in zip(pending_semantic_similarity, similarities):
+                split_name, ex_id, mode, subblock, _baseline_text, _mode_text = task
+                mode_key = mode_to_output_key(mode)
+                subblock_entry = results[split_name][ex_id][mode_key][subblock]
+                mini_subblock_entry = mini_results[split_name][ex_id][mode_key][subblock]
+                subblock_entry["semantic_similarity"] = similarity
+                mini_subblock_entry["semantic_similarity"] = similarity
+                mode_semantic_similarity_values[mode][subblock].append(similarity)
+                vce = subblock_entry.get("verbalised_confidence_effect")
+                if vce is not None:
+                    uncertainty = compute_uncertainty_score(similarity, float(vce))
+                    subblock_entry["uncertainty_score"] = uncertainty
+                    mini_subblock_entry["uncertainty_score"] = uncertainty
+                    mode_uncertainty_score_values[mode][subblock].append(uncertainty)
 
         mode_confidence_means: Dict[str, Dict[str, Optional[float]]] = {}
         mode_confidence_counts: Dict[str, Dict[str, int]] = {}
@@ -935,6 +1167,35 @@ def main() -> None:
                 vals = mode_confidence_values[mode_name][subblock]
                 mode_confidence_means[mode_name][subblock] = float(np.mean(vals)) if vals else None
                 mode_confidence_counts[mode_name][subblock] = len(vals)
+
+        mode_semantic_similarity_means: Dict[str, Dict[str, Optional[float]]] = {}
+        mode_semantic_similarity_counts: Dict[str, Dict[str, int]] = {}
+        mode_verbalised_confidence_effect_means: Dict[str, Dict[str, Optional[float]]] = {}
+        mode_verbalised_confidence_effect_counts: Dict[str, Dict[str, int]] = {}
+        mode_uncertainty_score_means: Dict[str, Dict[str, Optional[float]]] = {}
+        mode_uncertainty_score_counts: Dict[str, Dict[str, int]] = {}
+        for mode_name in args.ablation_mode:
+            if mode_name == "none":
+                continue
+            mode_semantic_similarity_means[mode_name] = {}
+            mode_semantic_similarity_counts[mode_name] = {}
+            mode_verbalised_confidence_effect_means[mode_name] = {}
+            mode_verbalised_confidence_effect_counts[mode_name] = {}
+            mode_uncertainty_score_means[mode_name] = {}
+            mode_uncertainty_score_counts[mode_name] = {}
+            for subblock in args.ablate_subblocks:
+                sem_mean, sem_count = _mean_and_count(mode_semantic_similarity_values[mode_name][subblock])
+                vce_mean, vce_count = _mean_and_count(
+                    mode_verbalised_confidence_effect_values[mode_name][subblock]
+                )
+                unc_mean, unc_count = _mean_and_count(mode_uncertainty_score_values[mode_name][subblock])
+                mode_semantic_similarity_means[mode_name][subblock] = sem_mean
+                mode_semantic_similarity_counts[mode_name][subblock] = sem_count
+                mode_verbalised_confidence_effect_means[mode_name][subblock] = vce_mean
+                mode_verbalised_confidence_effect_counts[mode_name][subblock] = vce_count
+                mode_uncertainty_score_means[mode_name][subblock] = unc_mean
+                mode_uncertainty_score_counts[mode_name][subblock] = unc_count
+
         return (
             results,
             mini_results,
@@ -942,6 +1203,12 @@ def main() -> None:
             mode_confidence_counts,
             used_none_cache,
             mode_responses_identical_true,
+            mode_semantic_similarity_means,
+            mode_semantic_similarity_counts,
+            mode_verbalised_confidence_effect_means,
+            mode_verbalised_confidence_effect_counts,
+            mode_uncertainty_score_means,
+            mode_uncertainty_score_counts,
         )
 
     def build_none_cache() -> Dict[str, Dict[str, Dict[str, object]]]:
@@ -977,6 +1244,26 @@ def main() -> None:
                 }
         return none_cache
 
+    compute_derived_metrics = "none" in args.ablation_mode and len(args.ablation_mode) > 1
+    sentence_transformer = None
+    if compute_derived_metrics and any(m in SEMANTIC_SIMILARITY_MODES for m in args.ablation_mode):
+        logging.info(
+            "Loading sentence-transformers model %s for semantic_similarity.",
+            DEFAULT_SEMANTIC_SIMILARITY_MODEL,
+        )
+        sentence_transformer = load_sentence_transformer_for_metrics()
+
+    derived_metric_kwargs: Dict[str, object] = {}
+    if compute_derived_metrics:
+        derived_metric_kwargs = {
+            "mode_semantic_similarity_means": None,
+            "mode_semantic_similarity_counts": None,
+            "mode_verbalised_confidence_effect_means": None,
+            "mode_verbalised_confidence_effect_counts": None,
+            "mode_uncertainty_score_means": None,
+            "mode_uncertainty_score_counts": None,
+        }
+
     if not args.individual_layers:
         (
             results,
@@ -985,7 +1272,22 @@ def main() -> None:
             mode_confidence_counts,
             _,
             mode_responses_identical_true,
-        ) = run_one_evaluation(run_layers)
+            mode_semantic_similarity_means,
+            mode_semantic_similarity_counts,
+            mode_verbalised_confidence_effect_means,
+            mode_verbalised_confidence_effect_counts,
+            mode_uncertainty_score_means,
+            mode_uncertainty_score_counts,
+        ) = run_one_evaluation(run_layers, sentence_transformer=sentence_transformer)
+        if compute_derived_metrics:
+            derived_metric_kwargs = {
+                "mode_semantic_similarity_means": mode_semantic_similarity_means,
+                "mode_semantic_similarity_counts": mode_semantic_similarity_counts,
+                "mode_verbalised_confidence_effect_means": mode_verbalised_confidence_effect_means,
+                "mode_verbalised_confidence_effect_counts": mode_verbalised_confidence_effect_counts,
+                "mode_uncertainty_score_means": mode_uncertainty_score_means,
+                "mode_uncertainty_score_counts": mode_uncertainty_score_counts,
+            }
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
         with open(mini_output_json_path(out_path), "w", encoding="utf-8") as f:
@@ -1004,6 +1306,7 @@ def main() -> None:
             mode_confidence_counts=mode_confidence_counts,
             mode_responses_identical_true=mode_responses_identical_true,
             finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+            **derived_metric_kwargs,
         )
         logging.info("Saved full outputs to %s", out_path)
         return
@@ -1022,7 +1325,22 @@ def main() -> None:
             layer_mode_counts,
             used_none_cache,
             layer_identical_true,
-        ) = run_one_evaluation([layer_idx], cached_none=none_cache)
+            layer_semantic_similarity_means,
+            layer_semantic_similarity_counts,
+            layer_verbalised_confidence_effect_means,
+            layer_verbalised_confidence_effect_counts,
+            layer_uncertainty_score_means,
+            layer_uncertainty_score_counts,
+        ) = run_one_evaluation([layer_idx], cached_none=none_cache, sentence_transformer=sentence_transformer)
+        if compute_derived_metrics:
+            derived_metric_kwargs = {
+                "mode_semantic_similarity_means": layer_semantic_similarity_means,
+                "mode_semantic_similarity_counts": layer_semantic_similarity_counts,
+                "mode_verbalised_confidence_effect_means": layer_verbalised_confidence_effect_means,
+                "mode_verbalised_confidence_effect_counts": layer_verbalised_confidence_effect_counts,
+                "mode_uncertainty_score_means": layer_uncertainty_score_means,
+                "mode_uncertainty_score_counts": layer_uncertainty_score_counts,
+            }
         if none_cache is None and used_none_cache["train"] and used_none_cache["validation"]:
             none_cache = used_none_cache
         per_layer_mode_means[int(layer_idx)] = layer_mode_means
@@ -1044,6 +1362,7 @@ def main() -> None:
             mode_confidence_counts=layer_mode_counts,
             mode_responses_identical_true=layer_identical_true,
             finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+            **derived_metric_kwargs,
         )
 
     summary_path = os.path.join(individual_root, "mode_confidence_summary.json")

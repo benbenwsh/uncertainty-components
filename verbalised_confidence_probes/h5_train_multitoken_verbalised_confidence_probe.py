@@ -14,7 +14,12 @@ Usage:
         [--output_dir ./results] \\
         [--model_type ridge] \\
         [--alpha 1.0] \\
+        [--tune_ridge_alphas [ALPHA ...]] \\
         [--plot]
+
+    Per-probe ridge alpha tuning (--tune_ridge_alphas) uses a fixed 80/20 train/validation split
+    from KFold(k=5, no rotation), selects alpha by lowest validation MSE, then retrains on the
+    full train set. Default grid when the flag is given with no values: 0.1 1 10.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ from pathlib import Path
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
+from sklearn.model_selection import KFold
 
 try:
     from verbalised_confidence_probes.train_verbalised_confidence_probe import (
@@ -862,6 +868,135 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: boo
                 logging.info("Saved %s", out_path)
 
 
+def _inverse_count_sample_weights(y: np.ndarray) -> np.ndarray:
+    """Weight each sample by 1 / count of its discrete y value (via np.unique)."""
+    values, counts = np.unique(y, return_counts=True)
+    count_of = dict(zip(values.tolist(), counts.tolist()))
+    return np.asarray([1.0 / count_of[v] for v in y], dtype=np.float64)
+
+
+def _fixed_kfold_train_val_split(
+    X: np.ndarray,
+    y: np.ndarray,
+    n_splits: int = 5,
+    random_state: int = 42,
+    sample_weight: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    train_idx, val_idx = next(iter(kf.split(X)))
+    sw_tr = sample_weight[train_idx] if sample_weight is not None else None
+    sw_val = sample_weight[val_idx] if sample_weight is not None else None
+    return X[train_idx], X[val_idx], y[train_idx], y[val_idx], sw_tr, sw_val
+
+
+def _tune_ridge_alpha_for_probe(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    alphas: list[float],
+    *,
+    sample_weight: np.ndarray | None = None,
+    n_splits: int = 5,
+    random_state: int = 42,
+    probe_label: str = "",
+) -> tuple[object, dict, float, dict]:
+    if X_train.shape[0] < n_splits:
+        raise ValueError(
+            f"Ridge alpha tuning requires at least {n_splits} training samples; "
+            f"got {X_train.shape[0]} for {probe_label or 'probe'}."
+        )
+
+    X_tr, X_val, y_tr, y_val, _sw_tr_indexed, _sw_val = _fixed_kfold_train_val_split(
+        X_train,
+        y_train,
+        n_splits=n_splits,
+        random_state=random_state,
+        sample_weight=sample_weight,
+    )
+    # Recompute inverse-count weights on the train fold so they match the fit set.
+    sw_tr = _inverse_count_sample_weights(y_tr) if sample_weight is not None else None
+
+    best_alpha = alphas[0]
+    best_val_mse = float("inf")
+    alpha_runs = []
+
+    for alpha in alphas:
+        _, metrics = train_verbalised_confidence_probe(
+            X_tr,
+            y_tr,
+            X_val,
+            y_val,
+            model_type="ridge",
+            alpha=alpha,
+            verbose=False,
+            sample_weight=sw_tr,
+        )
+        val_mse = metrics["test"]["mse"]
+        alpha_runs.append({"alpha": alpha, "val_mse": val_mse})
+        if val_mse < best_val_mse:
+            best_val_mse = val_mse
+            best_alpha = alpha
+
+        logging.info(
+            "%s alpha tuning: alpha=%s validation MSE=%.6f",
+            probe_label,
+            alpha,
+            val_mse,
+        )
+
+    logging.info(
+        "%s alpha tuning selected alpha=%s (validation MSE=%.6f)",
+        probe_label,
+        best_alpha,
+        best_val_mse,
+    )
+
+    model, metrics = train_verbalised_confidence_probe(
+        X_train,
+        y_train,
+        X_test,
+        y_test,
+        model_type="ridge",
+        alpha=best_alpha,
+        verbose=False,
+        sample_weight=sample_weight,
+    )
+
+    tuning_summary = {
+        "alphas_tried": list(alphas),
+        "alpha_runs": alpha_runs,
+        "selected_alpha": best_alpha,
+        "selected_val_mse": best_val_mse,
+        "n_splits": n_splits,
+        "random_state": random_state,
+    }
+    return model, metrics, best_alpha, tuning_summary
+
+
+def _write_tuning_txt(layer_dir: Path, tuning_summary: dict) -> None:
+    lines = [
+        "Ridge alpha tuning summary",
+        "=" * 40,
+        f"KFold splits: {tuning_summary['n_splits']} (fixed first split, no rotation)",
+        f"Random state: {tuning_summary['random_state']}",
+        "",
+        "Validation MSE by alpha:",
+    ]
+    for run in tuning_summary["alpha_runs"]:
+        marker = " *" if run["alpha"] == tuning_summary["selected_alpha"] else ""
+        lines.append(f"  alpha={run['alpha']}: val_mse={run['val_mse']:.6f}{marker}")
+    lines.extend(
+        [
+            "",
+            f"Selected alpha: {tuning_summary['selected_alpha']}",
+            f"Selected validation MSE: {tuning_summary['selected_val_mse']:.6f}",
+        ]
+    )
+    with open(layer_dir / "tuning.txt", "w") as f:
+        f.write("\n".join(lines))
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Train verbalised-confidence probes for multiple token positions across all layers (HDF5 input)"
@@ -884,12 +1019,12 @@ def main():
             "or process_generations_more_embs_from_h5.py when --new_h5_format is enabled)"
         ),
     )
-    parser.add_argument("--expected_probability_tokens", type=int, default=7)
-    parser.add_argument("--expected_guess_tokens", type=int, default=5)
+    parser.add_argument("--expected_probability_tokens", type=int, default=5)
+    parser.add_argument("--expected_guess_tokens", type=int, default=2)
     parser.add_argument(
         "--new_h5_format",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
             "If set, expect embeddings_guess/embeddings_probability to be dict-like groups with a 'res' sub-group "
             "(new process_generations_more_embs_from_h5.py format)."
@@ -912,7 +1047,27 @@ def main():
         "--alpha",
         type=float,
         default=1.0,
-        help="Regularization strength for Ridge (default: 1.0)",
+        help="Regularization strength for Ridge (default: 1.0; ignored when --tune_ridge_alphas is set)",
+    )
+    parser.add_argument(
+        "--tune_ridge_alphas",
+        type=float,
+        nargs="*",
+        default=None,
+        metavar="ALPHA",
+        help=(
+            "Enable per-probe ridge alpha tuning over these values. "
+            "If the flag is given with no values, uses 0.1 1 10. Requires --model_type ridge."
+        ),
+    )
+    parser.add_argument(
+        "--inverse_count_weights",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Weight training samples by 1 / count of their discrete confidence value "
+            "(default: enabled). Use --no-inverse_count_weights to disable."
+        ),
     )
     parser.add_argument("--plot", default=True, action="store_true", help="Save train/test regression plots per layer")
     parser.add_argument("--save_model", default=True, action="store_true", help="Save trained probes to pickle")
@@ -939,6 +1094,12 @@ def main():
         parser.error("--train_path and --test_path are required unless --plots_only is enabled.")
     if args.plots_only and not args.run_dir:
         parser.error("--run_dir is required when --plots_only is enabled.")
+
+    tune_alphas = None
+    if args.tune_ridge_alphas is not None:
+        if args.model_type != "ridge":
+            parser.error("--tune_ridge_alphas requires --model_type ridge")
+        tune_alphas = args.tune_ridge_alphas or [0.1, 1.0, 10.0]
 
     if args.plots_only:
         run_base = Path(args.run_dir)
@@ -986,6 +1147,13 @@ def main():
     logging.info("expected_guess_tokens=%s", args.expected_guess_tokens)
     logging.info("expected_probability_tokens=%s", args.expected_probability_tokens)
     logging.info("new_h5_format=%s", args.new_h5_format)
+    if tune_alphas is not None:
+        logging.info(
+            "Ridge alpha tuning enabled over %s (fixed KFold k=5, no rotation; --alpha ignored)",
+            tune_alphas,
+        )
+    else:
+        logging.info("model_type=%s alpha=%s", args.model_type, args.alpha)
     _validate_h5_embedding_lengths(
         args.train_path,
         expected_guess_tokens=args.expected_guess_tokens,
@@ -1096,15 +1264,46 @@ def main():
                 X_train_l = X_train
                 X_test_l = X_test
 
-                model, metrics = train_verbalised_confidence_probe(
-                    X_train_l,
-                    y_train,
-                    X_test_l,
-                    y_test,
-                    model_type=args.model_type,
-                    alpha=args.alpha,
-                    verbose=False,
+                sample_weight = (
+                    _inverse_count_sample_weights(y_train)
+                    if args.inverse_count_weights
+                    else None
                 )
+                if sample_weight is not None:
+                    n_unique = len(np.unique(y_train))
+                    logging.info(
+                        "%s: inverse-count sample weights from %s unique confidence values "
+                        "(weight min=%.6f max=%.6f)",
+                        f"{embedding_type} token {token_pos} layer {layer_idx}",
+                        n_unique,
+                        float(sample_weight.min()),
+                        float(sample_weight.max()),
+                    )
+
+                probe_label = f"{embedding_type} token {token_pos} layer {layer_idx}"
+                tuning_summary = None
+                if tune_alphas is not None:
+                    model, metrics, selected_alpha, tuning_summary = _tune_ridge_alpha_for_probe(
+                        X_train_l,
+                        y_train,
+                        X_test_l,
+                        y_test,
+                        tune_alphas,
+                        sample_weight=sample_weight,
+                        probe_label=probe_label,
+                    )
+                else:
+                    selected_alpha = args.alpha
+                    model, metrics = train_verbalised_confidence_probe(
+                        X_train_l,
+                        y_train,
+                        X_test_l,
+                        y_test,
+                        model_type=args.model_type,
+                        alpha=args.alpha,
+                        verbose=False,
+                        sample_weight=sample_weight,
+                    )
 
                 layer_numbers.append(layer_idx)
                 train_mse.append(metrics["train"]["mse"])
@@ -1120,21 +1319,21 @@ def main():
 
                 if args.save_model:
                     model_path = layer_dir / "verbalised_confidence_probe.pkl"
+                    probe_payload = {
+                        "model": model,
+                        "metrics": metrics,
+                        "layer_idx": layer_idx,
+                        "token_pos": token_pos,
+                        "embedding_type": embedding_type,
+                        "model_type": args.model_type,
+                        "alpha": selected_alpha if args.model_type == "ridge" else None,
+                    }
+                    if tuning_summary is not None:
+                        probe_payload["tuning_summary"] = tuning_summary
                     with open(model_path, "wb") as f:
-                        pickle.dump(
-                            {
-                                "model": model,
-                                "metrics": metrics,
-                                "layer_idx": layer_idx,
-                                "token_pos": token_pos,
-                                "embedding_type": embedding_type,
-                                "model_type": args.model_type,
-                                "alpha": args.alpha if args.model_type == "ridge" else None,
-                            },
-                            f,
-                        )
+                        pickle.dump(probe_payload, f)
 
-                    layer_args = argparse.Namespace(layer_idx=layer_idx, alpha=args.alpha)
+                    layer_args = argparse.Namespace(layer_idx=layer_idx, alpha=selected_alpha)
                     write_config_txt(
                         layer_dir,
                         layer_args,
@@ -1145,6 +1344,8 @@ def main():
                         train_path=str(args.train_path),
                         test_path=str(args.test_path),
                     )
+                    if tuning_summary is not None:
+                        _write_tuning_txt(layer_dir, tuning_summary)
                     logging.debug("Saved model and config to %s", layer_dir)
 
                 del X_train, y_train, X_test, y_test, X_train_l, X_test_l, model

@@ -19,12 +19,12 @@ python3 ./subblock_mass_mean_probe/run_subblock_mass_mean_probe.py \
   --input_h5 ./process_generations/processed_generations_more_h5/1_200_with_prob_val/train_verbalised_embeddings.h5 \
   --num_samples 200 \
   --device cuda:0 \
-  --ablate_layers 10-16 \
-  --ablate_subblocks attn mlp \
+  --ablate_layers 25-31 \
+  --ablate_subblocks attn \
   --alpha 0.0 1.0 2.0 \
   --ablation_targets low high \
   --low_conf_threshold 0.1 \
   --high_conf_threshold 0.9 \
   --new_h5_format \
   --no-enable_brief \
-  --ablation_mode none probability_first_token_mean_replace probability_first_two_tokens_mean_replace probability_first_two_and_index6_tokens_mean_replace probability_tokens_mean_replace \
+  --ablation_mode none all_tokens_mean_replace generated_tokens_mean_replace  

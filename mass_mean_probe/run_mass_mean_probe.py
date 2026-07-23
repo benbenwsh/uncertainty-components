@@ -91,9 +91,92 @@ BRIEF_PROMPTS = {
 }
 
 STOP_SEQUENCES = ["\n\n\n\n", "\n\n\n"]
-GUESS_PREFIX = "\n\nGuess:"
-PROBABILITY_MARKER = "\nProbability:"
-CONFIDENCE_MARKER = "\nConfidence:"
+
+# Gemma-3 token alternatives (fixed length; each inner list = allowed tokens at that position)
+GEMMA_GUESS_PREFIX_TOKENS = [
+    ["\n", "\n\n"],
+    ["Guess"],
+    [":"],
+]
+GEMMA_PROBABILITY_PREFIX_TOKENS = [
+    ["\n"],
+    ["Probability", " Probability"],
+    [":"],
+    [" "],
+]
+GEMMA_CONFIDENCE_PREFIX_TOKENS = [
+    ["\n"],
+    ["Confidence", " Confidence"],
+    [":"],
+]
+
+# Qwen2.5 token alternatives (from ans_gen/generated_answers/3_32B_200 decoded tokens)
+QWEN_GUESS_PREFIX_TOKENS = [
+    [" Guess", "Guess"],
+    [":"],
+]
+QWEN_PROBABILITY_PREFIX_TOKENS = [
+    ["\n"],
+    [" Probability"],
+    [":"],
+    [" "],
+]
+QWEN_CONFIDENCE_PREFIX_TOKENS = [
+    ["\n"],
+    [" Confidence", "Confidence"],
+    [":"],
+]
+
+# Mistral-7B-Instruct-v0.1 (from ans_gen/generated_answers/1_svamp_mistral)
+MISTRAL_GUESS_PREFIX_TOKENS = [
+    ["\n"],
+    ["\n"],
+    ["Gu"],
+    ["ess"],
+    [":"],
+]
+MISTRAL_PROBABILITY_PREFIX_TOKENS = [
+    ["\n"],
+    ["Pro"],
+    ["b"],
+    ["ability"],
+    [":"],
+    [""],  # space before number decodes as empty string
+]
+MISTRAL_CONFIDENCE_PREFIX_TOKENS = [
+    ["\n"],
+    ["Con"],
+    ["fidence"],
+    [":"],
+]
+
+# Active tables; set via configure_prefix_tokens_for_model(model_name).
+GUESS_PREFIX_TOKENS: list[list[str]] = GEMMA_GUESS_PREFIX_TOKENS
+PROBABILITY_PREFIX_TOKENS: list[list[str]] = GEMMA_PROBABILITY_PREFIX_TOKENS
+CONFIDENCE_PREFIX_TOKENS: list[list[str]] = GEMMA_CONFIDENCE_PREFIX_TOKENS
+
+
+def configure_prefix_tokens_for_model(model_name: str) -> None:
+    """Set GUESS/PROBABILITY/CONFIDENCE_PREFIX_TOKENS from exact model_name (case-sensitive)."""
+    global GUESS_PREFIX_TOKENS, PROBABILITY_PREFIX_TOKENS, CONFIDENCE_PREFIX_TOKENS
+    if model_name == "google/gemma-3-12b-it":
+        GUESS_PREFIX_TOKENS = GEMMA_GUESS_PREFIX_TOKENS
+        PROBABILITY_PREFIX_TOKENS = GEMMA_PROBABILITY_PREFIX_TOKENS
+        CONFIDENCE_PREFIX_TOKENS = GEMMA_CONFIDENCE_PREFIX_TOKENS
+    elif model_name == "Qwen/Qwen2.5-32B-Instruct":
+        GUESS_PREFIX_TOKENS = QWEN_GUESS_PREFIX_TOKENS
+        PROBABILITY_PREFIX_TOKENS = QWEN_PROBABILITY_PREFIX_TOKENS
+        CONFIDENCE_PREFIX_TOKENS = QWEN_CONFIDENCE_PREFIX_TOKENS
+    elif model_name == "mistralai/Mistral-7B-Instruct-v0.1":
+        GUESS_PREFIX_TOKENS = MISTRAL_GUESS_PREFIX_TOKENS
+        PROBABILITY_PREFIX_TOKENS = MISTRAL_PROBABILITY_PREFIX_TOKENS
+        CONFIDENCE_PREFIX_TOKENS = MISTRAL_CONFIDENCE_PREFIX_TOKENS
+    else:
+        raise ValueError(
+            f"Unsupported model_name for Guess/Probability token parsing: {model_name!r}. "
+            "Supported: 'google/gemma-3-12b-it', 'Qwen/Qwen2.5-32B-Instruct', "
+            "'mistralai/Mistral-7B-Instruct-v0.1'."
+        )
 
 PROBABILITY_ROW_INDEX_MODES: Dict[str, Tuple[int, ...]] = {
     "probability_first_token_mean_replace": (0,),
@@ -112,20 +195,37 @@ SEMANTIC_SIMILARITY_MODES = frozenset({
     "current_generated_window5_mean_replace",
     "prompt_tokens_mean_replace",
     "sem_ans_tokens_during_gen",
+    "all_tokens_mean_replace",
+    "generated_tokens_mean_replace",
+})
+
+GENERATED_TOKENS_SOURCE_CHOICES = ("probability_prefix_last_token",)
+WHOLE_SEQUENCE_MODES = frozenset({
+    "all_tokens_mean_replace",
+    "generated_tokens_mean_replace",
 })
 
 
-def _marker_for_linguistic_confidence(linguistic_confidence_prompt: bool) -> str:
-    return CONFIDENCE_MARKER if linguistic_confidence_prompt else PROBABILITY_MARKER
+def _prefix_tokens_for_linguistic_confidence(
+    linguistic_confidence_prompt: bool,
+) -> list[list[str]]:
+    return CONFIDENCE_PREFIX_TOKENS if linguistic_confidence_prompt else PROBABILITY_PREFIX_TOKENS
 
 
-def _token_index_for_char_offset(decoded_tokens: List[str], char_offset: int) -> int:
-    cumulative = 0
-    for i, tok in enumerate(decoded_tokens):
-        cumulative += len(tok)
-        if cumulative > char_offset:
+def _match_token_prefix(
+    decoded_tokens: List[str],
+    prefix_tokens: list[list[str]],
+    *,
+    start: int = 0,
+) -> int | None:
+    """Return start index of first match of prefix_tokens (2D alts) at/after `start`, else None."""
+    prefix_len = len(prefix_tokens)
+    if prefix_len == 0:
+        return None
+    for i in range(start, len(decoded_tokens) - prefix_len + 1):
+        if all(decoded_tokens[i + j] in prefix_tokens[j] for j in range(prefix_len)):
             return i
-    return max(0, len(decoded_tokens) - 1)
+    return None
 
 
 def parse_guess_and_marker_indices(
@@ -135,38 +235,26 @@ def parse_guess_and_marker_indices(
 ) -> tuple[int, int, int] | None:
     """Return (last_guess_token_index, first_span_token_index, end_span_token_index) completion indices.
 
-    Uses ``PROBABILITY_MARKER`` or ``CONFIDENCE_MARKER`` according to ``linguistic_confidence_prompt``.
-    The span always starts at the first
-    token that contains the marker (``first_marker_token_index``). For numeric ``Probability:``, a
-    whitespace-only token must follow the marker and the span ends at the single value token after
-    that space. For linguistic ``Confidence:``, there is no such required space; the span ends at the
-    first token after the marker (inclusive of marker through that token).
+    Uses ``PROBABILITY_PREFIX_TOKENS`` or ``CONFIDENCE_PREFIX_TOKENS`` according to
+    ``linguistic_confidence_prompt``. The span always starts at the first occurrence of the marker.
+    For numeric ``Probability:``, the prefix includes a whitespace token and the span ends at the
+    first value token after that space. For linguistic ``Confidence:``, there is no required space;
+    the span ends at the first token after the marker.
     """
-    full_str = "".join(decoded_tokens)
-    if not full_str.startswith(GUESS_PREFIX):
+    guess_start = _match_token_prefix(decoded_tokens, GUESS_PREFIX_TOKENS, start=0)
+    if guess_start is None:
         return None
 
-    marker = _marker_for_linguistic_confidence(linguistic_confidence_prompt)
-    last_guess_token_index = _token_index_for_char_offset(decoded_tokens, len(GUESS_PREFIX) - 1) + 1
-    rfind_start = full_str.rfind(marker)
-    if rfind_start < 0:
+    last_guess_token_index = guess_start + len(GUESS_PREFIX_TOKENS)
+    prefix_tokens = _prefix_tokens_for_linguistic_confidence(linguistic_confidence_prompt)
+    marker_start = _match_token_prefix(
+        decoded_tokens, prefix_tokens, start=last_guess_token_index
+    )
+    if marker_start is None:
         return None
 
-    first_marker_token_index = _token_index_for_char_offset(decoded_tokens, rfind_start)
-    prob_whitespace_token_index = _token_index_for_char_offset(
-        decoded_tokens, rfind_start + len(marker) - 1
-    ) + 1
-
-    if not linguistic_confidence_prompt:
-        if prob_whitespace_token_index >= len(decoded_tokens):
-            return None
-        if decoded_tokens[prob_whitespace_token_index].strip() != "":
-            return None
-        end_span_token_index = prob_whitespace_token_index + 1
-    else:
-        end_span_token_index = prob_whitespace_token_index
-
-    first_span_token_index = first_marker_token_index
+    first_span_token_index = marker_start
+    end_span_token_index = marker_start + len(prefix_tokens)
 
     if (
         last_guess_token_index <= 0
@@ -187,10 +275,10 @@ def parse_guess_and_probability_indices(decoded_tokens: List[str]) -> tuple[int,
 
 
 def parse_guess_start_index(decoded_tokens: List[str]) -> Optional[int]:
-    full_str = "".join(decoded_tokens)
-    if not full_str.startswith(GUESS_PREFIX):
+    guess_start = _match_token_prefix(decoded_tokens, GUESS_PREFIX_TOKENS, start=0)
+    if guess_start is None:
         return None
-    last_guess_token_index = _token_index_for_char_offset(decoded_tokens, len(GUESS_PREFIX) - 1) + 1
+    last_guess_token_index = guess_start + len(GUESS_PREFIX_TOKENS)
     if last_guess_token_index <= 0 or last_guess_token_index > len(decoded_tokens):
         return None
     return last_guess_token_index
@@ -277,6 +365,8 @@ def mode_to_output_key(mode: str) -> str:
         "current_generated_window5_mean_replace",
         "prompt_tokens_mean_replace",
         "sem_ans_tokens_during_gen",
+        "all_tokens_mean_replace",
+        "generated_tokens_mean_replace",
     }:
         return mode
     if mode in PROBABILITY_ROW_INDEX_MODES:
@@ -299,7 +389,7 @@ def parse_probability_from_response(response_str: str) -> float | None:
         matches = list(re.finditer(r"probability\s*:\s*(\d+(?:[.,]\d+)?)", response_str, re.IGNORECASE))
     if not matches:
         return None
-    raw = matches[-1].group(1).strip().replace(",", ".")
+    raw = matches[0].group(1).strip().replace(",", ".")
     try:
         value = float(raw)
     except ValueError:
@@ -315,7 +405,7 @@ def parse_linguistic_confidence_from_response(response_str: str) -> float | None
     matches = list(re.finditer(r"confidence\s*:\s*(.+)", response_str, re.IGNORECASE | re.DOTALL))
     if not matches:
         return None
-    tail = matches[-1].group(1)
+    tail = matches[0].group(1)
     tail = tail.split("\n")[0].strip()
     tail_collapsed = " ".join(tail.split())
     lowered = tail_collapsed.casefold()
@@ -338,7 +428,7 @@ def parse_semantic_answer_from_response(
     *,
     linguistic_confidence_prompt: bool = False,
 ) -> Optional[str]:
-    """Extract guess text between ``Guess:`` and the last marker span."""
+    """Extract guess text between ``Guess:`` and the first marker span."""
     if not response_str or not isinstance(response_str, str):
         return None
     if linguistic_confidence_prompt:
@@ -447,6 +537,7 @@ def write_config_txt(
         "",
         "[Ablation]",
         f"ablation_mode={args.ablation_mode}",
+        f"generated_tokens_source={args.generated_tokens_source}",
         f"ablation_targets={args.ablation_targets}",
         f"alpha={args.alpha}",
         "non_none_mode_behavior=additive_direction_perturbation",
@@ -1140,6 +1231,47 @@ def greedy_generate(
     return _postprocess_response_from_full_decode(model, tokens, local_prompt), decoded_tokens
 
 
+def _positions_for_whole_sequence_mode(mode: str, *, prompt_len: int, seq_len: int) -> List[int]:
+    if mode == "all_tokens_mean_replace":
+        return list(range(seq_len))
+    if mode == "generated_tokens_mean_replace":
+        return list(range(prompt_len - 1, seq_len))
+    raise ValueError(f"Unknown whole-sequence ablation mode: {mode!r}")
+
+
+def _generated_token_direction_for_source(
+    layer_delta: Dict[str, torch.Tensor],
+    source: str,
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if source == "probability_prefix_last_token":
+        return layer_delta["probability"][-1].to(dtype)
+    raise ValueError(f"Unknown generated_tokens_source: {source!r}")
+
+
+def _apply_steering_at_positions_with_generated_source(
+    activation: torch.Tensor,
+    layer_delta: Dict[str, torch.Tensor],
+    positions: Sequence[int],
+    *,
+    prompt_len: int,
+    generated_tokens_source: str,
+) -> torch.Tensor:
+    prompt_vec = layer_delta["prompt_mean"].to(activation.dtype)
+    generated_vec = _generated_token_direction_for_source(
+        layer_delta,
+        generated_tokens_source,
+        dtype=activation.dtype,
+    )
+    for abs_pos in positions:
+        if not (0 <= abs_pos < activation.shape[1]):
+            continue
+        delta_vec = prompt_vec if abs_pos < prompt_len - 1 else generated_vec
+        activation[:, abs_pos, :] = activation[:, abs_pos, :] + delta_vec
+    return activation
+
+
 def _direction_mode_activation_applier_builder(
     mode: str,
     *,
@@ -1147,6 +1279,7 @@ def _direction_mode_activation_applier_builder(
     expected_probability_tokens: int,
     expected_confidence_tokens: int,
     linguistic_confidence_prompt: bool = False,
+    generated_tokens_source: str = "probability_prefix_last_token",
 ) -> Callable[[int, Callable[[], List[str]]], Callable[[torch.Tensor, Dict[str, torch.Tensor]], torch.Tensor]]:
     def _builder(
         prompt_len: int,
@@ -1527,6 +1660,26 @@ def _direction_mode_activation_applier_builder(
 
             return _apply_sem_ans_tokens_during_gen
 
+        if mode in ("all_tokens_mean_replace", "generated_tokens_mean_replace"):
+
+            def _apply_whole_sequence_mean_replace(
+                activation: torch.Tensor,
+                layer_delta: Dict[str, torch.Tensor],
+            ) -> torch.Tensor:
+                seq_len = int(activation.shape[1])
+                positions = _positions_for_whole_sequence_mode(
+                    mode, prompt_len=prompt_len, seq_len=seq_len
+                )
+                return _apply_steering_at_positions_with_generated_source(
+                    activation,
+                    layer_delta,
+                    positions,
+                    prompt_len=prompt_len,
+                    generated_tokens_source=generated_tokens_source,
+                )
+
+            return _apply_whole_sequence_mean_replace
+
         raise ValueError(f"Unknown ablation mode for perturb hooks: {mode!r}")
 
     return _builder
@@ -1542,6 +1695,7 @@ def build_direction_perturb_hooks(
     expected_probability_tokens: int,
     expected_confidence_tokens: int,
     linguistic_confidence_prompt: bool = False,
+    generated_tokens_source: str = "probability_prefix_last_token",
 ) -> List[Tuple[str, Callable]]:
     hooks: List[Tuple[str, Callable]] = []
     activation_applier_builder = _direction_mode_activation_applier_builder(
@@ -1550,6 +1704,7 @@ def build_direction_perturb_hooks(
         expected_probability_tokens=expected_probability_tokens,
         expected_confidence_tokens=expected_confidence_tokens,
         linguistic_confidence_prompt=linguistic_confidence_prompt,
+        generated_tokens_source=generated_tokens_source,
     )
     activation_applier = activation_applier_builder(prompt_len, decoded_tokens_provider)
     for layer in layer_to_span_delta:
@@ -1578,6 +1733,7 @@ def greedy_generate_direction_perturbed(
     expected_probability_tokens: int,
     expected_confidence_tokens: int,
     linguistic_confidence_prompt: bool = False,
+    generated_tokens_source: str = "probability_prefix_last_token",
 ) -> Tuple[str, List[str]]:
     tokens = model.to_tokens(local_prompt)
     prompt_len = int(tokens.shape[1])
@@ -1596,6 +1752,7 @@ def greedy_generate_direction_perturbed(
         expected_probability_tokens=expected_probability_tokens,
         expected_confidence_tokens=expected_confidence_tokens,
         linguistic_confidence_prompt=linguistic_confidence_prompt,
+        generated_tokens_source=generated_tokens_source,
     )
     with torch.inference_mode():
         for _ in range(max_new_tokens):
@@ -1811,7 +1968,7 @@ def _dedupe_preserve_order(items: Sequence[str]) -> List[str]:
 def main() -> None:
     TRAIN_RATIO = 0.9
     parser = argparse.ArgumentParser(description="Mass mean direction probe inference (TransformerLens).")
-    parser.add_argument("--model_name", type=str, default="mistralai/Mistral-7B-Instruct-v0.1")
+    parser.add_argument("--model_name", type=str, default="google/gemma-3-12b-it")
     parser.add_argument("--input_h5", type=str, required=True, help="Path to *_verbalised_embeddings.h5 file.")
     parser.add_argument(
         "--new_h5_format",
@@ -1862,6 +2019,8 @@ def main() -> None:
             "probability_first_token_mean_replace",
             "probability_first_two_tokens_mean_replace",
             "probability_first_two_and_index6_tokens_mean_replace",
+            "all_tokens_mean_replace",
+            "generated_tokens_mean_replace",
         ],
         choices=[
             "none",
@@ -1881,6 +2040,8 @@ def main() -> None:
             "probability_first_token_mean_replace",
             "probability_first_two_tokens_mean_replace",
             "probability_first_two_and_index6_tokens_mean_replace",
+            "all_tokens_mean_replace",
+            "generated_tokens_mean_replace",
         ],
         help=(
             "Ablation mode(s) to run. probability_last_token_mean_replace: perturb only the "
@@ -1902,7 +2063,25 @@ def main() -> None:
             "prompt token positions with the shared prompt_mean direction. "
             "sem_ans_tokens_during_gen: no-op until Guess: prefix parses; perturb semantic-answer "
             "tokens generated so far (and keep ablating those positions after the span is complete). "
+            "all_tokens_mean_replace: perturb every sequence position at each decode step; "
+            "prompt_mean for prompt positions, selected --generated_tokens_source for all other "
+            "positions (no span parsing). "
+            "generated_tokens_mean_replace: same steering logic, but only generated positions "
+            "(prompt_len-1 onward). "
             "Both subset modes apply only with the numeric Probability: prompt."
+        ),
+    )
+    parser.add_argument(
+        "--generated_tokens_source",
+        type=str,
+        nargs="+",
+        default=["probability_prefix_last_token"],
+        choices=list(GENERATED_TOKENS_SOURCE_CHOICES),
+        help=(
+            "Generated-token direction source for all_tokens_mean_replace and "
+            "generated_tokens_mean_replace. Prompt positions always use prompt_mean; every "
+            "non-prompt position uses the selected source. Currently only "
+            "probability_prefix_last_token (probability[-1]) is supported."
         ),
     )
     parser.add_argument(
@@ -1967,11 +2146,19 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    configure_prefix_tokens_for_model(args.model_name)
 
     if len(set(args.ablation_mode)) != len(args.ablation_mode):
         raise ValueError(f"Duplicate ablation modes are not allowed: {args.ablation_mode}")
     if "none" not in args.ablation_mode:
         raise ValueError("Please include 'none' in --ablation_mode for baseline comparisons.")
+    if any(m in WHOLE_SEQUENCE_MODES for m in args.ablation_mode):
+        if len(args.generated_tokens_source) != 1:
+            raise ValueError(
+                "--generated_tokens_source must specify exactly one value when running "
+                f"whole-sequence modes; got {args.generated_tokens_source}"
+            )
+    generated_tokens_source = args.generated_tokens_source[0]
     if args.normalize_span_directions:
         normalization_supported_modes = {
             "none",
@@ -2210,6 +2397,7 @@ def main() -> None:
                             expected_probability_tokens=args.expected_probability_tokens,
                             expected_confidence_tokens=args.expected_confidence_tokens,
                             linguistic_confidence_prompt=args.linguistic_confidence_prompt,
+                            generated_tokens_source=generated_tokens_source,
                         )
                         mode_confidence = (
                             parse_mode_confidence_from_response(

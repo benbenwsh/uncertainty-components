@@ -209,21 +209,34 @@ def normalise_response_item(item) -> dict | None:
     }
 
 
-def _token_index_for_char_offset(decoded_tokens: list, char_offset: int) -> int:
-    """
-    Return the smallest token index i such that the cumulative length (num of chars) of
-    decoded_tokens[0..i+1] (exclusive end) is strictly greater than char_offset.
-    """
-    cumulative = 0
-    for i, tok in enumerate(decoded_tokens):
-        cumulative += len(tok)
-        if cumulative > char_offset:
+# Gemma-3 token alternatives (fixed length; each inner list = allowed tokens at that position)
+GUESS_PREFIX_TOKENS = [
+    ["\n", "\n\n"],
+    ["Guess"],
+    [":"],
+]
+PROBABILITY_PREFIX_TOKENS = [
+    ["\n"],
+    ["Probability", " Probability"],
+    [":"],
+    [" "],
+]
+
+
+def _match_token_prefix(
+    decoded_tokens: list,
+    prefix_tokens: list[list[str]],
+    *,
+    start: int = 0,
+) -> int | None:
+    """Return start index of first match of prefix_tokens (2D alts) at/after `start`, else None."""
+    prefix_len = len(prefix_tokens)
+    if prefix_len == 0:
+        return None
+    for i in range(start, len(decoded_tokens) - prefix_len + 1):
+        if all(decoded_tokens[i + j] in prefix_tokens[j] for j in range(prefix_len)):
             return i
-    return max(0, len(decoded_tokens) - 1)
-
-
-GUESS_PREFIX = "\n\nGuess:"
-PROBABILITY_MARKER = "\nProbability:"
+    return None
 
 
 def parse_guess_and_probability_indices(
@@ -233,36 +246,31 @@ def parse_guess_and_probability_indices(
     Compute token indices for the two embedding subsets (Guess and Probability).
 
     last_guess_token_index: token after "Guess:" (first token of answer)
-    first_prob_token_index: "\n" token before "Probability:"
-    end_prob_token_index: token after "Probability:\s" (first token of prob value)
+    first_prob_token_index: "\n" token before "Probability:" (first occurrence of marker)
+    end_prob_token_index: token after "Probability:\\s" (first token of prob value)
 
     Returns (last_guess_token_index, first_prob_token_index, end_prob_token_index)
     or None on failure.
     """
-    full_str = "".join(decoded_tokens)
-    if not full_str.startswith(GUESS_PREFIX):
+    guess_start = _match_token_prefix(decoded_tokens, GUESS_PREFIX_TOKENS, start=0)
+    if guess_start is None:
         return None
 
-    last_guess_token_index = _token_index_for_char_offset(decoded_tokens, len(GUESS_PREFIX) - 1) + 1
+    last_guess_token_index = guess_start + len(GUESS_PREFIX_TOKENS)
 
-    rfind_start = full_str.rfind(PROBABILITY_MARKER)
-    if rfind_start < 0:
+    prob_start = _match_token_prefix(
+        decoded_tokens, PROBABILITY_PREFIX_TOKENS, start=last_guess_token_index
+    )
+    if prob_start is None:
         return None
 
-    first_prob_token_index = _token_index_for_char_offset(decoded_tokens, rfind_start)
-    prob_whitespace_token_index = _token_index_for_char_offset(
-        decoded_tokens, rfind_start + len(PROBABILITY_MARKER) - 1
-    ) + 1
-    if prob_whitespace_token_index >= len(decoded_tokens):
-        return None
-    if decoded_tokens[prob_whitespace_token_index].strip() != "":
-        return None
-    end_prob_token_index = prob_whitespace_token_index + 1
+    first_prob_token_index = prob_start
+    end_prob_token_index = prob_start + len(PROBABILITY_PREFIX_TOKENS)
 
     if (
         last_guess_token_index <= 0
         or last_guess_token_index >= len(decoded_tokens)
-        or end_prob_token_index >= len(decoded_tokens)
+        or end_prob_token_index >= len(decoded_tokens) # this is >=, as we want to ensure there is a probability value
         or last_guess_token_index >= first_prob_token_index
         or first_prob_token_index >= end_prob_token_index
     ):

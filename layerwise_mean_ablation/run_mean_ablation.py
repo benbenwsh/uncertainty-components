@@ -53,11 +53,74 @@ BRIEF_PROMPTS = {
 STOP_SEQUENCES = ["\n\n\n\n", "\n\n\n"]
 
 # ---------------------------------------------------------------------------
-# Probability span parsing (aligned with process_generations_verbalised_embeddings_h5.py)
+# Probability span parsing (token-prefix match)
 # ---------------------------------------------------------------------------
 
-GUESS_PREFIX = "\n\nGuess:"
-PROBABILITY_MARKER = "\nProbability:"
+# Gemma-3 token alternatives (fixed length; each inner list = allowed tokens at that position)
+GEMMA_GUESS_PREFIX_TOKENS = [
+    ["\n", "\n\n"],
+    ["Guess"],
+    [":"],
+]
+GEMMA_PROBABILITY_PREFIX_TOKENS = [
+    ["\n"],
+    ["Probability", " Probability"],
+    [":"],
+    [" "],
+]
+
+# Qwen2.5 token alternatives (from ans_gen/generated_answers/3_32B_200 decoded tokens)
+QWEN_GUESS_PREFIX_TOKENS = [
+    [" Guess", "Guess"],
+    [":"],
+]
+QWEN_PROBABILITY_PREFIX_TOKENS = [
+    ["\n"],
+    [" Probability"],
+    [":"],
+    [" "],
+]
+
+# Mistral-7B-Instruct-v0.1 (from ans_gen/generated_answers/1_svamp_mistral)
+MISTRAL_GUESS_PREFIX_TOKENS = [
+    ["\n"],
+    ["\n"],
+    ["Gu"],
+    ["ess"],
+    [":"],
+]
+MISTRAL_PROBABILITY_PREFIX_TOKENS = [
+    ["\n"],
+    ["Pro"],
+    ["b"],
+    ["ability"],
+    [":"],
+    [""],  # space before number decodes as empty string
+]
+
+# Active tables; set via configure_prefix_tokens_for_model(model_name).
+GUESS_PREFIX_TOKENS: list[list[str]] = GEMMA_GUESS_PREFIX_TOKENS
+PROBABILITY_PREFIX_TOKENS: list[list[str]] = GEMMA_PROBABILITY_PREFIX_TOKENS
+
+
+def configure_prefix_tokens_for_model(model_name: str) -> None:
+    """Set GUESS/PROBABILITY_PREFIX_TOKENS from exact model_name (case-sensitive)."""
+    global GUESS_PREFIX_TOKENS, PROBABILITY_PREFIX_TOKENS
+    if model_name == "google/gemma-3-12b-it":
+        GUESS_PREFIX_TOKENS = GEMMA_GUESS_PREFIX_TOKENS
+        PROBABILITY_PREFIX_TOKENS = GEMMA_PROBABILITY_PREFIX_TOKENS
+    elif model_name == "Qwen/Qwen2.5-32B-Instruct":
+        GUESS_PREFIX_TOKENS = QWEN_GUESS_PREFIX_TOKENS
+        PROBABILITY_PREFIX_TOKENS = QWEN_PROBABILITY_PREFIX_TOKENS
+    elif model_name == "mistralai/Mistral-7B-Instruct-v0.1":
+        GUESS_PREFIX_TOKENS = MISTRAL_GUESS_PREFIX_TOKENS
+        PROBABILITY_PREFIX_TOKENS = MISTRAL_PROBABILITY_PREFIX_TOKENS
+    else:
+        raise ValueError(
+            f"Unsupported model_name for Guess/Probability token parsing: {model_name!r}. "
+            "Supported: 'google/gemma-3-12b-it', 'Qwen/Qwen2.5-32B-Instruct', "
+            "'mistralai/Mistral-7B-Instruct-v0.1'."
+        )
 
 GUESS_SPAN_ABLATION_MODES = frozenset({
     "guess_tokens_mean_replace",
@@ -74,46 +137,21 @@ PROBABILITY_ROW_INDEX_MODES: Dict[str, Tuple[int, ...]] = {
 }
 
 
-def _token_index_for_char_offset(decoded_tokens: List[str], char_offset: int) -> int:
-    cumulative = 0
-    for i, tok in enumerate(decoded_tokens):
-        cumulative += len(tok)
-        if cumulative > char_offset:
+def _match_token_prefix(
+    decoded_tokens: list,
+    prefix_tokens: list[list[str]],
+    *,
+    start: int = 0,
+) -> int | None:
+    """Return start index of first match of prefix_tokens (2D alts) at/after `start`, else None."""
+    prefix_len = len(prefix_tokens)
+    if prefix_len == 0:
+        return None
+    for i in range(start, len(decoded_tokens) - prefix_len + 1):
+        if all(decoded_tokens[i + j] in prefix_tokens[j] for j in range(prefix_len)):
             return i
-    return max(0, len(decoded_tokens) - 1)
+    return None
 
-# def parse_guess_and_probability_indices(
-#     decoded_tokens: List[str],
-#     full_str: str,
-# ) -> Optional[Tuple[int, int, int]]:
-#     """Parse ``full_str`` (``join(decoded_tokens)``) into token indices in ``decoded_tokens``.
-
-#     Returns (first_token_after_GUESS_PREFIX, first_prob_token, last_prob_token), or ``None`` if format or bounds checks fail.
-#     """
-#     if not full_str.startswith(GUESS_PREFIX):
-#         return None
-
-#     last_guess_token_index = _token_index_for_char_offset(decoded_tokens, len(GUESS_PREFIX) - 1) + 1
-
-#     rfind_start = full_str.rfind(PROBABILITY_MARKER)
-#     if rfind_start < 0:
-#         return None
-
-#     first_prob_token_index = _token_index_for_char_offset(decoded_tokens, rfind_start)
-#     end_prob_token_index = _token_index_for_char_offset(
-#         decoded_tokens, rfind_start + len(PROBABILITY_MARKER) - 1
-#     ) + 1
-
-#     if (
-#         last_guess_token_index <= 0
-#         or last_guess_token_index >= len(decoded_tokens)
-#         or end_prob_token_index >= len(decoded_tokens)
-#         or last_guess_token_index >= first_prob_token_index
-#         or first_prob_token_index >= end_prob_token_index
-#     ):
-#         return None
-
-#     return (last_guess_token_index, first_prob_token_index, end_prob_token_index)
 
 def parse_guess_and_probability_indices(
     decoded_tokens: list,
@@ -122,31 +160,26 @@ def parse_guess_and_probability_indices(
     Compute token indices for the two embedding subsets (Guess and Probability).
 
     last_guess_token_index: token after "Guess:" (first token of answer)
-    first_prob_token_index: "\n" token before "Probability:"
+    first_prob_token_index: "\n" token before "Probability:" (first occurrence of marker)
     end_prob_token_index: token after ``Probability:`` + whitespace (first token of prob value)
 
     Returns (last_guess_token_index, first_prob_token_index, end_prob_token_index)
     or None on failure.
     """
-    full_str = "".join(decoded_tokens)
-    if not full_str.startswith(GUESS_PREFIX):
+    guess_start = _match_token_prefix(decoded_tokens, GUESS_PREFIX_TOKENS, start=0)
+    if guess_start is None:
         return None
 
-    last_guess_token_index = _token_index_for_char_offset(decoded_tokens, len(GUESS_PREFIX) - 1) + 1
+    last_guess_token_index = guess_start + len(GUESS_PREFIX_TOKENS)
 
-    rfind_start = full_str.rfind(PROBABILITY_MARKER)
-    if rfind_start < 0:
+    prob_start = _match_token_prefix(
+        decoded_tokens, PROBABILITY_PREFIX_TOKENS, start=last_guess_token_index
+    )
+    if prob_start is None:
         return None
 
-    first_prob_token_index = _token_index_for_char_offset(decoded_tokens, rfind_start) # No -1 because rfind_start is an index not length
-    prob_whitespace_token_index = _token_index_for_char_offset(
-        decoded_tokens, rfind_start + len(PROBABILITY_MARKER) - 1
-    ) + 1
-    if prob_whitespace_token_index >= len(decoded_tokens):
-        return None
-    if decoded_tokens[prob_whitespace_token_index].strip() != "":
-        return None
-    end_prob_token_index = prob_whitespace_token_index + 1
+    first_prob_token_index = prob_start
+    end_prob_token_index = prob_start + len(PROBABILITY_PREFIX_TOKENS)
 
     if (
         last_guess_token_index <= 0
@@ -162,10 +195,10 @@ def parse_guess_and_probability_indices(
 
 def parse_guess_start_index(decoded_tokens: List[str]) -> Optional[int]:
     """Return first token index of semantic answer (token right after ``Guess:``)."""
-    full_str = "".join(decoded_tokens)
-    if not full_str.startswith(GUESS_PREFIX):
+    guess_start = _match_token_prefix(decoded_tokens, GUESS_PREFIX_TOKENS, start=0)
+    if guess_start is None:
         return None
-    last_guess_token_index = _token_index_for_char_offset(decoded_tokens, len(GUESS_PREFIX) - 1) + 1
+    last_guess_token_index = guess_start + len(GUESS_PREFIX_TOKENS)
     if last_guess_token_index <= 0 or last_guess_token_index > len(decoded_tokens):
         return None
     return last_guess_token_index
@@ -402,7 +435,7 @@ def parse_mode_confidence_from_response(response: str) -> Optional[float]:
 def parse_probability_from_response(response_str: str) -> float | None:
     """
     Extract probability in [0,1] from a response string.
-    Uses the last occurrence of "probability:".
+    Uses the first occurrence of "probability:".
     """
     if not response_str or not isinstance(response_str, str):
         return None
@@ -411,7 +444,7 @@ def parse_probability_from_response(response_str: str) -> float | None:
         matches = list(re.finditer(r"probability\s*:\s*(\d+(?:[.,]\d+)?)", response_str, re.IGNORECASE))
     if not matches:
         return None
-    raw = matches[-1].group(1).strip().replace(",", ".")
+    raw = matches[0].group(1).strip().replace(",", ".")
     try:
         value = float(raw)
     except ValueError:
@@ -422,7 +455,7 @@ def parse_probability_from_response(response_str: str) -> float | None:
 
 
 def parse_semantic_answer_from_response(response_str: str) -> Optional[str]:
-    """Extract guess text between ``Guess:`` and the last ``Probability:`` marker."""
+    """Extract guess text between ``Guess:`` and the first ``Probability:`` marker."""
     if not response_str or not isinstance(response_str, str):
         return None
     match = re.search(
@@ -1996,7 +2029,7 @@ def greedy_generate_sem_ans_tokens_during_gen(
 def main() -> None:
     TRAIN_RATIO = 0.9
     parser = argparse.ArgumentParser(description="Layerwise mean activation replacement inference (TransformerLens).")
-    parser.add_argument("--model_name", type=str, default="mistralai/Mistral-7B-Instruct-v0.1")
+    parser.add_argument("--model_name", type=str, default="google/gemma-3-12b-it")
     parser.add_argument("--input_h5", type=str, required=True, help="Path to *_verbalised_embeddings.h5 file.")
     parser.add_argument(
         "--new_h5_format",
@@ -2130,6 +2163,7 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    configure_prefix_tokens_for_model(args.model_name)
     if len(set(args.ablation_mode)) != len(args.ablation_mode):
         raise ValueError(f"Duplicate ablation modes are not allowed: {args.ablation_mode}")
 

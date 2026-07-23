@@ -33,19 +33,18 @@ def parse_probability_from_response(response_str: str) -> float | None:
     Extract probability in [0, 1] from a response string.
 
     Expected format: 'Guess: <...>\\nProbability:<number>' (case-insensitive, flexible whitespace).
-    Uses the **last** occurrence of "probability:" so that if the guess text contains
-    "Probability: ...", we still take the final number. Allows . or , as decimal separator.
+    Uses the **first** occurrence of "probability:". Allows . or , as decimal separator.
     Returns None if the value is outside [0, 1] or parsing fails.
     """
     if not response_str or not isinstance(response_str, str):
         return None
-    # Case-insensitive: use last occurrence of "probability:" then take the next number
+    # Case-insensitive: use first occurrence of "probability:" then take the next number
     matches = list(re.finditer(r'probability\s*:\s*([0-9]+[.,]?[0-9]*)\s*%?', response_str, re.IGNORECASE))
     if not matches:
         matches = list(re.finditer(r'probability\s*:\s*(\d+(?:[.,]\d+)?)', response_str, re.IGNORECASE))
     if not matches:
         return None
-    match = matches[-1]
+    match = matches[0]
     raw = match.group(1).strip().replace(',', '.')
     try:
         value = float(raw)

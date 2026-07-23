@@ -25,10 +25,10 @@ python3 ./mass_mean_probe/run_mass_mean_probe.py \
   --num_samples 200 \
   --device cuda:0 \
   --ablate_layers 14-24 \
-  --alpha 0.0 1.0 2.0 \
+  --alpha 0.0 1.0 2.0 3.0 \
   --ablation_targets low high \
   --low_conf_threshold 0.1 \
   --high_conf_threshold 0.9 \
   --new_h5_format \
   --no-enable_brief \
-  --ablation_mode none probability_last_token_mean_replace current_generated_token_mean_replace
+  --ablation_mode none all_tokens_mean_replace generated_tokens_mean_replace

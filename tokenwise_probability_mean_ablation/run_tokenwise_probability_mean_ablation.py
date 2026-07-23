@@ -43,6 +43,7 @@ from layerwise_mean_ablation.run_mean_ablation import (
     _greedy_extend_with_fwd_hooks,
     collect_confidence_group_ids,
     compute_verbalised_embedding_group_means,
+    configure_prefix_tokens_for_model,
     construct_fewshot_prompt_from_indices,
     encode_example_id,
     greedy_generate,
@@ -154,14 +155,34 @@ def build_single_token_probability_hooks(
     decoded_tokens_provider: Callable[[], List[str]],
     token_position: int,
     expected_probability_tokens: int,
+    log_context: str = "",
 ) -> List[Tuple[str, Callable]]:
+    _last_logged_key: Dict[str, object | None] = {"value": None}
+
     def _abs_positions() -> List[int]:
-        return _absolute_prob_single_position(
+        decoded_tokens = decoded_tokens_provider()
+        positions = _absolute_prob_single_position(
             prompt_len,
-            decoded_tokens_provider(),
+            decoded_tokens,
             token_position=token_position,
             expected_probability_tokens=expected_probability_tokens,
         )
+        if positions:
+            seq_len = seq_len_provider()
+            log_key = (seq_len, tuple(positions))
+            if _last_logged_key["value"] != log_key:
+                _last_logged_key["value"] = log_key
+                prefix = f"{log_context} " if log_context else ""
+                rendered_tokens = [_render_token_label(token) for token in decoded_tokens]
+                logging.info(
+                    "%sAblation forward pass (parse ok): ablation_positions=%s prompt_len=%d seq_len=%d decoded_tokens=%s",
+                    prefix,
+                    positions,
+                    prompt_len,
+                    seq_len,
+                    rendered_tokens,
+                )
+        return positions
 
     return _build_resid_post_mean_replace_hooks(
         layer_to_mean_vectors,
@@ -179,6 +200,7 @@ def greedy_generate_probability_single_token_mean_replaced(
     layer_to_mean_vectors: Dict[int, torch.Tensor],
     token_position: int,
     expected_probability_tokens: int,
+    log_context: str = "",
 ) -> Tuple[str, List[str]]:
     tokens = model.to_tokens(local_prompt)
     prompt_len = int(tokens.shape[1])
@@ -197,6 +219,7 @@ def greedy_generate_probability_single_token_mean_replaced(
         decoded_tokens_provider=_decoded_tokens,
         token_position=token_position,
         expected_probability_tokens=expected_probability_tokens,
+        log_context=log_context,
     )
     return _greedy_extend_with_fwd_hooks(
         model,
@@ -370,6 +393,7 @@ def run_tokenwise_evaluation(
                         layer_to_mean_vectors=layer_to_mean_vectors_eval,
                         token_position=token_position,
                         expected_probability_tokens=expected_probability_tokens,
+                        log_context=f"{split_name} {ex_id} {_token_mode_key(token_position)}",
                     )
                 )
                 confidence = (
@@ -624,7 +648,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Tokenwise probability mean replacement inference (TransformerLens)."
     )
-    parser.add_argument("--model_name", type=str, default="mistralai/Mistral-7B-Instruct-v0.1")
+    parser.add_argument("--model_name", type=str, default="google/gemma-3-12b-it")
     parser.add_argument("--input_h5", type=str, required=True, help="Path to *_verbalised_embeddings.h5 file.")
     parser.add_argument(
         "--new_h5_format",
@@ -633,7 +657,7 @@ def main() -> None:
         help="If set, read 'res' from the new {res,attn,mlp} H5 response format.",
     )
     parser.add_argument("--device", type=str, default=None, help="e.g. cuda, cuda:0, cpu")
-    parser.add_argument("--dtype", type=str, default="float32", choices=["bfloat16", "float16", "float32"])
+    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--random_seed", type=int, default=10)
     parser.add_argument("--num_samples", type=int, default=400)
     parser.add_argument("--num_few_shot", type=int, default=0)
@@ -659,8 +683,8 @@ def main() -> None:
             "If false, reverse source and target groups."
         ),
     )
-    parser.add_argument("--expected_probability_tokens", type=int, default=7)
-    parser.add_argument("--expected_guess_tokens", type=int, default=5)
+    parser.add_argument("--expected_probability_tokens", type=int, default=5)
+    parser.add_argument("--expected_guess_tokens", type=int, default=2)
     parser.add_argument(
         "--parse_mode_verbalised_confidence",
         action=argparse.BooleanOptionalAction,
@@ -683,8 +707,29 @@ def main() -> None:
         help="Optional run directory. If unset, auto-creates under tokenwise_probability_mean_ablation/results.",
     )
     args = parser.parse_args()
+    configure_prefix_tokens_for_model(args.model_name)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.info(
+        "Run parameters: model_name=%s input_h5=%s dtype=%s num_samples=%s "
+        "ablate_layers=%s individual_layers=%s low_conf_threshold=%s high_conf_threshold=%s "
+        "mean_from_low_confidence=%s expected_probability_tokens=%s expected_guess_tokens=%s "
+        "new_h5_format=%s random_seed=%s output_dir=%s",
+        args.model_name,
+        args.input_h5,
+        args.dtype,
+        args.num_samples,
+        args.ablate_layers,
+        args.individual_layers,
+        args.low_conf_threshold,
+        args.high_conf_threshold,
+        args.mean_from_low_confidence,
+        args.expected_probability_tokens,
+        args.expected_guess_tokens,
+        args.new_h5_format,
+        args.random_seed,
+        args.output_dir,
+    )
 
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     torch_dtype = dtype_map[args.dtype]
@@ -709,10 +754,13 @@ def main() -> None:
 
     logging.info("Loading HookedTransformer: %s", args.model_name)
     model = load_hooked_transformer(args.model_name, device=device, torch_dtype=torch_dtype)
+    logging.info("Model loaded")
     ablate_layers = parse_ablate_layers(args.ablate_layers, model.cfg.n_layers)
     run_layers = list(range(model.cfg.n_layers)) if args.individual_layers else ablate_layers
 
+    logging.info("Loading examples: %s", args.input_h5)
     examples_h5 = load_examples_h5(Path(args.input_h5))
+    logging.info("Examples loaded")
     verbalised_embedding_means, low_ids, high_ids = compute_verbalised_embedding_group_means(
         examples_h5,
         run_layers,
@@ -723,6 +771,7 @@ def main() -> None:
         mean_from_low_confidence=args.mean_from_low_confidence,
         new_h5_format=args.new_h5_format,
     )
+    logging.info("Verbalised embedding means computed")
     if not args.parse_mode_verbalised_confidence:
         # Keep confidence-group checks and IDs consistent with the base implementation.
         low_ids, high_ids = collect_confidence_group_ids(

@@ -26,8 +26,8 @@ python3 ./blockwise_mean_ablation/run_blockwise_mean_ablation.py \
   --num_samples 200 \
   --device cuda:0 \
   --ablate_subblocks attn mlp \
-  --ablate_layers 10-16 \
-  --no-mean_from_low_confidence \
-  --ablation_mode none probability_first_token_mean_replace probability_first_two_tokens_mean_replace probability_first_two_and_index6_tokens_mean_replace probability_tokens_mean_replace
+  --ablate_layers 25-31 \
+  --ablation_mode none probability_tokens_mean_replace \
+  --no-mean_from_low_confidence
 
   # --ablation_mode none current_generated_token_mean_replace

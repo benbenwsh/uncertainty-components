@@ -110,7 +110,8 @@ def load_verbalised_confidence_data(train_path, test_path, layer_idx=32):
 
 
 def train_verbalised_confidence_probe(X_train, y_train, X_test, y_test, 
-                                       model_type='ridge', alpha=1.0, verbose=True):
+                                       model_type='ridge', alpha=1.0, verbose=True,
+                                       sample_weight=None):
     """
     Train a regressor to predict verbalised confidence.
     
@@ -122,6 +123,7 @@ def train_verbalised_confidence_probe(X_train, y_train, X_test, y_test,
         model_type: 'ridge' or 'linear'.
         alpha: Regularization strength for Ridge (how much to penalise large weights) (ignored for linear).
         verbose: If True, print training message and metrics (default: True).
+        sample_weight: Optional per-sample weights for fit (evaluation metrics stay unweighted).
     
     Returns:
         Trained model and metrics dictionary
@@ -137,7 +139,7 @@ def train_verbalised_confidence_probe(X_train, y_train, X_test, y_test,
     # Train model
     if verbose:
         print(f"\nTraining {model_type} regressor...")
-    model.fit(X_train, y_train)
+    model.fit(X_train, y_train, sample_weight=sample_weight)
     
     # Predictions
     y_train_pred = model.predict(X_train)
