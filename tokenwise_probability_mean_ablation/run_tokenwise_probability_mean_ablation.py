@@ -49,7 +49,7 @@ from layerwise_mean_ablation.run_mean_ablation import (
     greedy_generate,
     load_examples_h5,
     load_hooked_transformer,
-    load_trivia_qa,
+    load_eval_dataset,
     parse_ablate_layers,
     parse_guess_and_probability_indices,
     parse_mode_confidence_from_response,
@@ -475,6 +475,7 @@ def write_config_txt(
         f"finished_at={finished_at}",
         f"model_name={args.model_name}",
         f"input_h5={args.input_h5}",
+        f"dataset={args.dataset}",
         f"new_h5_format={args.new_h5_format}",
         f"device={device}",
         f"dtype={args.dtype}",
@@ -659,6 +660,12 @@ def main() -> None:
     parser.add_argument("--device", type=str, default=None, help="e.g. cuda, cuda:0, cpu")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--random_seed", type=int, default=10)
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="trivia_qa",
+        choices=["trivia_qa", "squad", "bioasq", "nq", "svamp", "gsm8k", "math"],
+    )
     parser.add_argument("--num_samples", type=int, default=400)
     parser.add_argument("--num_few_shot", type=int, default=0)
     parser.add_argument("--model_max_new_tokens", type=int, default=50)
@@ -711,12 +718,13 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     logging.info(
-        "Run parameters: model_name=%s input_h5=%s dtype=%s num_samples=%s "
+        "Run parameters: model_name=%s input_h5=%s dataset=%s dtype=%s num_samples=%s "
         "ablate_layers=%s individual_layers=%s low_conf_threshold=%s high_conf_threshold=%s "
         "mean_from_low_confidence=%s expected_probability_tokens=%s expected_guess_tokens=%s "
         "new_h5_format=%s random_seed=%s output_dir=%s",
         args.model_name,
         args.input_h5,
+        args.dataset,
         args.dtype,
         args.num_samples,
         args.ablate_layers,
@@ -735,7 +743,7 @@ def main() -> None:
     torch_dtype = dtype_map[args.dtype]
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_ds, val_ds = load_trivia_qa(args.random_seed)
+    train_ds, val_ds = load_eval_dataset(args.dataset, args.random_seed)
     random.seed(args.random_seed)
     answerable_train = split_answerable_indices(train_ds)
     if len(answerable_train) < args.num_few_shot:
@@ -863,6 +871,7 @@ def main() -> None:
 
         summary = {
             "run_root": run_root,
+            "dataset": args.dataset,
             "baseline": {
                 "mode": "no_replacement",
                 "mean_confidence": baseline_mean,
@@ -994,6 +1003,7 @@ def main() -> None:
 
     summary = {
         "run_root": run_root,
+        "dataset": args.dataset,
         "individual_layers": True,
         "run_layers": list(run_layers),
         "baseline": {

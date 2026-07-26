@@ -20,6 +20,10 @@ Output:
 
   Also writes a companion *_summary.json with the same structure but embedding
   fields reduced to shape metadata only (no value previews).
+
+  With --balance (default), also writes a median-capped balanced copy under
+  a `balanced/` subdirectory. Use --balance_from_h5 to balance an existing
+  verbalised embeddings HDF5 without re-running processing.
 """
 
 import argparse
@@ -28,6 +32,7 @@ import logging
 import re
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import h5py
@@ -875,6 +880,138 @@ def iter_h5_examples(path: Path):
             yield example_id, _read_h5_node(examples_group[example_id])
 
 
+def _read_verbalised_confidence_from_h5_example(example_node) -> float | None:
+    """Read verbalised_confidence from a processed example H5 group (responses/0/...)."""
+    if "responses" not in example_node:
+        return None
+    responses = example_node["responses"]
+    if "0" not in responses:
+        return None
+    response0 = responses["0"]
+    if "verbalised_confidence" not in response0:
+        return None
+    value = _decode_h5_scalar(response0["verbalised_confidence"][()])
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def balance_dataset(src_h5: Path, out_dir: Path) -> int:
+    """
+    Median-cap examples by verbalised_confidence rounded to 2 d.p.
+
+    Writes `{stem}.h5`, `{stem}.json`, `{stem}_summary.json`, and `samples.txt`
+    under `out_dir`. Kept examples preserve original (unrounded) confidence.
+    Returns the number of kept examples.
+    """
+    if not src_h5.exists():
+        raise FileNotFoundError(f"Source HDF5 not found: {src_h5}")
+
+    bins: dict[float, list[str]] = defaultdict(list)
+    n_skip = 0
+    with h5py.File(src_h5, "r") as input_h5:
+        if "examples" not in input_h5:
+            raise ValueError(f"Input HDF5 missing 'examples' group: {src_h5}")
+        examples_group = input_h5["examples"]
+        for example_id in examples_group.keys():
+            conf = _read_verbalised_confidence_from_h5_example(examples_group[example_id])
+            if conf is None:
+                n_skip += 1
+                logging.warning(
+                    "Example %s missing/invalid verbalised_confidence; skipping for balance.",
+                    example_id,
+                )
+                continue
+            bins[round(conf, 2)].append(str(example_id))
+
+    if not bins:
+        raise ValueError(f"No examples with verbalised_confidence found in {src_h5}")
+
+    bin_counts = [len(ids) for ids in bins.values()]
+    cap = int(np.median(bin_counts))
+    keep_ids: set[str] = set()
+    for rounded, ids in bins.items():
+        kept_for_bin = ids[:cap]
+        keep_ids.update(kept_for_bin)
+        logging.info(
+            "Balance bin %.2f: count=%d kept=%d%s",
+            rounded,
+            len(ids),
+            len(kept_for_bin),
+            " (capped)" if len(ids) > cap else "",
+        )
+
+    logging.info(
+        "Balance median cap=%d over %d bins; keeping %d / %d examples (skipped %d)",
+        cap,
+        len(bins),
+        len(keep_ids),
+        sum(bin_counts),
+        n_skip,
+    )
+    if not keep_ids:
+        raise ValueError(f"Balance produced zero kept examples from {src_h5}")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = src_h5.stem
+    h5_path = out_dir / f"{stem}.h5"
+    json_path = out_dir / f"{stem}.json"
+    json_summary_path = out_dir / f"{stem}_summary.json"
+    samples_txt_path = out_dir / "samples.txt"
+
+    with h5py.File(h5_path, "w") as h5_file:
+        h5_file.attrs["format"] = "native_examples_v1"
+        h5_file.require_group("examples")
+
+    n_kept = 0
+    first_item = True
+    with (
+        h5py.File(h5_path, "a") as out_h5,
+        open(json_path, "w", encoding="utf-8") as json_file,
+        open(json_summary_path, "w", encoding="utf-8") as json_summary_file,
+    ):
+        out_examples = out_h5["examples"]
+        json_file.write("{\n")
+        json_summary_file.write("{\n")
+        for example_id, example in iter_h5_examples(src_h5):
+            eid = str(example_id)
+            if eid not in keep_ids:
+                continue
+
+            n_kept += 1
+            if eid in out_examples:
+                del out_examples[eid]
+            _write_h5_node(out_examples, eid, example)
+
+            if not first_item:
+                json_file.write(",\n")
+                json_summary_file.write(",\n")
+            json_file.write(f'  "{example_id}": ')
+            json_summary_file.write(f'  "{example_id}": ')
+            json_str = json.dumps(convert_for_json(example), indent=2)
+            json_summary_str = json.dumps(convert_for_json(example, shape_only=True), indent=2)
+            indented = "\n".join("    " + line if line.strip() else line for line in json_str.split("\n"))
+            json_summary_indented = "\n".join(
+                "    " + line if line.strip() else line for line in json_summary_str.split("\n")
+            )
+            json_file.write(indented)
+            json_summary_file.write(json_summary_indented)
+            first_item = False
+
+        json_file.write("\n}")
+        json_summary_file.write("\n}")
+
+    with open(samples_txt_path, "w", encoding="utf-8") as f:
+        f.write(f"{n_kept} samples\n")
+
+    logging.info("Wrote balanced %s", h5_path)
+    logging.info("Wrote balanced %s", json_path)
+    logging.info("Wrote balanced %s", json_summary_path)
+    logging.info("Wrote balanced %s", samples_txt_path)
+    return n_kept
+
+
 def write_config_txt(run_dir: Path, args, input_path: Path, out_base: str, output_paths: dict[str, Path]) -> Path:
     config_path = run_dir / "config.txt"
     lines = [
@@ -909,7 +1046,7 @@ def main():
     # Remember to change the prefix 2D list based on the model
     parser.add_argument(
         "--input",
-        required=True,
+        default=None,
         help="Path to train_generations.h5 or validation_generations.h5",
     )
     parser.add_argument(
@@ -970,7 +1107,50 @@ def main():
             "(for example, 7 to 9 with default --expected_probability_tokens)."
         ),
     )
+    parser.add_argument(
+        "--balance",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "After processing, write a median-capped balanced copy under balanced/ "
+            "(default: True). Ignored when --balance_from_h5 is set."
+        ),
+    )
+    parser.add_argument(
+        "--balance_from_h5",
+        default=None,
+        help=(
+            "Path to an existing verbalised embeddings HDF5 to balance. "
+            "Skips normal processing; writes outputs under <parent>/balanced/."
+        ),
+    )
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-8s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    if args.balance_from_h5 is not None:
+        src_h5 = Path(args.balance_from_h5)
+        if not src_h5.exists():
+            logging.error("Balance source HDF5 not found: %s", src_h5)
+            sys.exit(1)
+        out_dir = src_h5.parent / "balanced"
+        logging.info("Balance-only mode: balancing %s into %s", src_h5, out_dir)
+        try:
+            n_kept = balance_dataset(src_h5, out_dir)
+        except (FileNotFoundError, ValueError) as exc:
+            logging.error("%s", exc)
+            sys.exit(1)
+        total_elapsed = time.perf_counter() - total_start
+        logging.info("Balanced %d examples in %.2fs", n_kept, total_elapsed)
+        return
+
+    if args.input is None:
+        logging.error("Either --input or --balance_from_h5 is required")
+        sys.exit(1)
 
     input_path = Path(args.input)
     if not input_path.exists():
@@ -1091,6 +1271,17 @@ def main():
     with open(samples_txt_path, "w", encoding="utf-8") as f:
         f.write(f"{n_ok} samples\n")
     logging.info("Wrote %s", samples_txt_path)
+
+    if args.balance:
+        balanced_dir = run_dir / "balanced"
+        logging.info("Balancing dataset into %s", balanced_dir)
+        try:
+            n_kept = balance_dataset(h5_path, balanced_dir)
+        except (FileNotFoundError, ValueError) as exc:
+            logging.error("%s", exc)
+            sys.exit(1)
+        logging.info("Balanced dataset kept %d examples", n_kept)
+
     total_elapsed = time.perf_counter() - total_start
     append_total_duration_to_config(config_path, total_elapsed)
     logging.info("Updated %s with total_duration_seconds=%.2f", config_path, total_elapsed)

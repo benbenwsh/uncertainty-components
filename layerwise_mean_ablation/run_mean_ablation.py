@@ -13,7 +13,9 @@ positions are replaced with those low-confidence means.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime
+import gc
 import json
 import logging
 import os
@@ -27,9 +29,10 @@ import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from datasets import Dataset, load_dataset
+from datasets import Dataset
 from transformers import AutoTokenizer
 from transformer_lens import HookedTransformer
+from transformer_lens.weight_processing import ProcessWeights
 
 # ---------------------------------------------------------------------------
 # Prompts (match generate_answers_with_confidence.py / utils defaults)
@@ -209,10 +212,23 @@ def parse_guess_start_index(decoded_tokens: List[str]) -> Optional[int]:
 # ---------------------------------------------------------------------------
 
 
+def load_eval_dataset(dataset_name: str, seed: int) -> Tuple[Dataset, Dataset]:
+    """Load train/validation splits via semantic_uncertainty.data_utils.load_ds."""
+    import sys
+
+    sem_unc_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "semantic_uncertainty")
+    if sem_unc_root not in sys.path:
+        sys.path.insert(0, sem_unc_root)
+    from uncertainty.data.data_utils import load_ds
+
+    train_ds, val_ds = load_ds(dataset_name, seed=seed)
+    if train_ds is None or val_ds is None:
+        raise ValueError(f"Unsupported or failed dataset load: {dataset_name}")
+    return train_ds, val_ds
+
+
 def load_trivia_qa(seed: int) -> Tuple[Dataset, Dataset]:
-    raw = load_dataset("TimoImhof/TriviaQA-in-SQuAD-format")["unmodified"]
-    split = raw.train_test_split(test_size=0.2, seed=seed)
-    return split["train"], split["test"]
+    return load_eval_dataset("trivia_qa", seed)
 
 
 def split_answerable_indices(dataset: Dataset) -> List[int]:
@@ -518,20 +534,72 @@ def _mean_and_count(values: Sequence[float]) -> Tuple[Optional[float], int]:
     return float(np.mean(values)), len(values)
 
 
+@contextmanager
+def _without_tl_noop_fp32_upcast():
+    """Skip TL's full-state-dict fp32 upcast when no weight processing is requested.
+
+    ``ProcessWeights.process_weights`` always upcasts every tensor to float32 even
+    when fold/center flags are all False. That temporary copy OOMs large models
+    (e.g. Qwen-32B) on both host RAM and 80GB GPUs.
+    """
+    original = ProcessWeights.__dict__["process_weights"]
+    original_fn = original.__func__ if isinstance(original, staticmethod) else original
+
+    def _process_weights(
+        state_dict,
+        cfg,
+        fold_ln=False,
+        center_writing_weights=False,
+        center_unembed=False,
+        fold_value_biases=False,
+        refactor_factored_attn_matrices=False,
+        adapter=None,
+    ):
+        if not (
+            fold_ln
+            or center_writing_weights
+            or center_unembed
+            or fold_value_biases
+            or refactor_factored_attn_matrices
+        ):
+            return state_dict
+        return original_fn(
+            state_dict,
+            cfg,
+            fold_ln=fold_ln,
+            center_writing_weights=center_writing_weights,
+            center_unembed=center_unembed,
+            fold_value_biases=fold_value_biases,
+            refactor_factored_attn_matrices=refactor_factored_attn_matrices,
+            adapter=adapter,
+        )
+
+    ProcessWeights.process_weights = staticmethod(_process_weights)
+    try:
+        yield
+    finally:
+        ProcessWeights.process_weights = original
+
+
 def load_hooked_transformer(
     model_name: str,
     *,
     device: str,
     torch_dtype: torch.dtype,
 ) -> HookedTransformer:
+    def _from_pretrained(**extra_kwargs):
+        with _without_tl_noop_fp32_upcast():
+            # Disable fold/center processing so the fp32 upcast is unnecessary.
+            return HookedTransformer.from_pretrained_no_processing(
+                model_name,
+                device=device,
+                dtype=torch_dtype,
+                low_cpu_mem_usage=True,
+                **extra_kwargs,
+            )
+
     try:
-        return HookedTransformer.from_pretrained(
-            model_name,
-            fold_ln=False,
-            center_writing_weights=False,
-            device=device,
-            dtype=torch_dtype,
-        )
+        model = _from_pretrained()
     except Exception as exc:
         if "PyPreTokenizerTypeWrapper" not in str(exc):
             raise
@@ -544,14 +612,12 @@ def load_hooked_transformer(
             use_fast=False,
             token=hf_token,
         )
-        return HookedTransformer.from_pretrained(
-            model_name,
-            fold_ln=False,
-            center_writing_weights=False,
-            device=device,
-            dtype=torch_dtype,
-            tokenizer=slow_tokenizer,
-        )
+        model = _from_pretrained(tokenizer=slow_tokenizer)
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return model
 
 
 # ---------------------------------------------------------------------------

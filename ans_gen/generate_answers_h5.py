@@ -782,7 +782,7 @@ def build_parser():
         "--dataset",
         type=str,
         default="trivia_qa",
-        choices=["trivia_qa", "squad", "bioasq", "nq", "svamp"],
+        choices=["trivia_qa", "squad", "bioasq", "nq", "svamp", "gsm8k", "math"],
     )
     parser.add_argument("--num_samples", type=int, default=1000)
     parser.add_argument(

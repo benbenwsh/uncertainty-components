@@ -46,6 +46,96 @@ def load_ds(dataset_name, seed, add_options=None):
         train_dataset = [reformat(d) for d in train_dataset]
         validation_dataset = [reformat(d) for d in validation_dataset]
 
+    elif dataset_name == "gsm8k":
+        # openai/gsm8k parquet currently lists duplicate shards (2x expected size);
+        # skip size verification and keep unique questions.
+        dataset = datasets.load_dataset(
+            "openai/gsm8k",
+            "main",
+            verification_mode="no_checks",
+        )
+        train_dataset = dataset["train"]
+        validation_dataset = dataset["test"]
+        md5hash = lambda s: str(int(hashlib.md5(s.encode("utf-8")).hexdigest(), 16))
+
+        def _gsm8k_final_answer(answer_text):
+            answer_text = str(answer_text)
+            if "####" in answer_text:
+                return answer_text.rsplit("####", 1)[-1].strip()
+            return answer_text.strip()
+
+        def _dedupe_by_question(split):
+            seen = set()
+            out = []
+            for ex in split:
+                question = ex["question"]
+                if question in seen:
+                    continue
+                seen.add(question)
+                out.append(ex)
+            return out
+
+        train_dataset = _dedupe_by_question(train_dataset)
+        validation_dataset = _dedupe_by_question(validation_dataset)
+
+        reformat = lambda x: {
+            "question": x["question"],
+            "context": "",
+            "id": md5hash(str(x["question"])),
+            "answers": {"text": [_gsm8k_final_answer(x["answer"])]},
+        }
+
+        train_dataset = [reformat(d) for d in train_dataset]
+        validation_dataset = [reformat(d) for d in validation_dataset]
+
+    elif dataset_name == "math":
+        # Hendrycks MATH (competition math). Parquet metadata can disagree with
+        # shard sizes; skip size verification like gsm8k.
+        dataset = datasets.load_dataset(
+            "DigitalLearningGmbH/MATH-lighteval",
+            verification_mode="no_checks",
+        )
+        train_dataset = dataset["train"]
+        validation_dataset = dataset["test"]
+        md5hash = lambda s: str(int(hashlib.md5(s.encode("utf-8")).hexdigest(), 16))
+
+        def _math_boxed_answer(solution_text):
+            """Extract the final answer from the last \\boxed{...} in the solution."""
+            solution_text = str(solution_text)
+            idx = solution_text.rfind(r"\boxed")
+            if idx < 0:
+                return None
+            brace_start = solution_text.find("{", idx)
+            if brace_start < 0:
+                return None
+            depth = 0
+            for j in range(brace_start, len(solution_text)):
+                if solution_text[j] == "{":
+                    depth += 1
+                elif solution_text[j] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return solution_text[brace_start + 1:j].strip()
+            return None
+
+        def _reformat_math(example):
+            answer = _math_boxed_answer(example["solution"])
+            if answer is None:
+                return None
+            return {
+                "question": example["problem"],
+                "context": "",
+                "id": md5hash(str(example["problem"])),
+                "level": example.get("level"),
+                "type": example.get("type"),
+                "answers": {"text": [answer]},
+            }
+
+        train_dataset = [r for d in train_dataset if (r := _reformat_math(d)) is not None]
+        validation_dataset = [
+            r for d in validation_dataset if (r := _reformat_math(d)) is not None
+        ]
+
     elif dataset_name == "trivia_qa":
         dataset = datasets.load_dataset('TimoImhof/TriviaQA-in-SQuAD-format')['unmodified']
        

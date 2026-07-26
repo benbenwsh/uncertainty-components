@@ -67,7 +67,7 @@ from mass_mean_probe.run_mass_mean_probe import (
     load_examples_h5,
     load_hooked_transformer,
     load_sentence_transformer_for_metrics,
-    load_trivia_qa,
+    load_eval_dataset,
     mode_to_output_key,
     parse_ablate_layers,
     parse_mode_confidence_from_response,
@@ -918,6 +918,7 @@ def write_config_txt(
         "",
         "[Data]",
         f"input_h5={args.input_h5}",
+        f"dataset={args.dataset}",
         f"new_h5_format={args.new_h5_format}",
         f"h5_example_count={h5_example_count}",
         f"random_seed={args.random_seed}",
@@ -1049,6 +1050,12 @@ def main() -> None:
     parser.add_argument("--device", type=str, default=None, help="e.g. cuda, cuda:0, cpu")
     parser.add_argument("--dtype", type=str, default="float32", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--random_seed", type=int, default=10)
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="trivia_qa",
+        choices=["trivia_qa", "squad", "bioasq", "nq", "svamp", "gsm8k", "math"],
+    )
     parser.add_argument("--num_samples", type=int, default=400)
     parser.add_argument("--num_few_shot", type=int, default=0)
     parser.add_argument("--model_max_new_tokens", type=int, default=50)
@@ -1221,7 +1228,7 @@ def main() -> None:
     torch_dtype = dtype_map[args.dtype]
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_ds, val_ds = load_trivia_qa(args.random_seed)
+    train_ds, val_ds = load_eval_dataset(args.dataset, args.random_seed)
     random.seed(args.random_seed)
     answerable_train = split_answerable_indices(train_ds)
     if len(answerable_train) < args.num_few_shot:

@@ -15,35 +15,26 @@ source /vol/cuda/13.0.0/setup.sh
 /usr/bin/nvidia-smi
 uptime
 
-# Standard tokenwise run across a layer span:
 # python3 ./tokenwise_probability_mean_ablation/run_tokenwise_probability_mean_ablation.py \
-#   --input_h5 ./process_generations/processed_generations_more_h5/2_200_concat/train_verbalised_embeddings.h5 \
+#   --model_name Qwen/Qwen2.5-32B-Instruct \
+#   --input_h5 ./process_generations/processed_generations_more_h5/qwen_32B/22_svamp_32B_train/train_verbalised_embeddings.h5 \
+#   --dataset svamp \
 #   --no-enable_brief \
-#   --num_samples 80 \
+#   --num_samples 50 \
 #   --device cuda:0 \
 #   --dtype bfloat16 \
-#   --ablate_layers 10-16 \
 #   --new_h5_format \
-#   --individual_layers
-
-python3 ./tokenwise_probability_mean_ablation/run_tokenwise_probability_mean_ablation.py \
-  --model_name Qwen/Qwen2.5-32B-Instruct \
-  --input_h5 ./process_generations/processed_generations_more_h5/2_200_concat/train_verbalised_embeddings.h5 \
-  --no-enable_brief \
-  --num_samples 50 \
-  --device cuda:0 \
-  --dtype bfloat16 \
-  --new_h5_format \
-  --low_conf_threshold 0.1 \
-  --high_conf_threshold 0.9 \
-  --individual_layers \
-  --no-mean_from_low_confidence
+#   --low_conf_threshold 0.1 \
+#   --high_conf_threshold 0.9 \
+#   --individual_layers \
+#   --no-mean_from_low_confidence
 
 # Individual-layer mode (uncomment to run layer x token grid output):
 # # Qwen
 # python3 ./tokenwise_probability_mean_ablation/run_tokenwise_probability_mean_ablation.py \
 #   --model_name Qwen/Qwen2.5-32B-Instruct \
-#   --input_h5 ./process_generations/processed_generations_more_h5/old_parsing/16_32B_1000_train/train_verbalised_embeddings.h5 \
+#   --input_h5 ./process_generations/processed_generations_more_h5/qwen_32B/23_32B_1000_train/train_verbalised_embeddings.h5 \
+#   --dataset trivia_qa \
 #   --no-enable_brief \
 #   --num_samples 50 \
 #   --device cuda:0 \
@@ -52,19 +43,21 @@ python3 ./tokenwise_probability_mean_ablation/run_tokenwise_probability_mean_abl
 #   --low_conf_threshold 0.25 \
 #   --high_conf_threshold 0.9 \
 #   --individual_layers \
-#   --no-mean_from_low_confidence
 
 # Gemma
-# python3 ./tokenwise_probability_mean_ablation/run_tokenwise_probability_mean_ablation.py \
-#   --model_name google/gemma-3-12b-it \
-#   --input_h5 ./process_generations/processed_generations_more_h5/gemma/24_gemma_1000_train/train_verbalised_embeddings.h5 \
-#   --no-enable_brief \
-#   --num_samples 50 \
-#   --device cuda:0 \
-#   --dtype bfloat16 \
-#   --new_h5_format \
-#   --low_conf_threshold 0.6 \
-#   --high_conf_threshold 0.9 \
-#   --individual_layers \
-#   --expected_guess_tokens 3 \
-#   # --no-mean_from_low_confidence
+python3 ./tokenwise_probability_mean_ablation/run_tokenwise_probability_mean_ablation.py \
+  --model_name google/gemma-3-12b-it \
+  --input_h5 ./process_generations/processed_generations_more_h5/gemma/24_gemma_1000_train/balanced/train_verbalised_embeddings.h5 \
+  --dataset trivia_qa \
+  --no-enable_brief \
+  --num_samples 200 \
+  --device cuda:0 \
+  --dtype bfloat16 \
+  --new_h5_format \
+  --low_conf_threshold 0.6 \
+  --high_conf_threshold 0.9 \
+  --individual_layers \
+  --expected_guess_tokens 3 \
+  --no-mean_from_low_confidence
+
+# so the oom on cpu is indeed because of the process weight float upcasting

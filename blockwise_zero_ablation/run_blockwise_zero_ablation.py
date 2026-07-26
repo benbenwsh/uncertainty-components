@@ -16,6 +16,7 @@ import logging
 import os
 import random
 import re
+import sys
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
@@ -24,11 +25,14 @@ import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from datasets import Dataset, load_dataset
+from datasets import Dataset
 from transformers import AutoTokenizer
 from transformer_lens import HookedTransformer
 
-from layerwise_mean_ablation.run_mean_ablation import PROBABILITY_ROW_INDEX_MODES
+from layerwise_mean_ablation.run_mean_ablation import (
+    PROBABILITY_ROW_INDEX_MODES,
+    load_hooked_transformer,
+)
 
 CONFIDENCE_PROMPT = (
     "Provide your best guess and the probability that it is correct (0.0 to 1.0) "
@@ -119,10 +123,17 @@ def parse_guess_start_index(decoded_tokens: List[str]) -> Optional[int]:
     return last_guess_token_index
 
 
-def load_trivia_qa(seed: int) -> Tuple[Dataset, Dataset]:
-    raw = load_dataset("TimoImhof/TriviaQA-in-SQuAD-format")["unmodified"]
-    split = raw.train_test_split(test_size=0.2, seed=seed)
-    return split["train"], split["test"]
+def load_eval_dataset(dataset_name: str, seed: int):
+    """Load train/validation splits via semantic_uncertainty.data_utils.load_ds."""
+    sem_unc_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "semantic_uncertainty")
+    if sem_unc_root not in sys.path:
+        sys.path.insert(0, sem_unc_root)
+    from uncertainty.data.data_utils import load_ds
+
+    train_ds, val_ds = load_ds(dataset_name, seed=seed)
+    if train_ds is None or val_ds is None:
+        raise ValueError(f"Unsupported or failed dataset load: {dataset_name}")
+    return train_ds, val_ds
 
 
 def split_answerable_indices(dataset: Dataset) -> List[int]:
@@ -210,6 +221,7 @@ def write_config_txt(
         "",
         "[Data]",
         f"input_h5={args.input_h5}",
+        f"dataset={args.dataset}",
         f"h5_example_count={h5_example_count}",
         f"random_seed={args.random_seed}",
         f"num_samples={args.num_samples}",
@@ -315,38 +327,6 @@ def parse_probability_from_response(response_str: str) -> float | None:
     if value < 0 or value > 1:
         return None
     return value
-
-
-def load_hooked_transformer(
-    model_name: str,
-    *,
-    device: str,
-    torch_dtype: torch.dtype,
-) -> HookedTransformer:
-    try:
-        return HookedTransformer.from_pretrained(
-            model_name,
-            fold_ln=False,
-            center_writing_weights=False,
-            device=device,
-            dtype=torch_dtype,
-        )
-    except Exception as exc:
-        if "PyPreTokenizerTypeWrapper" not in str(exc):
-            raise
-        logging.warning("Fast tokenizer load failed (%s). Retrying with use_fast=False.", exc)
-        hf_token = os.environ.get("HF_TOKEN", None)
-        slow_tokenizer = AutoTokenizer.from_pretrained(
-            model_name, add_bos_token=True, trust_remote_code=True, use_fast=False, token=hf_token
-        )
-        return HookedTransformer.from_pretrained(
-            model_name,
-            fold_ln=False,
-            center_writing_weights=False,
-            device=device,
-            dtype=torch_dtype,
-            tokenizer=slow_tokenizer,
-        )
 
 
 def _decode_h5_string(value):
@@ -981,6 +961,12 @@ def main() -> None:
     parser.add_argument("--device", type=str, default=None, help="e.g. cuda, cuda:0, cpu")
     parser.add_argument("--dtype", type=str, default="float32", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--random_seed", type=int, default=10)
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="trivia_qa",
+        choices=["trivia_qa", "squad", "bioasq", "nq", "svamp", "gsm8k"],
+    )
     parser.add_argument("--num_samples", type=int, default=400)
     parser.add_argument("--num_few_shot", type=int, default=0)
     parser.add_argument("--model_max_new_tokens", type=int, default=50)
@@ -1133,7 +1119,7 @@ def main() -> None:
     torch_dtype = dtype_map[args.dtype]
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_ds, val_ds = load_trivia_qa(args.random_seed)
+    train_ds, val_ds = load_eval_dataset(args.dataset, args.random_seed)
     random.seed(args.random_seed)
     answerable_train = split_answerable_indices(train_ds)
     if len(answerable_train) < args.num_few_shot:

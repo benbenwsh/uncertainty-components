@@ -15,11 +15,8 @@ source /vol/cuda/13.0.0/setup.sh
 /usr/bin/nvidia-smi
 uptime
 
-python3 ./ans_gen/generate_answers_h5.py \
-  --model_name google/gemma-3-12b-it \
-  --num_samples 2000 \
-  --answerable_only \
-  --collect_attn_block_embeddings \
-  --collect_mlp_block_embeddings \
-  --collect_qkvo_embeddings \
-  --dataset trivia_qa
+python3 ./calibration_metrics/run_calibration_metrics.py \
+  --model_name mistralai/Mistral-7B-Instruct-v0.1 \
+  --dataset trivia_qa \
+  --num_samples 1000 \
+  --answerable_only
