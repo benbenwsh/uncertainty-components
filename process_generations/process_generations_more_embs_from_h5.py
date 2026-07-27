@@ -21,9 +21,10 @@ Output:
   Also writes a companion *_summary.json with the same structure but embedding
   fields reduced to shape metadata only (no value previews).
 
-  With --balance (default), also writes a median-capped balanced copy under
-  a `balanced/` subdirectory. Use --balance_from_h5 to balance an existing
-  verbalised embeddings HDF5 without re-running processing.
+  With --balance (default), also writes a balanced copy under a `balanced/`
+  subdirectory, capping each verbalised_confidence bin at --balance_cap.
+  Use --balance_from_h5 to balance an existing verbalised embeddings HDF5
+  without re-running processing.
 """
 
 import argparse
@@ -54,27 +55,40 @@ _EMBEDDING_KEYS = frozenset(
     }
 )
 
-# # Gemma-3 token alternatives (fixed length; each inner list = allowed tokens at that position)
-# GUESS_PREFIX_TOKENS = [
-#     ["\n", "\n\n"],
-#     ["Guess"],
-#     [":"],
-# ]
-# PROBABILITY_PREFIX_TOKENS = [
-#     ["\n"],
-#     ["Probability", " Probability"],
-#     [":"],
-#     [" "],
-# ]
+# Gemma-3 token alternatives (fixed length; each inner list = allowed tokens at that position)
+GEMMA_GUESS_PREFIX_TOKENS = [
+    ["\n", "\n\n"],
+    ["Guess"],
+    [":"],
+]
+GEMMA_PROBABILITY_PREFIX_TOKENS = [
+    ["\n"],
+    ["Probability", " Probability"],
+    [":"],
+    [" "],
+]
+
+# Qwen2.5 token alternatives (from ans_gen/generated_answers/3_32B_200 decoded tokens)
+QWEN_GUESS_PREFIX_TOKENS = [
+    [" Guess", "Guess"],
+    [":"],
+]
+QWEN_PROBABILITY_PREFIX_TOKENS = [
+    ["\n"],
+    [" Probability"],
+    [":"],
+    [" "],
+]
+
 # Mistral-7B-Instruct-v0.1 (from ans_gen/generated_answers/1_svamp_mistral)
-GUESS_PREFIX_TOKENS = [
+MISTRAL_GUESS_PREFIX_TOKENS = [
     ["\n"],
     ["\n"],
     ["Gu"],
     ["ess"],
     [":"],
 ]
-PROBABILITY_PREFIX_TOKENS = [
+MISTRAL_PROBABILITY_PREFIX_TOKENS = [
     ["\n"],
     ["Pro"],
     ["b"],
@@ -82,17 +96,30 @@ PROBABILITY_PREFIX_TOKENS = [
     [":"],
     [""],  # space before number decodes as empty string
 ]
-# # Qwen-2.5-32B
-# GUESS_PREFIX_TOKENS = [
-#     [" Guess"],
-#     [":"],
-# ]
-# PROBABILITY_PREFIX_TOKENS = [
-#     ["\n"],
-#     [" Probability"],
-#     [":"],
-#     [" "],
-# ]
+
+# Active tables; set via configure_prefix_tokens_for_model(model_name).
+GUESS_PREFIX_TOKENS: list[list[str]] = GEMMA_GUESS_PREFIX_TOKENS
+PROBABILITY_PREFIX_TOKENS: list[list[str]] = GEMMA_PROBABILITY_PREFIX_TOKENS
+
+
+def configure_prefix_tokens_for_model(model_name: str) -> None:
+    """Set GUESS/PROBABILITY_PREFIX_TOKENS from exact model_name (case-sensitive)."""
+    global GUESS_PREFIX_TOKENS, PROBABILITY_PREFIX_TOKENS
+    if model_name == "google/gemma-3-12b-it":
+        GUESS_PREFIX_TOKENS = GEMMA_GUESS_PREFIX_TOKENS
+        PROBABILITY_PREFIX_TOKENS = GEMMA_PROBABILITY_PREFIX_TOKENS
+    elif model_name == "Qwen/Qwen2.5-32B-Instruct":
+        GUESS_PREFIX_TOKENS = QWEN_GUESS_PREFIX_TOKENS
+        PROBABILITY_PREFIX_TOKENS = QWEN_PROBABILITY_PREFIX_TOKENS
+    elif model_name == "mistralai/Mistral-7B-Instruct-v0.1":
+        GUESS_PREFIX_TOKENS = MISTRAL_GUESS_PREFIX_TOKENS
+        PROBABILITY_PREFIX_TOKENS = MISTRAL_PROBABILITY_PREFIX_TOKENS
+    else:
+        raise ValueError(
+            f"Unsupported model_name for Guess/Probability token parsing: {model_name!r}. "
+            "Supported: 'google/gemma-3-12b-it', 'Qwen/Qwen2.5-32B-Instruct', "
+            "'mistralai/Mistral-7B-Instruct-v0.1'."
+        )
 
 
 def _tensor_to_numpy(obj):
@@ -897,14 +924,16 @@ def _read_verbalised_confidence_from_h5_example(example_node) -> float | None:
         return None
 
 
-def balance_dataset(src_h5: Path, out_dir: Path) -> int:
+def balance_dataset(src_h5: Path, out_dir: Path, *, balance_cap: int) -> int:
     """
-    Median-cap examples by verbalised_confidence rounded to 2 d.p.
+    Cap examples per verbalised_confidence bin (rounded to 2 d.p.) at ``balance_cap``.
 
     Writes `{stem}.h5`, `{stem}.json`, `{stem}_summary.json`, and `samples.txt`
     under `out_dir`. Kept examples preserve original (unrounded) confidence.
     Returns the number of kept examples.
     """
+    if balance_cap < 1:
+        raise ValueError(f"balance_cap must be >= 1, got {balance_cap}")
     if not src_h5.exists():
         raise FileNotFoundError(f"Source HDF5 not found: {src_h5}")
 
@@ -929,22 +958,21 @@ def balance_dataset(src_h5: Path, out_dir: Path) -> int:
         raise ValueError(f"No examples with verbalised_confidence found in {src_h5}")
 
     bin_counts = [len(ids) for ids in bins.values()]
-    cap = int(np.median(bin_counts))
     keep_ids: set[str] = set()
     for rounded, ids in bins.items():
-        kept_for_bin = ids[:cap]
+        kept_for_bin = ids[:balance_cap]
         keep_ids.update(kept_for_bin)
         logging.info(
             "Balance bin %.2f: count=%d kept=%d%s",
             rounded,
             len(ids),
             len(kept_for_bin),
-            " (capped)" if len(ids) > cap else "",
+            " (capped)" if len(ids) > balance_cap else "",
         )
 
     logging.info(
-        "Balance median cap=%d over %d bins; keeping %d / %d examples (skipped %d)",
-        cap,
+        "Balance cap=%d over %d bins; keeping %d / %d examples (skipped %d)",
+        balance_cap,
         len(bins),
         len(keep_ids),
         sum(bin_counts),
@@ -1043,7 +1071,16 @@ def main():
     parser = argparse.ArgumentParser(
         description="Process HDF5 generations into verbalised-confidence embedding HDF5."
     )
-    # Remember to change the prefix 2D list based on the model
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="google/gemma-3-12b-it",
+        help=(
+            "Model name used to select Guess/Probability prefix token tables. "
+            "Supported: google/gemma-3-12b-it, Qwen/Qwen2.5-32B-Instruct, "
+            "mistralai/Mistral-7B-Instruct-v0.1."
+        ),
+    )
     parser.add_argument(
         "--input",
         default=None,
@@ -1108,12 +1145,31 @@ def main():
         ),
     )
     parser.add_argument(
+        "--max_examples",
+        type=int,
+        default=None,
+        help=(
+            "If set, stop after this many successfully processed examples "
+            "(rejected examples do not count)."
+        ),
+    )
+    parser.add_argument(
         "--balance",
         default=True,
         action=argparse.BooleanOptionalAction,
         help=(
-            "After processing, write a median-capped balanced copy under balanced/ "
-            "(default: True). Ignored when --balance_from_h5 is set."
+            "After processing, write a balanced copy under balanced/, capping each "
+            "verbalised_confidence bin at --balance_cap (default: True). "
+            "Ignored when --balance_from_h5 is set."
+        ),
+    )
+    parser.add_argument(
+        "--balance_cap",
+        type=int,
+        default=None,
+        help=(
+            "Max examples to keep per verbalised_confidence bin (rounded to 2 d.p.). "
+            "Required when balancing (--balance or --balance_from_h5)."
         ),
     )
     parser.add_argument(
@@ -1132,6 +1188,23 @@ def main():
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
+    try:
+        configure_prefix_tokens_for_model(args.model_name)
+    except ValueError as exc:
+        logging.error("%s", exc)
+        sys.exit(1)
+
+    will_balance = args.balance_from_h5 is not None or args.balance
+    if will_balance and args.balance_cap is None:
+        logging.error("--balance_cap is required when balancing")
+        sys.exit(1)
+    if args.balance_cap is not None and args.balance_cap < 1:
+        logging.error("--balance_cap must be >= 1, got %s", args.balance_cap)
+        sys.exit(1)
+    if args.max_examples is not None and args.max_examples < 1:
+        logging.error("--max_examples must be >= 1, got %s", args.max_examples)
+        sys.exit(1)
+
     if args.balance_from_h5 is not None:
         src_h5 = Path(args.balance_from_h5)
         if not src_h5.exists():
@@ -1140,7 +1213,7 @@ def main():
         out_dir = src_h5.parent / "balanced"
         logging.info("Balance-only mode: balancing %s into %s", src_h5, out_dir)
         try:
-            n_kept = balance_dataset(src_h5, out_dir)
+            n_kept = balance_dataset(src_h5, out_dir, balance_cap=args.balance_cap)
         except (FileNotFoundError, ValueError) as exc:
             logging.error("%s", exc)
             sys.exit(1)
@@ -1255,6 +1328,13 @@ def main():
             if (n_ok % 10) == 0:
                 logging.info("Processed %d examples", n_ok)
 
+            if args.max_examples is not None and n_ok >= args.max_examples:
+                logging.info(
+                    "Reached max_examples=%d successful examples; early exit.",
+                    args.max_examples,
+                )
+                break
+
         json_file.write("\n}")
         json_summary_file.write("\n}")
 
@@ -1276,7 +1356,7 @@ def main():
         balanced_dir = run_dir / "balanced"
         logging.info("Balancing dataset into %s", balanced_dir)
         try:
-            n_kept = balance_dataset(h5_path, balanced_dir)
+            n_kept = balance_dataset(h5_path, balanced_dir, balance_cap=args.balance_cap)
         except (FileNotFoundError, ValueError) as exc:
             logging.error("%s", exc)
             sys.exit(1)
