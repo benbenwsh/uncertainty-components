@@ -332,6 +332,7 @@ def write_config_txt(
         "",
         "[Data]",
         f"input_h5={args.input_h5}",
+        f"dataset={args.dataset}",
         f"new_h5_format={args.new_h5_format}",
         f"h5_example_count={h5_example_count}",
         f"random_seed={args.random_seed}",
@@ -792,8 +793,9 @@ def compute_confidence_group_means(
 
         token_vectors: List[np.ndarray] = []
         for tok_arr in emb_prob:
-            layer_hidden = _as_layer_hidden(tok_arr)  # [n_layers, hidden_dim]
-            selected = layer_hidden[np.asarray(ablate_layers), :]  # [num_selected_layers, hidden_dim]
+            layer_hidden = _as_layer_hidden(tok_arr)  # [n_layers + 1, hidden_dim]
+            # HF res[0] is the embedding; resid_post of TL block i is res[i + 1].
+            selected = layer_hidden[np.asarray(ablate_layers) + 1, :]
             token_vectors.append(selected)
         stacked = np.stack(token_vectors, axis=1)  # [num_selected_layers, num_prob_tokens - 1, hidden_dim]
         source_vectors.append(stacked)
@@ -936,19 +938,20 @@ def compute_verbalised_embedding_group_means(
             )
         emb_prob = emb_prob[:expected_probability_tokens]
 
-        prompt_layer_hidden = _as_layer_hidden(emb_prompt)[np.asarray(ablate_layers), :]
-        sem_answer_layer_hidden = _as_layer_hidden(emb_sem_answer)[np.asarray(ablate_layers), :]
-        mean_prob_val_layer_hidden = _as_layer_hidden(emb_mean_prob_val)[np.asarray(ablate_layers), :]
+        resid_post_layers = np.asarray(ablate_layers) + 1
+        prompt_layer_hidden = _as_layer_hidden(emb_prompt)[resid_post_layers, :]
+        sem_answer_layer_hidden = _as_layer_hidden(emb_sem_answer)[resid_post_layers, :]
+        mean_prob_val_layer_hidden = _as_layer_hidden(emb_mean_prob_val)[resid_post_layers, :]
 
         guess_selected: List[np.ndarray] = []
         for tok_arr in emb_guess:
-            layer_hidden = _as_layer_hidden(tok_arr)[np.asarray(ablate_layers), :]
+            layer_hidden = _as_layer_hidden(tok_arr)[resid_post_layers, :]
             guess_selected.append(layer_hidden)
         guess_stacked = np.stack(guess_selected, axis=1)
 
         prob_selected: List[np.ndarray] = []
         for tok_arr in emb_prob:
-            layer_hidden = _as_layer_hidden(tok_arr)[np.asarray(ablate_layers), :]
+            layer_hidden = _as_layer_hidden(tok_arr)[resid_post_layers, :]
             prob_selected.append(layer_hidden)
         prob_stacked = np.stack(prob_selected, axis=1)
 
@@ -1380,7 +1383,7 @@ def greedy_generate_mean_replaced(
     decoded_tokens: List[str] = []
 
     def _seq_len() -> int:
-        return int(tokens.shape[1])
+        return prompt_len + len(decoded_tokens)
 
     def _decoded_tokens() -> List[str]:
         return decoded_tokens
@@ -1408,7 +1411,7 @@ def greedy_generate_probability_span_subset_mean_replaced(
     decoded_tokens: List[str] = []
 
     def _seq_len() -> int:
-        return int(tokens.shape[1])
+        return prompt_len + len(decoded_tokens)
 
     def _decoded_tokens() -> List[str]:
         return decoded_tokens
@@ -1448,7 +1451,7 @@ def greedy_generate_probability_row_indices_mean_replaced(
     decoded_tokens: List[str] = []
 
     def _seq_len() -> int:
-        return int(tokens.shape[1])
+        return prompt_len + len(decoded_tokens)
 
     def _decoded_tokens() -> List[str]:
         return decoded_tokens
@@ -1607,7 +1610,7 @@ def greedy_generate_guess_tokens_mean_replaced(
     decoded_tokens: List[str] = []
 
     def _seq_len() -> int:
-        return int(tokens.shape[1])
+        return prompt_len + len(decoded_tokens)
 
     def _decoded_tokens() -> List[str]:
         return decoded_tokens
@@ -1882,7 +1885,7 @@ def greedy_generate_probability_value_mean_replaced(
     decoded_tokens: List[str] = []
 
     def _seq_len() -> int:
-        return int(tokens.shape[1])
+        return prompt_len + len(decoded_tokens)
 
     def _decoded_tokens() -> List[str]:
         return decoded_tokens
@@ -2111,6 +2114,12 @@ def main() -> None:
     parser.add_argument("--device", type=str, default=None, help="e.g. cuda, cuda:0, cpu")
     parser.add_argument("--dtype", type=str, default="float32", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--random_seed", type=int, default=10)
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="trivia_qa",
+        choices=["trivia_qa", "squad", "bioasq", "nq", "svamp", "gsm8k"],
+    )
     parser.add_argument("--num_samples", type=int, default=400)
     parser.add_argument("--num_few_shot", type=int, default=0)
     parser.add_argument("--model_max_new_tokens", type=int, default=50)
@@ -2239,7 +2248,7 @@ def main() -> None:
     torch_dtype = dtype_map[args.dtype]
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_ds, val_ds = load_trivia_qa(args.random_seed)
+    train_ds, val_ds = load_eval_dataset(args.dataset, args.random_seed)
 
     random.seed(args.random_seed)
     answerable_train = split_answerable_indices(train_ds)
@@ -3069,6 +3078,7 @@ def main() -> None:
         "[Setup]",
         f"model_name={args.model_name}",
         f"input_h5={args.input_h5}",
+        f"dataset={args.dataset}",
         f"ablation_mode={args.ablation_mode}",
         f"num_layers={model.cfg.n_layers}",
         f"run_layers={','.join(str(layer) for layer in run_layers)}",

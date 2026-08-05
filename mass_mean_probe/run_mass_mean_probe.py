@@ -1852,7 +1852,7 @@ def compute_low_high_span_means_and_directions(
     }
     low_ids: set[str] = set()
     high_ids: set[str] = set()
-    layer_indices = np.asarray(ablate_layers)
+    resid_post_layers = np.asarray(ablate_layers) + 1
 
     for ex_id, ex_obj in examples_h5.items():
         responses = ex_obj.get("responses")
@@ -1910,11 +1910,15 @@ def compute_low_high_span_means_and_directions(
             )
         emb_prob = emb_prob[:expected_probability_tokens]
 
-        prompt_selected = _as_layer_hidden(emb_prompt)[layer_indices, :]
-        sem_answer_selected = _as_layer_hidden(emb_sem_answer)[layer_indices, :]
-        guess_selected = np.stack([_as_layer_hidden(tok_arr)[layer_indices, :] for tok_arr in emb_guess], axis=1)
-        prob_selected = np.stack([_as_layer_hidden(tok_arr)[layer_indices, :] for tok_arr in emb_prob], axis=1)
-        prob_val_selected = _as_layer_hidden(emb_prob_val)[layer_indices, :]
+        prompt_selected = _as_layer_hidden(emb_prompt)[resid_post_layers, :]
+        sem_answer_selected = _as_layer_hidden(emb_sem_answer)[resid_post_layers, :]
+        guess_selected = np.stack(
+            [_as_layer_hidden(tok_arr)[resid_post_layers, :] for tok_arr in emb_guess], axis=1
+        )
+        prob_selected = np.stack(
+            [_as_layer_hidden(tok_arr)[resid_post_layers, :] for tok_arr in emb_prob], axis=1
+        )
+        prob_val_selected = _as_layer_hidden(emb_prob_val)[resid_post_layers, :]
         if is_low:
             low_vectors["prompt_mean"].append(prompt_selected)
             low_vectors["guess"].append(guess_selected)

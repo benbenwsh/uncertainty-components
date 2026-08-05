@@ -112,6 +112,16 @@ def _grid_plot_path(run_root: str) -> str:
     return os.path.join(run_root, "layer_token_deviation_grid.png")
 
 
+def _attach_output_log(run_root: str) -> str:
+    output_log_path = os.path.join(run_root, "output.log")
+    file_handler = logging.FileHandler(output_log_path, mode="w")
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)-8s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    )
+    logging.getLogger().addHandler(file_handler)
+    return output_log_path
+
+
 def _render_token_label(token: str) -> str:
     escaped = token.encode("unicode_escape").decode("ascii")
     return escaped if escaped else "<empty>"
@@ -651,21 +661,44 @@ def write_line_plot(
     plt.close(fig)
 
 
+def _directed_deviation_from_baseline(
+    value: float,
+    baseline: float,
+    *,
+    mean_from_low_confidence: bool,
+) -> float:
+    """Non-negative deviation only in the intended confidence-change direction.
+
+    If mean_from_low_confidence: shade when value is below baseline.
+    Otherwise: shade when value is above baseline.
+    Opposite-direction or zero change returns 0.0.
+    """
+    diff = float(value) - float(baseline)
+    if mean_from_low_confidence:
+        return max(0.0, -diff)
+    return max(0.0, diff)
+
+
 def write_layer_token_grid_plot(
     *,
     path: str,
     run_layers: Sequence[int],
     token_labels: Sequence[str],
     matrix_values: np.ndarray,
-    matrix_deviation_abs: np.ndarray,
+    matrix_deviation_desired: np.ndarray,
+    mean_from_low_confidence: bool,
     linguistic_confidence_prompt: bool = False,
 ) -> None:
     n_rows, n_cols = matrix_values.shape
-    max_dev = float(np.nanmax(matrix_deviation_abs)) if np.isfinite(matrix_deviation_abs).any() else 0.0
+    max_dev = (
+        float(np.nanmax(matrix_deviation_desired))
+        if np.isfinite(matrix_deviation_desired).any()
+        else 0.0
+    )
     if max_dev > 0:
-        alpha_grid = np.clip(matrix_deviation_abs / max_dev, 0.0, 1.0)
+        alpha_grid = np.clip(matrix_deviation_desired / max_dev, 0.0, 1.0)
     else:
-        alpha_grid = np.zeros_like(matrix_deviation_abs)
+        alpha_grid = np.zeros_like(matrix_deviation_desired)
     alpha_grid = np.nan_to_num(alpha_grid, nan=0.0)
 
     rgba = np.zeros((n_rows, n_cols, 4), dtype=np.float32)
@@ -696,7 +729,10 @@ def write_layer_token_grid_plot(
     xlabel = "Confidence token position" if linguistic_confidence_prompt else "Probability token position"
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Layer")
-    ax.set_title("Layer x token confidence (blue alpha = |deviation from baseline|)")
+    direction = "below" if mean_from_low_confidence else "above"
+    ax.set_title(
+        f"Layer x token confidence (blue alpha = deviation {direction} baseline; opposite = 0)"
+    )
 
     ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
     ax.set_yticks(np.arange(-0.5, n_rows, 1), minor=True)
@@ -803,7 +839,15 @@ def main() -> None:
     args = parser.parse_args()
     configure_prefix_tokens_for_model(args.model_name)
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)-8s %(message)s",
+        level=logging.INFO,
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    run_root = _resolve_run_root(args.output_dir, individual_layers=args.individual_layers)
+    output_log_path = _attach_output_log(run_root)
+    logging.info("Saving outputs to %s", run_root)
+    logging.info("Writing run log to %s", output_log_path)
 
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     torch_dtype = dtype_map[args.dtype]
@@ -889,7 +933,6 @@ def main() -> None:
             direction["probability"][i], device=device, dtype=torch_dtype
         )
 
-    run_root = _resolve_run_root(args.output_dir, individual_layers=args.individual_layers)
     logging.info(
         "Run root: %s | target=%s sign=%.1f alpha=%s direction.shape=%s",
         run_root,
@@ -1030,6 +1073,7 @@ def main() -> None:
             linguistic_confidence_prompt=args.linguistic_confidence_prompt,
         )
         logging.info("Wrote %s", _line_plot_path(run_root))
+        logging.info("Run complete. Output directory: %s", run_root)
         return
 
     per_layer_token_means: Dict[int, Dict[int, Optional[float]]] = {}
@@ -1097,7 +1141,7 @@ def main() -> None:
     )
 
     matrix_values = np.full((len(run_layers), span_token_count), np.nan, dtype=np.float32)
-    matrix_dev_abs = np.full((len(run_layers), span_token_count), np.nan, dtype=np.float32)
+    matrix_dev_desired = np.full((len(run_layers), span_token_count), np.nan, dtype=np.float32)
     for r, layer_idx in enumerate(run_layers):
         for c in range(span_token_count):
             val = per_layer_token_means[layer_idx].get(c)
@@ -1105,9 +1149,13 @@ def main() -> None:
                 continue
             matrix_values[r, c] = float(val)
             if baseline_mean is not None:
-                matrix_dev_abs[r, c] = abs(float(val) - float(baseline_mean))
+                matrix_dev_desired[r, c] = _directed_deviation_from_baseline(
+                    float(val),
+                    float(baseline_mean),
+                    mean_from_low_confidence=args.mean_from_low_confidence,
+                )
             else:
-                matrix_dev_abs[r, c] = np.nan
+                matrix_dev_desired[r, c] = np.nan
 
     line_token_means: Dict[int, Optional[float]] = {}
     line_token_counts: Dict[int, int] = {}
@@ -1194,7 +1242,8 @@ def main() -> None:
         run_layers=run_layers,
         token_labels=token_labels,
         matrix_values=matrix_values,
-        matrix_deviation_abs=matrix_dev_abs,
+        matrix_deviation_desired=matrix_dev_desired,
+        mean_from_low_confidence=args.mean_from_low_confidence,
         linguistic_confidence_prompt=args.linguistic_confidence_prompt,
     )
     logging.info("Wrote %s", _grid_plot_path(run_root))
@@ -1210,6 +1259,7 @@ def main() -> None:
         linguistic_confidence_prompt=args.linguistic_confidence_prompt,
     )
     logging.info("Wrote %s", _line_plot_path(run_root))
+    logging.info("Run complete. Output directory: %s", run_root)
 
 
 if __name__ == "__main__":

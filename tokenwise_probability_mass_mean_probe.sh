@@ -17,19 +17,20 @@ uptime
 
 # Tokenwise direction steering across all layers (layer x token grid):
 python3 ./tokenwise_probability_mass_mean_probe/run_tokenwise_probability_mass_mean_probe.py \
-  --model_name Qwen/Qwen2.5-32B-Instruct \
-  --input_h5 ./process_generations/processed_generations_more_h5/16_32B_1000_train/train_verbalised_embeddings.h5 \
+  --model_name mistralai/Mistral-7B-Instruct-v0.1 \
+  --input_h5 ./process_generations/processed_generations_more_h5/mistral/3_nq_mistral_500_train/train_verbalised_embeddings.h5 \
+  --dataset nq \
   --no-enable_brief \
-  --num_samples 20 \
+  --num_samples 33 \
   --device cuda:0 \
   --dtype bfloat16 \
   --new_h5_format \
   --individual_layers \
   --alpha 1.0 \
-  --expected_guess_tokens 2 \
-  --expected_probability_tokens 5 \
-  --low_conf_threshold 0.3 \
-  --high_conf_threshold 0.9 \
+  --expected_guess_tokens 5 \
+  --expected_probability_tokens 7 \
+  --low_conf_threshold 0.0 \
+  --high_conf_threshold 1.0 \
   --no-mean_from_low_confidence
 
 # Low-confidence cohort (uncomment to steer low-conf examples toward higher confidence):

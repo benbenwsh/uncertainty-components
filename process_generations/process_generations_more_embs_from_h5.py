@@ -18,13 +18,17 @@ Output:
     - embeddings_prompt_k_tokens (tokenwise K mode)
     - embeddings_sem_answer_k_tokens (tokenwise K mode)
 
-  Also writes a companion *_summary.json with the same structure but embedding
-  fields reduced to shape metadata only (no value previews).
+  Also writes a companion *_summary.json with the same structure but all
+  embeddings_* fields omitted.
 
   With --balance (default), also writes a balanced copy under a `balanced/`
   subdirectory, capping each verbalised_confidence bin at --balance_cap.
   Use --balance_from_h5 to balance an existing verbalised embeddings HDF5
   without re-running processing.
+
+  The run directory gets `sample_bin_counts.txt` (total count plus per-bin
+  counts for verbalised_confidence rounded to 2 d.p., ascending). The
+  balanced subdirectory keeps a simple `samples.txt` with the kept count.
 """
 
 import argparse
@@ -513,6 +517,11 @@ def _first_and_last_layer_values_for_list_of_arrays(arr_list, n: int = 5, *, sha
 
 
 def convert_for_json(obj, parent_key=None, in_embedding_field=False, shape_only: bool = False):
+    """Convert nested objects for JSON.
+
+    When ``shape_only`` is True (summary JSON), any ``embeddings_*`` / known
+    embedding keys are omitted entirely rather than included with shape metadata.
+    """
     if parent_key in _EMBEDDING_KEYS:
         in_embedding_field = True
     elif in_embedding_field and parent_key in {"res", "attn", "mlp", "q", "k", "v", "o"}:
@@ -541,10 +550,14 @@ def convert_for_json(obj, parent_key=None, in_embedding_field=False, shape_only:
     if isinstance(obj, np.integer):
         return int(obj)
     if isinstance(obj, dict):
-        return {
-            k: convert_for_json(v, parent_key=k, in_embedding_field=in_embedding_field, shape_only=shape_only)
-            for k, v in obj.items()
-        }
+        out = {}
+        for k, v in obj.items():
+            if shape_only and (k in _EMBEDDING_KEYS or str(k).startswith("embeddings_")):
+                continue
+            out[k] = convert_for_json(
+                v, parent_key=k, in_embedding_field=in_embedding_field, shape_only=shape_only
+            )
+        return out
     if isinstance(obj, (list, tuple)):
         if in_embedding_field and obj and hasattr(obj[0], "shape"):
             return _first_and_last_layer_values_for_list_of_arrays(
@@ -952,7 +965,7 @@ def balance_dataset(src_h5: Path, out_dir: Path, *, balance_cap: int) -> int:
                     example_id,
                 )
                 continue
-            bins[round(conf, 2)].append(str(example_id))
+            bins[_confidence_bin(conf)].append(str(example_id))
 
     if not bins:
         raise ValueError(f"No examples with verbalised_confidence found in {src_h5}")
@@ -1038,6 +1051,25 @@ def balance_dataset(src_h5: Path, out_dir: Path, *, balance_cap: int) -> int:
     logging.info("Wrote balanced %s", json_summary_path)
     logging.info("Wrote balanced %s", samples_txt_path)
     return n_kept
+
+
+def _confidence_bin(conf: float) -> float:
+    """Round verbalised confidence to a 2 d.p. bin (e.g. 0.999 -> 1.0)."""
+    return round(float(conf), 2)
+
+
+def write_sample_bin_counts_txt(
+    path: Path,
+    *,
+    total_samples: int,
+    bin_counts: dict[float, int],
+) -> None:
+    """Write total sample count plus ascending per-bin counts."""
+    lines = [f"{total_samples} samples"]
+    for bin_value in sorted(bin_counts):
+        lines.append(f"{bin_value:.2f}: {bin_counts[bin_value]}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def write_config_txt(run_dir: Path, args, input_path: Path, out_base: str, output_paths: dict[str, Path]) -> Path:
@@ -1246,7 +1278,7 @@ def main():
     h5_path = run_dir / f"{out_base}.h5"
     json_path = run_dir / f"{out_base}.json"
     json_summary_path = run_dir / f"{out_base}_summary.json"
-    samples_txt_path = run_dir / "samples.txt"
+    samples_txt_path = run_dir / "sample_bin_counts.txt"
     config_path = write_config_txt(
         run_dir=run_dir,
         args=args,
@@ -1256,7 +1288,7 @@ def main():
             "h5": h5_path,
             "json": json_path,
             "json_summary": json_summary_path,
-            "samples_txt": samples_txt_path,
+            "sample_bin_counts_txt": samples_txt_path,
         },
     )
 
@@ -1279,6 +1311,7 @@ def main():
     n_ok = 0
     n_reject = 0
     first_item = True
+    confidence_bin_counts: dict[float, int] = defaultdict(int)
     t_start = time.perf_counter()
 
     with (
@@ -1306,6 +1339,14 @@ def main():
                 continue
 
             n_ok += 1
+            try:
+                conf = float(out["responses"][0]["verbalised_confidence"])
+                confidence_bin_counts[_confidence_bin(conf)] += 1
+            except (KeyError, IndexError, TypeError, ValueError):
+                logging.warning(
+                    "Example %s missing/invalid verbalised_confidence for bin counts.",
+                    example_id,
+                )
             if str(example_id) in out_examples:
                 del out_examples[str(example_id)]
             _write_h5_node(out_examples, str(example_id), out)
@@ -1348,8 +1389,11 @@ def main():
     logging.info("Wrote %s", json_summary_path)
     logging.info("Processed %d valid and rejected %d examples in %.2fs", n_ok, n_reject, elapsed)
 
-    with open(samples_txt_path, "w", encoding="utf-8") as f:
-        f.write(f"{n_ok} samples\n")
+    write_sample_bin_counts_txt(
+        samples_txt_path,
+        total_samples=n_ok,
+        bin_counts=confidence_bin_counts,
+    )
     logging.info("Wrote %s", samples_txt_path)
 
     if args.balance:

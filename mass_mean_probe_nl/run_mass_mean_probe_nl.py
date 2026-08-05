@@ -567,7 +567,7 @@ def compute_low_high_mixed_means_and_directions(
     high_vectors: Dict[str, List[np.ndarray]] = {key: [] for key in direction_keys}
     low_ids: set[str] = set()
     high_ids: set[str] = set()
-    layer_indices = np.asarray(ablate_layers)
+    resid_post_layers = np.asarray(ablate_layers) + 1
 
     for ex_id, ex_obj in examples_h5.items():
         responses = ex_obj.get("responses")
@@ -596,7 +596,7 @@ def compute_low_high_mixed_means_and_directions(
             )
         if not isinstance(emb_probability, (list, tuple)) or len(emb_probability) == 0:
             raise ValueError(f"Example {ex_id} field {_EMBEDDING_FIELD_PROBABILITY} must be a non-empty list.")
-        probability_last_selected = _as_layer_hidden(emb_probability[-1])[layer_indices, :]
+        probability_last_selected = _as_layer_hidden(emb_probability[-1])[resid_post_layers, :]
         prompt_selected = None
         if not probability_last_direction_only:
             emb_prompt = _extract_res_field(
@@ -606,7 +606,7 @@ def compute_low_high_mixed_means_and_directions(
                 raise ValueError(
                     f"Example {ex_id} is missing required field {_EMBEDDING_FIELD_PROMPT}."
                 )
-            prompt_selected = _as_layer_hidden(emb_prompt)[layer_indices, :]
+            prompt_selected = _as_layer_hidden(emb_prompt)[resid_post_layers, :]
         if is_low:
             if prompt_selected is not None:
                 low_vectors["prompt"].append(prompt_selected)
