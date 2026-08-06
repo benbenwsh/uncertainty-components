@@ -35,6 +35,41 @@ EMBEDDING_CHOICES = (
 )
 EPS = 1e-12
 
+SUPPORTED_MODEL_NAMES = (
+    "mistralai/Mistral-7B-Instruct-v0.1",
+    "google/gemma-3-12b-it",
+    "Qwen/Qwen2.5-32B-Instruct",
+)
+
+# Hardcoded logit-lens extraction specs (no runtime path discovery).
+LOGIT_LENS_SPECS: dict[str, dict] = {
+    "mistralai/Mistral-7B-Instruct-v0.1": {
+        "trust_remote_code": False,
+        "load_dtype": torch.float32,
+        "norm_path": ("model", "norm"),
+        "lm_head_path": ("lm_head",),
+        "softcap": None,
+        "rms_norm_eps": 1e-5,
+    },
+    "Qwen/Qwen2.5-32B-Instruct": {
+        "trust_remote_code": True,
+        "load_dtype": torch.bfloat16,
+        "norm_path": ("model", "norm"),
+        "lm_head_path": ("lm_head",),
+        "softcap": None,
+        "rms_norm_eps": 1e-6,
+    },
+    "google/gemma-3-12b-it": {
+        "trust_remote_code": True,
+        "load_dtype": torch.bfloat16,
+        # Gemma3ForConditionalGeneration: text RMSNorm under model.language_model
+        "norm_path": ("model", "language_model", "norm"),
+        "lm_head_path": ("lm_head",),
+        "softcap": None,
+        "rms_norm_eps": 1e-6,
+    },
+}
+
 
 def _resolve_device(device_arg: str | None) -> torch.device:
     if device_arg:
@@ -88,42 +123,82 @@ def _h5_list_length(group_obj: h5py.Group) -> int:
     return int(group_obj.attrs.get("__len__", len(group_obj.keys())))
 
 
+def _resolve_attr_path(root, path: tuple[str, ...]):
+    obj = root
+    for attr in path:
+        obj = getattr(obj, attr)
+    return obj
+
+
 def _load_unembedding(model_name_or_path: str, device: torch.device) -> tuple:
+    """Load tokenizer + final RMSNorm / lm_head tensors using hardcoded model specs."""
+    if model_name_or_path not in LOGIT_LENS_SPECS:
+        raise ValueError(
+            f"Unsupported model_name_or_path={model_name_or_path!r}. "
+            f"Supported: {list(LOGIT_LENS_SPECS)}"
+        )
+    spec = LOGIT_LENS_SPECS[model_name_or_path]
+    trust_remote_code = bool(spec["trust_remote_code"])
+    load_dtype = spec["load_dtype"]
+
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name_or_path, trust_remote_code=trust_remote_code
+        )
     except Exception as exc:
         print(
             f"WARNING: fast tokenizer load failed ({exc}). "
             "Falling back to slow tokenizer (use_fast=False)."
         )
-        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=False)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            use_fast=False,
+        )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name_or_path,
-        torch_dtype=torch.float32,
-        low_cpu_mem_usage=True,
-    )
-    model.to(device)
+    # Large models (Qwen-32B / Gemma-3-12B): load in bf16; extract lens tensors as fp32.
+    # Mistral-7B: load fully in fp32 on the target device.
+    load_kwargs: dict = {
+        "torch_dtype": load_dtype,
+        "low_cpu_mem_usage": True,
+        "trust_remote_code": trust_remote_code,
+    }
+    if load_dtype != torch.float32:
+        load_kwargs["device_map"] = "auto"
+    model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **load_kwargs)
+    if load_dtype == torch.float32:
+        model.to(device)
     model.eval()
 
-    if not hasattr(model, "lm_head"):
-        raise ValueError("Model has no lm_head; cannot perform logit lens.")
+    final_norm = _resolve_attr_path(model, tuple(spec["norm_path"]))
+    lm_head = _resolve_attr_path(model, tuple(spec["lm_head_path"]))
+    if not hasattr(final_norm, "weight"):
+        raise ValueError(
+            f"Hardcoded norm path {spec['norm_path']} for {model_name_or_path} "
+            "has no .weight attribute."
+        )
+    if not hasattr(lm_head, "weight"):
+        raise ValueError(
+            f"Hardcoded lm_head path {spec['lm_head_path']} for {model_name_or_path} "
+            "has no .weight attribute."
+        )
 
-    core_model = getattr(model, "model", model)
-    final_norm = getattr(core_model, "norm", None)
-    if final_norm is None or not hasattr(final_norm, "weight"):
-        raise ValueError("Model has no final norm weight; expected model.norm.weight for logit lens.")
-
-    unembed_w = model.lm_head.weight.detach().to(device=device, dtype=torch.float32)
-    unembed_b = getattr(model.lm_head, "bias", None)
+    unembed_w = lm_head.weight.detach().to(device=device, dtype=torch.float32)
+    unembed_b = getattr(lm_head, "bias", None)
     if unembed_b is not None:
         unembed_b = unembed_b.detach().to(device=device, dtype=torch.float32)
     norm_weight = final_norm.weight.detach().to(device=device, dtype=torch.float32)
-    norm_eps = getattr(final_norm, "eps", None)
-    if norm_eps is None:
-        norm_eps = getattr(final_norm, "variance_epsilon", 1e-6)
-    norm_eps = float(norm_eps)
-    return tokenizer, unembed_w, unembed_b, norm_weight, norm_eps
+    # Prefer hardcoded eps; fall back to module attrs if present.
+    norm_eps = float(spec["rms_norm_eps"])
+    softcap = spec["softcap"]
+    softcap = float(softcap) if softcap is not None else None
+
+    # Free the full model; keep only lens tensors on device.
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return tokenizer, unembed_w, unembed_b, norm_weight, norm_eps, softcap
 
 
 def _apply_rmsnorm(hidden: torch.Tensor, norm_weight: torch.Tensor, norm_eps: float) -> torch.Tensor:
@@ -132,17 +207,25 @@ def _apply_rmsnorm(hidden: torch.Tensor, norm_weight: torch.Tensor, norm_eps: fl
     return (hidden * inv_rms) * norm_weight
 
 
+def _apply_logit_softcap(logits: torch.Tensor, softcap: float | None) -> torch.Tensor:
+    if softcap is None:
+        return logits
+    return softcap * torch.tanh(logits / softcap)
+
+
 def _probs_from_hidden(
     hidden: torch.Tensor,
     w_u: torch.Tensor,
     b_u: torch.Tensor | None,
     norm_weight: torch.Tensor,
     norm_eps: float,
+    softcap: float | None = None,
 ) -> torch.Tensor:
     hidden = _apply_rmsnorm(hidden, norm_weight=norm_weight, norm_eps=norm_eps)
     logits = hidden @ w_u.T
     if b_u is not None:
         logits = logits + b_u
+    logits = _apply_logit_softcap(logits, softcap)
     return torch.softmax(logits, dim=-1)
 
 
@@ -324,6 +407,8 @@ def _save_topk_table_png(
     tokenizer,
     top_ids: np.ndarray,
     top_vals: np.ndarray,
+    *,
+    shade_body: bool = True,
 ) -> None:
     n_rows, top_k = top_ids.shape
     col_labels = ["Row"]
@@ -361,11 +446,12 @@ def _save_topk_table_png(
         header_cell.set_facecolor((0.85, 0.9, 1.0, 1.0))
         header_cell.set_text_props(weight="bold")
 
-    for r in range(n_rows):
-        alpha = float(np.clip(top_vals[r, 0], 0.0, 1.0))
-        for c in range(1, len(col_labels)):
-            cell = table[(r + 1, c)]
-            cell.set_facecolor((0.1, 0.3, 1.0, alpha))
+    if shade_body:
+        for r in range(n_rows):
+            alpha = float(np.clip(top_vals[r, 0], 0.0, 1.0))
+            for c in range(1, len(col_labels)):
+                cell = table[(r + 1, c)]
+                cell.set_facecolor((0.1, 0.3, 1.0, alpha))
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -450,6 +536,7 @@ def _compute_topk(
     b_u: torch.Tensor | None,
     norm_weight: torch.Tensor,
     norm_eps: float,
+    softcap: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     hidden_t = torch.as_tensor(hidden, dtype=torch.float32, device=device)
     with torch.no_grad():
@@ -459,6 +546,7 @@ def _compute_topk(
             b_u=b_u,
             norm_weight=norm_weight,
             norm_eps=norm_eps,
+            softcap=softcap,
         ).detach().cpu().numpy()
 
     n_rows = probs.shape[0]
@@ -544,6 +632,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--model_name_or_path",
         type=str,
         default="mistralai/Mistral-7B-Instruct-v0.1",
+        choices=list(SUPPORTED_MODEL_NAMES),
+        help="Supported: Mistral-7B-Instruct-v0.1, gemma-3-12b-it, Qwen2.5-32B-Instruct.",
     )
     parser.add_argument("--device", type=str, default=None, help="Optional torch device, e.g. cuda:0 or cpu")
     parser.add_argument(
@@ -604,7 +694,9 @@ def main():
         raise ValueError("No token positions selected; include at least one embedding family.")
 
     device = _resolve_device(args.device)
-    tokenizer, w_u, b_u, norm_weight, norm_eps = _load_unembedding(args.model_name_or_path, device)
+    tokenizer, w_u, b_u, norm_weight, norm_eps, softcap = _load_unembedding(
+        args.model_name_or_path, device
+    )
 
     results_dir = Path(args.output_dir) if args.output_dir else SCRIPT_DIR / "results"
     run_base = _get_run_base_dir(results_dir)
@@ -774,6 +866,7 @@ def main():
                     b_u=b_u,
                     norm_weight=norm_weight,
                     norm_eps=norm_eps,
+                    softcap=softcap,
                 )
                 top_ids_mlp, top_vals_mlp = _compute_topk(
                     store["mlp"][label],
@@ -783,6 +876,7 @@ def main():
                     b_u=b_u,
                     norm_weight=norm_weight,
                     norm_eps=norm_eps,
+                    softcap=softcap,
                 )
                 out_path = out_dir / f"{prefix}_{label}.png"
                 _save_topk_table_png_subblocks(
@@ -803,6 +897,7 @@ def main():
                     b_u=b_u,
                     norm_weight=norm_weight,
                     norm_eps=norm_eps,
+                    softcap=softcap,
                 )
                 out_path = out_dir / f"{prefix}_{label}.png"
                 _save_topk_table_png(
