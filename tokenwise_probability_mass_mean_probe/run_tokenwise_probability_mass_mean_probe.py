@@ -47,7 +47,7 @@ from mass_mean_probe.run_mass_mean_probe import (
     CONFIDENCE_PROMPT_NUMERIC,
     _expected_probability_span_token_budget,
     _format_alpha,
-    _is_expected_or_plus_one,
+    _is_expected_or_plus_two,
     compute_low_high_span_means_and_directions,
     configure_prefix_tokens_for_model,
     normalize_direction_spans_to_unit_norm_budget,
@@ -133,6 +133,7 @@ def _extract_probability_tokens(
     expected_probability_tokens: int,
     expected_confidence_tokens: int,
     linguistic_confidence_prompt: bool = False,
+    extend_probability_span: bool = False,
 ) -> Optional[List[str]]:
     parsed = parse_guess_and_marker_indices(
         list(decoded_tokens),
@@ -141,13 +142,18 @@ def _extract_probability_tokens(
     if parsed is None:
         return None
     _, first_prob, end_prob = parsed
-    span = list(decoded_tokens[first_prob : end_prob + 1])
+    apply_extend = extend_probability_span and not linguistic_confidence_prompt
+    if apply_extend and end_prob + 2 >= len(decoded_tokens):
+        return None
+    span_end = end_prob + (2 if apply_extend else 0)
+    span = list(decoded_tokens[first_prob : span_end + 1])
     span_budget = _expected_probability_span_token_budget(
         linguistic_confidence_prompt=linguistic_confidence_prompt,
         expected_probability_tokens=expected_probability_tokens,
         expected_confidence_tokens=expected_confidence_tokens,
+        extend_probability_span=extend_probability_span,
     )
-    if not _is_expected_or_plus_one(len(span), span_budget):
+    if not _is_expected_or_plus_two(len(span), span_budget):
         return None
     return span[:span_budget]
 
@@ -160,6 +166,7 @@ def _absolute_prob_single_position(
     expected_probability_tokens: int,
     expected_confidence_tokens: int,
     linguistic_confidence_prompt: bool = False,
+    extend_probability_span: bool = False,
 ) -> List[int]:
     parsed = parse_guess_and_marker_indices(
         decoded_tokens,
@@ -168,13 +175,18 @@ def _absolute_prob_single_position(
     if parsed is None:
         return []
     _, first_prob, end_prob = parsed
+    apply_extend = extend_probability_span and not linguistic_confidence_prompt
+    if apply_extend and end_prob + 2 >= len(decoded_tokens):
+        return []
+    span_end = end_prob + (2 if apply_extend else 0)
     span_budget = _expected_probability_span_token_budget(
         linguistic_confidence_prompt=linguistic_confidence_prompt,
         expected_probability_tokens=expected_probability_tokens,
         expected_confidence_tokens=expected_confidence_tokens,
+        extend_probability_span=extend_probability_span,
     )
-    span_len = end_prob - first_prob + 1
-    if not _is_expected_or_plus_one(span_len, span_budget):
+    span_len = span_end - first_prob + 1
+    if not _is_expected_or_plus_two(span_len, span_budget):
         return []
     if token_position < 0 or token_position >= span_budget:
         return []
@@ -195,6 +207,7 @@ def build_single_token_probability_direction_hooks(
     expected_probability_tokens: int,
     expected_confidence_tokens: int,
     linguistic_confidence_prompt: bool = False,
+    extend_probability_span: bool = False,
 ) -> List[Tuple[str, Callable]]:
     hooks: List[Tuple[str, Callable]] = []
 
@@ -210,6 +223,7 @@ def build_single_token_probability_direction_hooks(
                     expected_probability_tokens=expected_probability_tokens,
                     expected_confidence_tokens=expected_confidence_tokens,
                     linguistic_confidence_prompt=linguistic_confidence_prompt,
+                    extend_probability_span=extend_probability_span,
                 )
                 if not abs_positions:
                     return activation
@@ -236,6 +250,7 @@ def greedy_generate_probability_single_token_direction_perturbed(
     expected_probability_tokens: int,
     expected_confidence_tokens: int,
     linguistic_confidence_prompt: bool = False,
+    extend_probability_span: bool = False,
 ) -> Tuple[str, List[str]]:
     tokens = model.to_tokens(local_prompt)
     prompt_len = int(tokens.shape[1])
@@ -252,6 +267,7 @@ def greedy_generate_probability_single_token_direction_perturbed(
         expected_probability_tokens=expected_probability_tokens,
         expected_confidence_tokens=expected_confidence_tokens,
         linguistic_confidence_prompt=linguistic_confidence_prompt,
+        extend_probability_span=extend_probability_span,
     )
     return _greedy_extend_with_fwd_hooks(
         model,
@@ -356,6 +372,7 @@ def run_tokenwise_evaluation(
     expected_probability_tokens: int,
     expected_confidence_tokens: int,
     linguistic_confidence_prompt: bool,
+    extend_probability_span: bool,
     span_token_count: int,
     steering_target: str,
     steering_sign: float,
@@ -416,10 +433,22 @@ def run_tokenwise_evaluation(
                 expected_probability_tokens=expected_probability_tokens,
                 expected_confidence_tokens=expected_confidence_tokens,
                 linguistic_confidence_prompt=linguistic_confidence_prompt,
+                extend_probability_span=extend_probability_span,
             )
-            if prob_tokens is not None:
-                for pos, token in enumerate(prob_tokens):
-                    token_label_counters[pos][token] += 1
+            if prob_tokens is None:
+                logging.warning(
+                    "Skipping example %s/%s: could not form probability/confidence span "
+                    "(extend_probability_span=%s, expected_base=%d, decoded_len=%d). response=%r",
+                    split_name,
+                    ex_id,
+                    extend_probability_span,
+                    expected_probability_tokens,
+                    len(baseline_decoded_tokens),
+                    baseline_response,
+                )
+                continue
+            for pos, token in enumerate(prob_tokens):
+                token_label_counters[pos][token] += 1
 
             for token_position in range(span_token_count):
                 key = _token_mode_key(token_position, steering_target, alpha)
@@ -439,6 +468,7 @@ def run_tokenwise_evaluation(
                         expected_probability_tokens=expected_probability_tokens,
                         expected_confidence_tokens=expected_confidence_tokens,
                         linguistic_confidence_prompt=linguistic_confidence_prompt,
+                        extend_probability_span=extend_probability_span,
                     )
                 )
                 confidence = (
@@ -567,7 +597,8 @@ def write_config_txt(
         "[Tokenwise settings]",
         f"expected_probability_tokens={args.expected_probability_tokens}",
         f"expected_confidence_tokens={args.expected_confidence_tokens}",
-        f"span_token_count={_expected_probability_span_token_budget(linguistic_confidence_prompt=args.linguistic_confidence_prompt, expected_probability_tokens=args.expected_probability_tokens, expected_confidence_tokens=args.expected_confidence_tokens)}",
+        f"extend_probability_span={args.extend_probability_span}",
+        f"span_token_count={_expected_probability_span_token_budget(linguistic_confidence_prompt=args.linguistic_confidence_prompt, expected_probability_tokens=args.expected_probability_tokens, expected_confidence_tokens=args.expected_confidence_tokens, extend_probability_span=args.extend_probability_span)}",
         f"expected_guess_tokens={args.expected_guess_tokens}",
         f"parse_mode_verbalised_confidence={args.parse_mode_verbalised_confidence}",
         "",
@@ -582,6 +613,7 @@ def write_config_txt(
         linguistic_confidence_prompt=args.linguistic_confidence_prompt,
         expected_probability_tokens=args.expected_probability_tokens,
         expected_confidence_tokens=args.expected_confidence_tokens,
+        extend_probability_span=args.extend_probability_span,
     )
     for pos in range(span_token_count):
         lines.append(
@@ -807,6 +839,16 @@ def main() -> None:
     )
     parser.add_argument("--expected_guess_tokens", type=int, default=5)
     parser.add_argument(
+        "--extend_probability_span",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If true (and not using linguistic confidence), treat probability span length as "
+            "expected_probability_tokens + 2 (matching process_generations --extend_probability_span). "
+            "Eval examples lacking two tokens past the first probability-value token are skipped."
+        ),
+    )
+    parser.add_argument(
         "--parse_mode_verbalised_confidence",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -879,6 +921,7 @@ def main() -> None:
         linguistic_confidence_prompt=args.linguistic_confidence_prompt,
         expected_probability_tokens=args.expected_probability_tokens,
         expected_confidence_tokens=args.expected_confidence_tokens,
+        extend_probability_span=args.extend_probability_span,
     )
 
     logging.info("Loading HookedTransformer: %s", args.model_name)
@@ -895,6 +938,7 @@ def main() -> None:
         expected_probability_tokens=args.expected_probability_tokens,
         expected_guess_tokens=args.expected_guess_tokens,
         new_h5_format=args.new_h5_format,
+        extend_probability_span=args.extend_probability_span,
     )
     if args.normalize_span_directions:
         normalization_stats = normalize_direction_spans_to_unit_norm_budget(
@@ -1010,6 +1054,7 @@ def main() -> None:
             expected_probability_tokens=args.expected_probability_tokens,
             expected_confidence_tokens=args.expected_confidence_tokens,
             linguistic_confidence_prompt=args.linguistic_confidence_prompt,
+            extend_probability_span=args.extend_probability_span,
             span_token_count=span_token_count,
             steering_target=steering_target,
             steering_sign=steering_sign,
@@ -1046,6 +1091,7 @@ def main() -> None:
                 "sample_count": baseline_count,
             },
             "expected_probability_tokens": args.expected_probability_tokens,
+            "extend_probability_span": args.extend_probability_span,
             "expected_confidence_tokens": args.expected_confidence_tokens,
             "span_token_count": span_token_count,
             "linguistic_confidence_prompt": args.linguistic_confidence_prompt,
@@ -1107,6 +1153,7 @@ def main() -> None:
             expected_probability_tokens=args.expected_probability_tokens,
             expected_confidence_tokens=args.expected_confidence_tokens,
             linguistic_confidence_prompt=args.linguistic_confidence_prompt,
+            extend_probability_span=args.extend_probability_span,
             span_token_count=span_token_count,
             steering_target=steering_target,
             steering_sign=steering_sign,
@@ -1182,6 +1229,7 @@ def main() -> None:
             "sample_count": baseline_count,
         },
         "expected_probability_tokens": args.expected_probability_tokens,
+        "extend_probability_span": args.extend_probability_span,
         "expected_confidence_tokens": args.expected_confidence_tokens,
         "span_token_count": span_token_count,
         "linguistic_confidence_prompt": args.linguistic_confidence_prompt,

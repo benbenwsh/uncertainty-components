@@ -44,7 +44,7 @@ from blockwise_zero_ablation.run_blockwise_zero_ablation import (
 from layerwise_mean_ablation.run_mean_ablation import (
     _absolute_probability_value_start_position,
     _as_layer_hidden,
-    _is_expected_or_plus_one,
+    _is_expected_or_plus_two,
 )
 
 TRAIN_RATIO = 0.9
@@ -396,10 +396,10 @@ def compute_component_group_means(
                 )
                 key = f"{component}_{source_name}"
                 if source_name == "guess":
-                    if not _is_expected_or_plus_one(len(value), expected_guess_tokens):
+                    if len(value) != expected_guess_tokens:
                         raise ValueError(
                             f"Example {ex_id} {field_name}/{component} has length {len(value)}; "
-                            f"expected {expected_guess_tokens} or {expected_guess_tokens + 1}."
+                            f"expected {expected_guess_tokens}."
                         )
                     token_values = value[:expected_guess_tokens]
                     selected: List[np.ndarray] = []
@@ -408,10 +408,10 @@ def compute_component_group_means(
                     component_source_vectors[key].append(np.stack(selected, axis=1))
                     continue
                 if source_name == "probability":
-                    if not _is_expected_or_plus_one(len(value), expected_probability_tokens):
+                    if not _is_expected_or_plus_two(len(value), expected_probability_tokens):
                         raise ValueError(
                             f"Example {ex_id} {field_name}/{component} has length {len(value)}; "
-                            f"expected {expected_probability_tokens} or {expected_probability_tokens + 1}."
+                            f"expected {expected_probability_tokens} or {expected_probability_tokens + 2}."
                         )
                     token_values = value[:expected_probability_tokens]
                     selected: List[np.ndarray] = []

@@ -47,7 +47,7 @@ from layerwise_mean_ablation.run_mean_ablation import (
     PROBABILITY_ROW_INDEX_MODES,
     _absolute_probability_value_start_position,
     _as_layer_hidden,
-    _is_expected_or_plus_one,
+    _is_expected_or_plus_two,
     _mean_and_count,
     batch_compute_semantic_similarities,
     compute_uncertainty_score,
@@ -309,10 +309,10 @@ def compute_pre_probability_group_means_by_component(
                 raise ValueError(
                     f"Example {ex_id} responses/0/embeddings_guess/{component} must be a list."
                 )
-            if not _is_expected_or_plus_one(len(emb_guess), expected_guess_tokens):
+            if len(emb_guess) != expected_guess_tokens:
                 raise ValueError(
                     f"Example {ex_id} embeddings_guess/{component} len={len(emb_guess)}; expected "
-                    f"{expected_guess_tokens} or {expected_guess_tokens + 1}."
+                    f"{expected_guess_tokens}."
                 )
             emb_guess = emb_guess[:expected_guess_tokens]
 
@@ -320,10 +320,10 @@ def compute_pre_probability_group_means_by_component(
                 raise ValueError(
                     f"Example {ex_id} responses/0/embeddings_probability/{component} must be a list."
                 )
-            if not _is_expected_or_plus_one(len(emb_prob), expected_probability_tokens):
+            if not _is_expected_or_plus_two(len(emb_prob), expected_probability_tokens):
                 raise ValueError(
                     f"Example {ex_id} embeddings_probability/{component} len={len(emb_prob)}; expected "
-                    f"{expected_probability_tokens} or {expected_probability_tokens + 1}."
+                    f"{expected_probability_tokens} or {expected_probability_tokens + 2}."
                 )
             emb_prob = emb_prob[:expected_probability_tokens]
 

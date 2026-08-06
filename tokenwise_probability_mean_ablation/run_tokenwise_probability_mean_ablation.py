@@ -122,17 +122,49 @@ def _render_token_label(token: str) -> str:
     return escaped if escaped else "<empty>"
 
 
-def _extract_probability_tokens(
+def _probability_span_token_budget(
+    expected_probability_tokens: int,
+    *,
+    extend_probability_span: bool,
+) -> int:
+    return expected_probability_tokens + (2 if extend_probability_span else 0)
+
+
+def _probability_span_bounds(
     decoded_tokens: Sequence[str],
     *,
-    expected_probability_tokens: int,
-) -> Optional[List[str]]:
+    extend_probability_span: bool,
+) -> Optional[Tuple[int, int]]:
+    """Return (first_prob, span_end) inclusive, or None if parse/extend fails."""
     parsed = parse_guess_and_probability_indices(list(decoded_tokens))
     if parsed is None:
         return None
     _, first_prob, end_prob = parsed
-    span = list(decoded_tokens[first_prob : end_prob + 1])
-    if len(span) != expected_probability_tokens:
+    span_end = end_prob + (2 if extend_probability_span else 0)
+    if extend_probability_span and end_prob + 2 >= len(decoded_tokens):
+        return None
+    if span_end >= len(decoded_tokens):
+        return None
+    return first_prob, span_end
+
+
+def _extract_probability_tokens(
+    decoded_tokens: Sequence[str],
+    *,
+    expected_probability_tokens: int,
+    extend_probability_span: bool = False,
+) -> Optional[List[str]]:
+    bounds = _probability_span_bounds(
+        decoded_tokens, extend_probability_span=extend_probability_span
+    )
+    if bounds is None:
+        return None
+    first_prob, span_end = bounds
+    span = list(decoded_tokens[first_prob : span_end + 1])
+    span_budget = _probability_span_token_budget(
+        expected_probability_tokens, extend_probability_span=extend_probability_span
+    )
+    if len(span) != span_budget:
         return None
     return span
 
@@ -143,12 +175,18 @@ def _absolute_prob_single_position(
     *,
     token_position: int,
     expected_probability_tokens: int,
+    extend_probability_span: bool = False,
 ) -> List[int]:
-    parsed = parse_guess_and_probability_indices(decoded_tokens)
-    if parsed is None:
+    bounds = _probability_span_bounds(
+        decoded_tokens, extend_probability_span=extend_probability_span
+    )
+    if bounds is None:
         return []
-    _, first_prob, end_prob = parsed
-    if (end_prob - first_prob + 1) != expected_probability_tokens:
+    first_prob, span_end = bounds
+    span_budget = _probability_span_token_budget(
+        expected_probability_tokens, extend_probability_span=extend_probability_span
+    )
+    if (span_end - first_prob + 1) != span_budget:
         return []
     target_rel_pos = first_prob + token_position
     seq_len = prompt_len + len(decoded_tokens)
@@ -166,6 +204,7 @@ def build_single_token_probability_hooks(
     decoded_tokens_provider: Callable[[], List[str]],
     token_position: int,
     expected_probability_tokens: int,
+    extend_probability_span: bool = False,
     log_context: str = "",
 ) -> List[Tuple[str, Callable]]:
     _last_logged_key: Dict[str, object | None] = {"value": None}
@@ -177,6 +216,7 @@ def build_single_token_probability_hooks(
             decoded_tokens,
             token_position=token_position,
             expected_probability_tokens=expected_probability_tokens,
+            extend_probability_span=extend_probability_span,
         )
         if positions:
             seq_len = seq_len_provider()
@@ -211,6 +251,7 @@ def greedy_generate_probability_single_token_mean_replaced(
     layer_to_mean_vectors: Dict[int, torch.Tensor],
     token_position: int,
     expected_probability_tokens: int,
+    extend_probability_span: bool = False,
     log_context: str = "",
 ) -> Tuple[str, List[str]]:
     tokens = model.to_tokens(local_prompt)
@@ -233,6 +274,7 @@ def greedy_generate_probability_single_token_mean_replaced(
         decoded_tokens_provider=_decoded_tokens,
         token_position=token_position,
         expected_probability_tokens=expected_probability_tokens,
+        extend_probability_span=extend_probability_span,
         log_context=log_context,
     )
     return _greedy_extend_with_fwd_hooks(
@@ -331,6 +373,7 @@ def run_tokenwise_evaluation(
     max_new_tokens: int,
     parse_mode_verbalised_confidence: bool,
     expected_probability_tokens: int,
+    extend_probability_span: bool,
     mean_from_low_confidence: bool,
 ) -> Tuple[
     Dict[str, dict],
@@ -339,14 +382,17 @@ def run_tokenwise_evaluation(
     Dict[int, int],
     Dict[int, Counter[str]],
 ]:
+    span_token_count = _probability_span_token_budget(
+        expected_probability_tokens, extend_probability_span=extend_probability_span
+    )
     mini_results = {"train": {}, "validation": {}}
     token_position_values: Dict[int, List[float]] = {
-        i: [] for i in range(expected_probability_tokens)
+        i: [] for i in range(span_token_count)
     }
-    token_position_counts: Dict[int, int] = {i: 0 for i in range(expected_probability_tokens)}
-    responses_identical_true: Dict[int, int] = {i: 0 for i in range(expected_probability_tokens)}
+    token_position_counts: Dict[int, int] = {i: 0 for i in range(span_token_count)}
+    responses_identical_true: Dict[int, int] = {i: 0 for i in range(span_token_count)}
     token_label_counters: Dict[int, Counter[str]] = {
-        i: Counter() for i in range(expected_probability_tokens)
+        i: Counter() for i in range(span_token_count)
     }
 
     for split_name, eval_ds in [("train", train_ds), ("validation", val_ds)]:
@@ -386,12 +432,24 @@ def run_tokenwise_evaluation(
             prob_tokens = _extract_probability_tokens(
                 baseline_decoded_tokens,
                 expected_probability_tokens=expected_probability_tokens,
+                extend_probability_span=extend_probability_span,
             )
-            if prob_tokens is not None:
-                for pos, token in enumerate(prob_tokens):
-                    token_label_counters[pos][token] += 1
+            if prob_tokens is None:
+                logging.warning(
+                    "Skipping example %s/%s: could not form probability span "
+                    "(extend_probability_span=%s, expected_base=%d, decoded_len=%d). response=%r",
+                    split_name,
+                    ex_id,
+                    extend_probability_span,
+                    expected_probability_tokens,
+                    len(baseline_decoded_tokens),
+                    baseline_response,
+                )
+                continue
+            for pos, token in enumerate(prob_tokens):
+                token_label_counters[pos][token] += 1
 
-            for token_position in range(expected_probability_tokens):
+            for token_position in range(span_token_count):
                 key = _token_mode_key(token_position)
                 layer_to_mean_vectors_eval = {
                     layer_idx: layer_to_verbalised_embedding_means_eval[layer_idx]["probability"][
@@ -407,6 +465,7 @@ def run_tokenwise_evaluation(
                         layer_to_mean_vectors=layer_to_mean_vectors_eval,
                         token_position=token_position,
                         expected_probability_tokens=expected_probability_tokens,
+                        extend_probability_span=extend_probability_span,
                         log_context=f"{split_name} {ex_id} {_token_mode_key(token_position)}",
                     )
                 )
@@ -448,7 +507,7 @@ def run_tokenwise_evaluation(
             )
 
     token_position_means: Dict[int, Optional[float]] = {}
-    for token_position in range(expected_probability_tokens):
+    for token_position in range(span_token_count):
         values = token_position_values[token_position]
         token_position_means[token_position] = (
             float(np.mean(values)) if values else None
@@ -523,6 +582,8 @@ def write_config_txt(
         "",
         "[Tokenwise settings]",
         f"expected_probability_tokens={args.expected_probability_tokens}",
+        f"extend_probability_span={args.extend_probability_span}",
+        f"span_token_count={_probability_span_token_budget(args.expected_probability_tokens, extend_probability_span=args.extend_probability_span)}",
         f"parse_mode_verbalised_confidence={args.parse_mode_verbalised_confidence}",
         "",
         "[Baseline]",
@@ -532,7 +593,11 @@ def write_config_txt(
         "[Per-position means]",
     ]
 
-    for pos in range(args.expected_probability_tokens):
+    span_token_count = _probability_span_token_budget(
+        args.expected_probability_tokens,
+        extend_probability_span=args.extend_probability_span,
+    )
+    for pos in range(span_token_count):
         lines.append(
             "position_"
             f"{pos}: mean={token_position_means.get(pos)} "
@@ -547,10 +612,10 @@ def write_config_txt(
 def _token_labels_from_counters(
     token_label_counters: Dict[int, Counter[str]],
     *,
-    expected_probability_tokens: int,
+    span_token_count: int,
 ) -> List[str]:
     labels: List[str] = []
-    for pos in range(expected_probability_tokens):
+    for pos in range(span_token_count):
         counter = token_label_counters[pos]
         if not counter:
             labels.append(f"pos_{pos}")
@@ -565,12 +630,12 @@ def write_line_plot(
     path: str,
     token_position_means: Dict[int, Optional[float]],
     baseline_mean: Optional[float],
-    expected_probability_tokens: int,
+    span_token_count: int,
     token_labels: Sequence[str],
 ) -> None:
     xs: List[int] = []
     ys: List[float] = []
-    for pos in range(expected_probability_tokens):
+    for pos in range(span_token_count):
         y_val = token_position_means.get(pos)
         if y_val is not None:
             xs.append(pos)
@@ -586,12 +651,12 @@ def write_line_plot(
             linewidth=1.6,
             label="no_replacement (baseline)",
         )
-    ax.set_xlim(-0.3, max(expected_probability_tokens - 1, 0) + 0.3)
+    ax.set_xlim(-0.3, max(span_token_count - 1, 0) + 0.3)
     ax.set_xlabel("Probability token position")
     ax.set_ylabel("Verbalised confidence")
     ax.set_ylim(0.0, 1.0)
     ax.set_title("Tokenwise probability-span ablation")
-    ax.set_xticks(list(range(expected_probability_tokens)))
+    ax.set_xticks(list(range(span_token_count)))
     ax.set_xticklabels(
         [f"{i}:{_render_token_label(tok)}" for i, tok in enumerate(token_labels)],
         rotation=20,
@@ -730,6 +795,16 @@ def main() -> None:
     parser.add_argument("--expected_probability_tokens", type=int, default=5)
     parser.add_argument("--expected_guess_tokens", type=int, default=2)
     parser.add_argument(
+        "--extend_probability_span",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If true, treat probability span length as expected_probability_tokens + 2 "
+            "(matching process_generations --extend_probability_span H5 builds). "
+            "Eval examples lacking two tokens past the first probability-value token are skipped."
+        ),
+    )
+    parser.add_argument(
         "--parse_mode_verbalised_confidence",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -765,8 +840,8 @@ def main() -> None:
     logging.info(
         "Run parameters: model_name=%s input_h5=%s dataset=%s dtype=%s num_samples=%s "
         "ablate_layers=%s individual_layers=%s low_conf_threshold=%s high_conf_threshold=%s "
-        "mean_from_low_confidence=%s expected_probability_tokens=%s expected_guess_tokens=%s "
-        "new_h5_format=%s random_seed=%s output_dir=%s",
+        "mean_from_low_confidence=%s expected_probability_tokens=%s extend_probability_span=%s "
+        "expected_guess_tokens=%s new_h5_format=%s random_seed=%s output_dir=%s",
         args.model_name,
         args.input_h5,
         args.dataset,
@@ -778,6 +853,7 @@ def main() -> None:
         args.high_conf_threshold,
         args.mean_from_low_confidence,
         args.expected_probability_tokens,
+        args.extend_probability_span,
         args.expected_guess_tokens,
         args.new_h5_format,
         args.random_seed,
@@ -787,6 +863,10 @@ def main() -> None:
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     torch_dtype = dtype_map[args.dtype]
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    span_token_count = _probability_span_token_budget(
+        args.expected_probability_tokens,
+        extend_probability_span=args.extend_probability_span,
+    )
 
     train_ds, val_ds = load_eval_dataset(args.dataset, args.random_seed)
     random.seed(args.random_seed)
@@ -823,6 +903,7 @@ def main() -> None:
         expected_guess_tokens=args.expected_guess_tokens,
         mean_from_low_confidence=args.mean_from_low_confidence,
         new_h5_format=args.new_h5_format,
+        extend_probability_span=args.extend_probability_span,
     )
     logging.info("Verbalised embedding means computed")
     if not args.parse_mode_verbalised_confidence:
@@ -879,10 +960,11 @@ def main() -> None:
             max_new_tokens=args.model_max_new_tokens,
             parse_mode_verbalised_confidence=args.parse_mode_verbalised_confidence,
             expected_probability_tokens=args.expected_probability_tokens,
+            extend_probability_span=args.extend_probability_span,
             mean_from_low_confidence=args.mean_from_low_confidence,
         )
         token_labels = _token_labels_from_counters(
-            token_label_counters, expected_probability_tokens=args.expected_probability_tokens
+            token_label_counters, span_token_count=span_token_count
         )
 
         mini_path = _mini_output_json_path(run_root)
@@ -920,6 +1002,8 @@ def main() -> None:
                 "sample_count": baseline_count,
             },
             "expected_probability_tokens": args.expected_probability_tokens,
+            "extend_probability_span": args.extend_probability_span,
+            "span_token_count": span_token_count,
             "token_positions": {
                 str(pos): {
                     "mode_key": _token_mode_key(pos),
@@ -933,7 +1017,7 @@ def main() -> None:
                         else float(token_position_means[pos] - baseline_mean)
                     ),
                 }
-                for pos in range(args.expected_probability_tokens)
+                for pos in range(span_token_count)
             },
         }
 
@@ -947,7 +1031,7 @@ def main() -> None:
             path=line_plot_path,
             token_position_means=token_position_means,
             baseline_mean=baseline_mean,
-            expected_probability_tokens=args.expected_probability_tokens,
+            span_token_count=span_token_count,
             token_labels=token_labels,
         )
         logging.info("Wrote %s", line_plot_path)
@@ -958,7 +1042,7 @@ def main() -> None:
     per_layer_token_counts: Dict[int, Dict[int, int]] = {}
     per_layer_identical_counts: Dict[int, Dict[int, int]] = {}
     global_token_label_counter: Dict[int, Counter[str]] = {
-        i: Counter() for i in range(args.expected_probability_tokens)
+        i: Counter() for i in range(span_token_count)
     }
 
     for layer_idx in run_layers:
@@ -982,12 +1066,13 @@ def main() -> None:
             max_new_tokens=args.model_max_new_tokens,
             parse_mode_verbalised_confidence=args.parse_mode_verbalised_confidence,
             expected_probability_tokens=args.expected_probability_tokens,
+            extend_probability_span=args.extend_probability_span,
             mean_from_low_confidence=args.mean_from_low_confidence,
         )
         per_layer_token_means[layer_idx] = token_position_means
         per_layer_token_counts[layer_idx] = token_position_counts
         per_layer_identical_counts[layer_idx] = responses_identical_true
-        for pos in range(args.expected_probability_tokens):
+        for pos in range(span_token_count):
             global_token_label_counter[pos].update(token_label_counters[pos])
 
         layer_dir = os.path.join(run_root, str(layer_idx))
@@ -1019,15 +1104,15 @@ def main() -> None:
         logging.info("Wrote %s", layer_config_path)
 
     token_labels = _token_labels_from_counters(
-        global_token_label_counter, expected_probability_tokens=args.expected_probability_tokens
+        global_token_label_counter, span_token_count=span_token_count
     )
 
-    matrix_values = np.full((len(run_layers), args.expected_probability_tokens), np.nan, dtype=np.float32)
+    matrix_values = np.full((len(run_layers), span_token_count), np.nan, dtype=np.float32)
     matrix_dev_desired = np.full(
-        (len(run_layers), args.expected_probability_tokens), np.nan, dtype=np.float32
+        (len(run_layers), span_token_count), np.nan, dtype=np.float32
     )
     for r, layer_idx in enumerate(run_layers):
-        for c in range(args.expected_probability_tokens):
+        for c in range(span_token_count):
             val = per_layer_token_means[layer_idx].get(c)
             if val is None:
                 continue
@@ -1044,7 +1129,7 @@ def main() -> None:
     line_token_means: Dict[int, Optional[float]] = {}
     line_token_counts: Dict[int, int] = {}
     line_identical_counts: Dict[int, int] = {}
-    for pos in range(args.expected_probability_tokens):
+    for pos in range(span_token_count):
         vals = [per_layer_token_means[layer][pos] for layer in run_layers if per_layer_token_means[layer][pos] is not None]
         line_token_means[pos] = float(np.mean(vals)) if vals else None
         line_token_counts[pos] = sum(per_layer_token_counts[layer][pos] for layer in run_layers)
@@ -1061,6 +1146,8 @@ def main() -> None:
             "sample_count": baseline_count,
         },
         "expected_probability_tokens": args.expected_probability_tokens,
+        "extend_probability_span": args.extend_probability_span,
+        "span_token_count": span_token_count,
         "token_positions": {
             str(pos): {
                 "mode_key": _token_mode_key(pos),
@@ -1074,12 +1161,12 @@ def main() -> None:
                     else float(line_token_means[pos] - baseline_mean)
                 ),
             }
-            for pos in range(args.expected_probability_tokens)
+            for pos in range(span_token_count)
         },
         "layer_token_confidence": {
             str(layer_idx): {
                 str(pos): per_layer_token_means[layer_idx].get(pos)
-                for pos in range(args.expected_probability_tokens)
+                for pos in range(span_token_count)
             }
             for layer_idx in run_layers
         },
@@ -1090,7 +1177,7 @@ def main() -> None:
                     if per_layer_token_means[layer_idx].get(pos) is None or baseline_mean is None
                     else float(per_layer_token_means[layer_idx][pos] - baseline_mean)
                 )
-                for pos in range(args.expected_probability_tokens)
+                for pos in range(span_token_count)
             }
             for layer_idx in run_layers
         },
@@ -1137,7 +1224,7 @@ def main() -> None:
         path=line_plot_path,
         token_position_means=line_token_means,
         baseline_mean=baseline_mean,
-        expected_probability_tokens=args.expected_probability_tokens,
+        span_token_count=span_token_count,
         token_labels=token_labels,
     )
     logging.info("Wrote %s", line_plot_path)

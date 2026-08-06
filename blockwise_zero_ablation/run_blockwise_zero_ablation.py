@@ -407,8 +407,8 @@ def parse_ablate_layers(spec: str, n_layers: int) -> List[int]:
     return layers
 
 
-def _is_expected_or_plus_one(actual_len: int, expected_len: int) -> bool:
-    return actual_len in (expected_len, expected_len + 1)
+def _is_expected_or_plus_two(actual_len: int, expected_len: int) -> bool:
+    return actual_len in (expected_len, expected_len + 2)
 
 
 def _completion_token_index_to_abs_pos(prompt_len: int, completion_index: int) -> int:
@@ -431,7 +431,7 @@ def _absolute_prob_positions(
         return []
     _, first_prob, end_prob = parsed
     rel_positions = list(range(first_prob, end_prob+1))
-    if not _is_expected_or_plus_one(len(rel_positions), expected_probability_tokens):
+    if not _is_expected_or_plus_two(len(rel_positions), expected_probability_tokens):
         return []
     rel_positions = rel_positions[:expected_probability_tokens]
     return [_completion_token_index_to_abs_pos(prompt_len, pos) for pos in rel_positions]
@@ -471,7 +471,7 @@ def _absolute_prob_last_token_only_positions(
         return []
     _, first_prob, end_prob = parsed
     full_rel_positions = list(range(first_prob, end_prob+1))
-    if not _is_expected_or_plus_one(len(full_rel_positions), expected_probability_tokens):
+    if not _is_expected_or_plus_two(len(full_rel_positions), expected_probability_tokens):
         return []
     return [_completion_token_index_to_abs_pos(prompt_len, end_prob)]
 
@@ -487,7 +487,7 @@ def _absolute_prob_except_last_token_positions(
         return []
     _, first_prob, end_prob = parsed
     full_rel_positions = list(range(first_prob, end_prob+1))
-    if not _is_expected_or_plus_one(len(full_rel_positions), expected_probability_tokens):
+    if not _is_expected_or_plus_two(len(full_rel_positions), expected_probability_tokens):
         return []
     return [
         _completion_token_index_to_abs_pos(prompt_len, pos) for pos in range(first_prob, end_prob)
@@ -504,7 +504,7 @@ def _absolute_guess_span_positions(
     if last_guess_token_index is None:
         return []
     guess_positions_rel = list(range(0, last_guess_token_index))
-    if not _is_expected_or_plus_one(len(guess_positions_rel), expected_guess_tokens):
+    if len(guess_positions_rel) != expected_guess_tokens:
         return []
     guess_positions_rel = guess_positions_rel[:expected_guess_tokens]
     return [_completion_token_index_to_abs_pos(prompt_len, k) for k in guess_positions_rel]
@@ -528,12 +528,12 @@ def _absolute_pre_probability_positions(
     last_guess_token_index, first_prob_token_index, end_prob_token_index = parsed
 
     guess_positions_rel = list(range(0, last_guess_token_index))
-    if not _is_expected_or_plus_one(len(guess_positions_rel), expected_guess_tokens):
+    if len(guess_positions_rel) != expected_guess_tokens:
         return None
     guess_positions_rel = guess_positions_rel[:expected_guess_tokens]
 
     probability_positions_rel = list(range(first_prob_token_index, end_prob_token_index+1))
-    if not _is_expected_or_plus_one(len(probability_positions_rel), expected_probability_tokens):
+    if not _is_expected_or_plus_two(len(probability_positions_rel), expected_probability_tokens):
         return None
     probability_positions_rel = probability_positions_rel[:expected_probability_tokens]
 

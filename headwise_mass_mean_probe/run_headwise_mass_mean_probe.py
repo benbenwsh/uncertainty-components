@@ -42,7 +42,7 @@ from mass_mean_probe.run_mass_mean_probe import (
     _dedupe_preserve_order,
     _format_alpha,
     _generation_contains_stop,
-    _is_expected_or_plus_one,
+    _is_expected_or_plus_two,
     _postprocess_response_from_full_decode,
     construct_fewshot_prompt_from_indices,
     encode_example_id,
@@ -227,19 +227,19 @@ def compute_low_high_span_means_and_directions_concat(
 
         if not isinstance(emb_guess, list):
             raise ValueError(f"Example {ex_id} embeddings_guess/concat must be a list.")
-        if not _is_expected_or_plus_one(len(emb_guess), expected_guess_tokens):
+        if len(emb_guess) != expected_guess_tokens:
             raise ValueError(
                 f"Example {ex_id} embeddings_guess/concat len={len(emb_guess)}; expected "
-                f"{expected_guess_tokens} or {expected_guess_tokens + 1}."
+                f"{expected_guess_tokens}."
             )
         emb_guess = emb_guess[:expected_guess_tokens]
 
         if not isinstance(emb_prob, list):
             raise ValueError(f"Example {ex_id} embeddings_probability/concat must be a list.")
-        if not _is_expected_or_plus_one(len(emb_prob), expected_probability_tokens):
+        if not _is_expected_or_plus_two(len(emb_prob), expected_probability_tokens):
             raise ValueError(
                 f"Example {ex_id} embeddings_probability/concat len={len(emb_prob)}; expected "
-                f"{expected_probability_tokens} or {expected_probability_tokens + 1}."
+                f"{expected_probability_tokens} or {expected_probability_tokens + 2}."
             )
         emb_prob = emb_prob[:expected_probability_tokens]
 

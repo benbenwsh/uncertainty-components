@@ -950,8 +950,8 @@ def _as_layer_hidden(arr_like: np.ndarray) -> np.ndarray:
     raise ValueError(f"Unexpected embedding tensor shape: {arr.shape}; expected 4D or 2D.")
 
 
-def _is_expected_or_plus_one(actual_len: int, expected_len: int) -> bool:
-    return actual_len in (expected_len, expected_len + 1)
+def _is_expected_or_plus_two(actual_len: int, expected_len: int) -> bool:
+    return actual_len in (expected_len, expected_len + 2)
 
 
 def _expected_probability_span_token_budget(
@@ -959,9 +959,12 @@ def _expected_probability_span_token_budget(
     linguistic_confidence_prompt: bool,
     expected_probability_tokens: int,
     expected_confidence_tokens: int,
+    extend_probability_span: bool = False,
 ) -> int:
     """Token budget for span length checks and truncation on decoded completions."""
-    return expected_confidence_tokens if linguistic_confidence_prompt else expected_probability_tokens
+    if linguistic_confidence_prompt:
+        return expected_confidence_tokens
+    return expected_probability_tokens + (2 if extend_probability_span else 0)
 
 
 def _completion_token_index_to_abs_pos(prompt_len: int, completion_index: int) -> int:
@@ -980,6 +983,7 @@ def _absolute_prob_positions(
     expected_probability_tokens: int,
     expected_confidence_tokens: int,
     linguistic_confidence_prompt: bool = False,
+    extend_probability_span: bool = False,
 ) -> List[int]:
     parsed = parse_guess_and_marker_indices(
         decoded_tokens,
@@ -988,16 +992,21 @@ def _absolute_prob_positions(
     if parsed is None:
         return []
     _, first_prob, end_prob = parsed
-    rel_positions = list(range(first_prob, end_prob+1))
+    apply_extend = extend_probability_span and not linguistic_confidence_prompt
+    if apply_extend and end_prob + 2 >= len(decoded_tokens):
+        return []
+    span_end = end_prob + (2 if apply_extend else 0)
+    rel_positions = list(range(first_prob, span_end + 1))
     span_budget = _expected_probability_span_token_budget(
         linguistic_confidence_prompt=linguistic_confidence_prompt,
         expected_probability_tokens=expected_probability_tokens,
         expected_confidence_tokens=expected_confidence_tokens,
+        extend_probability_span=extend_probability_span,
     )
     logging.info(f"rel_positions: {rel_positions}")
     logging.info(f"span_budget: {span_budget}, length of rel_positions: {len(rel_positions)}")
     logging.info(f"prompt_len: {prompt_len}, decoded_tokens length: {len(decoded_tokens)}")
-    if not _is_expected_or_plus_one(len(rel_positions), span_budget):
+    if not _is_expected_or_plus_two(len(rel_positions), span_budget):
         return []
     rel_positions = rel_positions[:span_budget]
     final_tokens = [_completion_token_index_to_abs_pos(prompt_len, pos) for pos in rel_positions]
@@ -1013,6 +1022,7 @@ def _absolute_prob_positions_at_row_indices(
     expected_probability_tokens: int,
     expected_confidence_tokens: int,
     linguistic_confidence_prompt: bool = False,
+    extend_probability_span: bool = False,
 ) -> List[int]:
     """Absolute positions for selected rows of the H5 probability-prefix span (0-indexed)."""
     full_positions = _absolute_prob_positions(
@@ -1021,6 +1031,7 @@ def _absolute_prob_positions_at_row_indices(
         expected_probability_tokens=expected_probability_tokens,
         expected_confidence_tokens=expected_confidence_tokens,
         linguistic_confidence_prompt=linguistic_confidence_prompt,
+        extend_probability_span=extend_probability_span,
     )
     if not full_positions:
         return []
@@ -1039,6 +1050,7 @@ def _absolute_prob_last_token_only(
     expected_probability_tokens: int,
     expected_confidence_tokens: int,
     linguistic_confidence_prompt: bool = False,
+    extend_probability_span: bool = False,
 ) -> List[int]:
     """Absolute index for the last token in the Probability:/Confidence: marker span."""
     parsed = parse_guess_and_marker_indices(
@@ -1048,15 +1060,20 @@ def _absolute_prob_last_token_only(
     if parsed is None:
         return []
     _, first_prob, end_prob = parsed
-    full_rel_positions = list(range(first_prob, end_prob + 1))
+    apply_extend = extend_probability_span and not linguistic_confidence_prompt
+    if apply_extend and end_prob + 2 >= len(decoded_tokens):
+        return []
+    span_end = end_prob + (2 if apply_extend else 0)
+    full_rel_positions = list(range(first_prob, span_end + 1))
     span_budget = _expected_probability_span_token_budget(
         linguistic_confidence_prompt=linguistic_confidence_prompt,
         expected_probability_tokens=expected_probability_tokens,
         expected_confidence_tokens=expected_confidence_tokens,
+        extend_probability_span=extend_probability_span,
     )
-    if not _is_expected_or_plus_one(len(full_rel_positions), span_budget):
+    if not _is_expected_or_plus_two(len(full_rel_positions), span_budget):
         return []
-    return [_completion_token_index_to_abs_pos(prompt_len, end_prob)]
+    return [_completion_token_index_to_abs_pos(prompt_len, span_end)]
 
 
 def _absolute_prob_marker_except_last_token(
@@ -1066,6 +1083,7 @@ def _absolute_prob_marker_except_last_token(
     expected_probability_tokens: int,
     expected_confidence_tokens: int,
     linguistic_confidence_prompt: bool = False,
+    extend_probability_span: bool = False,
 ) -> List[int]:
     """Absolute indices for the Probability:/Confidence: marker span excluding the last span token."""
     parsed = parse_guess_and_marker_indices(
@@ -1075,16 +1093,21 @@ def _absolute_prob_marker_except_last_token(
     if parsed is None:
         return []
     _, first_prob, end_prob = parsed
-    full_rel_positions = list(range(first_prob, end_prob + 1))
+    apply_extend = extend_probability_span and not linguistic_confidence_prompt
+    if apply_extend and end_prob + 2 >= len(decoded_tokens):
+        return []
+    span_end = end_prob + (2 if apply_extend else 0)
+    full_rel_positions = list(range(first_prob, span_end + 1))
     span_budget = _expected_probability_span_token_budget(
         linguistic_confidence_prompt=linguistic_confidence_prompt,
         expected_probability_tokens=expected_probability_tokens,
         expected_confidence_tokens=expected_confidence_tokens,
+        extend_probability_span=extend_probability_span,
     )
-    if not _is_expected_or_plus_one(len(full_rel_positions), span_budget):
+    if not _is_expected_or_plus_two(len(full_rel_positions), span_budget):
         return []
     return [
-        _completion_token_index_to_abs_pos(prompt_len, pos) for pos in range(first_prob, end_prob)
+        _completion_token_index_to_abs_pos(prompt_len, pos) for pos in range(first_prob, span_end)
     ]
 
 
@@ -1147,7 +1170,7 @@ def _absolute_guess_span_positions(
     if last_guess_token_index is None:
         return []
     guess_positions_rel = list(range(0, last_guess_token_index))
-    if not _is_expected_or_plus_one(len(guess_positions_rel), expected_guess_tokens):
+    if len(guess_positions_rel) != expected_guess_tokens:
         return []
     guess_positions_rel = guess_positions_rel[:expected_guess_tokens]
     return [_completion_token_index_to_abs_pos(prompt_len, k) for k in guess_positions_rel]
@@ -1161,6 +1184,7 @@ def _absolute_pre_probability_positions(
     expected_probability_tokens: int,
     expected_confidence_tokens: int,
     linguistic_confidence_prompt: bool = False,
+    extend_probability_span: bool = False,
 ) -> Optional[Dict[str, List[int]]]:
     """Absolute positions for pre-probability mean ablation.
 
@@ -1176,17 +1200,22 @@ def _absolute_pre_probability_positions(
     last_guess_token_index, first_prob_token_index, end_prob_token_index = parsed
 
     guess_positions_rel = list(range(0, last_guess_token_index))
-    if not _is_expected_or_plus_one(len(guess_positions_rel), expected_guess_tokens):
+    if len(guess_positions_rel) != expected_guess_tokens:
         return None
     guess_positions_rel = guess_positions_rel[:expected_guess_tokens]
 
-    probability_positions_rel = list(range(first_prob_token_index, end_prob_token_index+1))
+    apply_extend = extend_probability_span and not linguistic_confidence_prompt
+    if apply_extend and end_prob_token_index + 2 >= len(decoded_tokens):
+        return None
+    span_end = end_prob_token_index + (2 if apply_extend else 0)
+    probability_positions_rel = list(range(first_prob_token_index, span_end + 1))
     span_budget = _expected_probability_span_token_budget(
         linguistic_confidence_prompt=linguistic_confidence_prompt,
         expected_probability_tokens=expected_probability_tokens,
         expected_confidence_tokens=expected_confidence_tokens,
+        extend_probability_span=extend_probability_span,
     )
-    if not _is_expected_or_plus_one(len(probability_positions_rel), span_budget):
+    if not _is_expected_or_plus_two(len(probability_positions_rel), span_budget):
         return None
     probability_positions_rel = probability_positions_rel[:span_budget]
 
@@ -1835,6 +1864,7 @@ def compute_low_high_span_means_and_directions(
     expected_probability_tokens: int,
     expected_guess_tokens: int,
     new_h5_format: bool = False,
+    extend_probability_span: bool = False,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray], set[str], set[str]]:
     low_vectors: Dict[str, List[np.ndarray]] = {
         "prompt_mean": [],
@@ -1853,6 +1883,7 @@ def compute_low_high_span_means_and_directions(
     low_ids: set[str] = set()
     high_ids: set[str] = set()
     resid_post_layers = np.asarray(ablate_layers) + 1
+    prob_token_budget = expected_probability_tokens + (2 if extend_probability_span else 0)
 
     for ex_id, ex_obj in examples_h5.items():
         responses = ex_obj.get("responses")
@@ -1895,20 +1926,20 @@ def compute_low_high_span_means_and_directions(
             )
         if not isinstance(emb_guess, list):
             raise ValueError(f"Example {ex_id} responses/0/embeddings_guess must be a list.")
-        if not _is_expected_or_plus_one(len(emb_guess), expected_guess_tokens):
+        if len(emb_guess) != expected_guess_tokens:
             raise ValueError(
                 f"Example {ex_id} embeddings_guess len={len(emb_guess)}; "
-                f"expected {expected_guess_tokens} or {expected_guess_tokens + 1}."
+                f"expected {expected_guess_tokens}."
             )
         emb_guess = emb_guess[:expected_guess_tokens]
         if not isinstance(emb_prob, list):
             raise ValueError(f"Example {ex_id} responses/0/embeddings_probability must be a list.")
-        if not _is_expected_or_plus_one(len(emb_prob), expected_probability_tokens):
+        if not _is_expected_or_plus_two(len(emb_prob), prob_token_budget):
             raise ValueError(
                 f"Example {ex_id} embeddings_probability len={len(emb_prob)}; "
-                f"expected {expected_probability_tokens} or {expected_probability_tokens + 1}."
+                f"expected {prob_token_budget} or {prob_token_budget + 2}."
             )
-        emb_prob = emb_prob[:expected_probability_tokens]
+        emb_prob = emb_prob[:prob_token_budget]
 
         prompt_selected = _as_layer_hidden(emb_prompt)[resid_post_layers, :]
         sem_answer_selected = _as_layer_hidden(emb_sem_answer)[resid_post_layers, :]
@@ -2179,6 +2210,15 @@ def main() -> None:
     )
     parser.add_argument("--expected_guess_tokens", type=int, default=5)
     parser.add_argument(
+        "--extend_probability_span",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If true, treat probability span length as expected_probability_tokens + 2 "
+            "(matching process_generations --extend_probability_span H5 builds)."
+        ),
+    )
+    parser.add_argument(
         "--normalize_span_directions",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -2294,6 +2334,7 @@ def main() -> None:
         expected_probability_tokens=args.expected_probability_tokens,
         expected_guess_tokens=args.expected_guess_tokens,
         new_h5_format=args.new_h5_format,
+        extend_probability_span=args.extend_probability_span,
     )
     if args.normalize_span_directions:
         # Mutates direction dict in place

@@ -38,7 +38,10 @@ from blockwise_zero_ablation.run_blockwise_zero_ablation import (
     parse_mode_confidence_from_response,
     split_answerable_indices,
 )
-from layerwise_mean_ablation.run_mean_ablation import _as_layer_hidden, _is_expected_or_plus_one
+from layerwise_mean_ablation.run_mean_ablation import (
+    _as_layer_hidden,
+    _is_expected_or_plus_two,
+)
 
 TRAIN_RATIO = 0.9
 MODE_NONE = "none"
@@ -260,15 +263,15 @@ def compute_kv_probability_group_means(
 
         emb_prob_k = _validate_kv_probability_field(resp0, ex_id, "k")
         emb_prob_v = _validate_kv_probability_field(resp0, ex_id, "v")
-        if not _is_expected_or_plus_one(len(emb_prob_k), expected_probability_tokens):
+        if not _is_expected_or_plus_two(len(emb_prob_k), expected_probability_tokens):
             raise ValueError(
                 f"Example {ex_id} embeddings_probability/k has length {len(emb_prob_k)}; "
-                f"expected {expected_probability_tokens} or {expected_probability_tokens + 1}."
+                f"expected {expected_probability_tokens} or {expected_probability_tokens + 2}."
             )
-        if not _is_expected_or_plus_one(len(emb_prob_v), expected_probability_tokens):
+        if not _is_expected_or_plus_two(len(emb_prob_v), expected_probability_tokens):
             raise ValueError(
                 f"Example {ex_id} embeddings_probability/v has length {len(emb_prob_v)}; "
-                f"expected {expected_probability_tokens} or {expected_probability_tokens + 1}."
+                f"expected {expected_probability_tokens} or {expected_probability_tokens + 2}."
             )
         emb_prob_k = emb_prob_k[:expected_probability_tokens]
         emb_prob_v = emb_prob_v[:expected_probability_tokens]

@@ -55,7 +55,7 @@ from mass_mean_probe.run_mass_mean_probe import (
     _dedupe_preserve_order,
     _format_alpha,
     _generation_contains_stop,
-    _is_expected_or_plus_one,
+    _is_expected_or_plus_two,
     _mean_and_count,
     _positions_for_whole_sequence_mode,
     _postprocess_response_from_full_decode,
@@ -199,10 +199,10 @@ def compute_low_high_span_means_and_directions_by_component(
                 raise ValueError(
                     f"Example {ex_id} responses/0/embeddings_guess/{component} must be a list."
                 )
-            if not _is_expected_or_plus_one(len(emb_guess), expected_guess_tokens):
+            if len(emb_guess) != expected_guess_tokens:
                 raise ValueError(
                     f"Example {ex_id} embeddings_guess/{component} len={len(emb_guess)}; expected "
-                    f"{expected_guess_tokens} or {expected_guess_tokens + 1}."
+                    f"{expected_guess_tokens}."
                 )
             emb_guess = emb_guess[:expected_guess_tokens]
 
@@ -210,10 +210,10 @@ def compute_low_high_span_means_and_directions_by_component(
                 raise ValueError(
                     f"Example {ex_id} responses/0/embeddings_probability/{component} must be a list."
                 )
-            if not _is_expected_or_plus_one(len(emb_prob), expected_probability_tokens):
+            if not _is_expected_or_plus_two(len(emb_prob), expected_probability_tokens):
                 raise ValueError(
                     f"Example {ex_id} embeddings_probability/{component} len={len(emb_prob)}; expected "
-                    f"{expected_probability_tokens} or {expected_probability_tokens + 1}."
+                    f"{expected_probability_tokens} or {expected_probability_tokens + 2}."
                 )
             emb_prob = emb_prob[:expected_probability_tokens]
 

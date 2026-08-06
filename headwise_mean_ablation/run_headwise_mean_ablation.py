@@ -41,7 +41,7 @@ from blockwise_zero_ablation.run_blockwise_zero_ablation import (
 from layerwise_mean_ablation.run_mean_ablation import (
     _absolute_probability_value_start_position,
     _as_layer_hidden,
-    _is_expected_or_plus_one,
+    _is_expected_or_plus_two,
 )
 
 
@@ -278,19 +278,19 @@ def compute_concat_headwise_means(
 
         if not isinstance(emb_guess, list):
             raise ValueError(f"Example {ex_id} embeddings_guess/concat must be a list.")
-        if not _is_expected_or_plus_one(len(emb_guess), expected_guess_tokens):
+        if len(emb_guess) != expected_guess_tokens:
             raise ValueError(
                 f"Example {ex_id} embeddings_guess/concat len={len(emb_guess)}; expected "
-                f"{expected_guess_tokens} or {expected_guess_tokens + 1}."
+                f"{expected_guess_tokens}."
             )
         emb_guess = emb_guess[:expected_guess_tokens]
 
         if not isinstance(emb_prob, list):
             raise ValueError(f"Example {ex_id} embeddings_probability/concat must be a list.")
-        if not _is_expected_or_plus_one(len(emb_prob), expected_probability_tokens):
+        if not _is_expected_or_plus_two(len(emb_prob), expected_probability_tokens):
             raise ValueError(
                 f"Example {ex_id} embeddings_probability/concat len={len(emb_prob)}; expected "
-                f"{expected_probability_tokens} or {expected_probability_tokens + 1}."
+                f"{expected_probability_tokens} or {expected_probability_tokens + 2}."
             )
         emb_prob = emb_prob[:expected_probability_tokens]
 
@@ -406,19 +406,19 @@ def compute_kv_headwise_means(
 
         if not isinstance(emb_guess, list):
             raise ValueError(f"Example {ex_id} embeddings_guess/{component} must be a list.")
-        if not _is_expected_or_plus_one(len(emb_guess), expected_guess_tokens):
+        if len(emb_guess) != expected_guess_tokens:
             raise ValueError(
                 f"Example {ex_id} embeddings_guess/{component} len={len(emb_guess)}; expected "
-                f"{expected_guess_tokens} or {expected_guess_tokens + 1}."
+                f"{expected_guess_tokens}."
             )
         emb_guess = emb_guess[:expected_guess_tokens]
 
         if not isinstance(emb_prob, list):
             raise ValueError(f"Example {ex_id} embeddings_probability/{component} must be a list.")
-        if not _is_expected_or_plus_one(len(emb_prob), expected_probability_tokens):
+        if not _is_expected_or_plus_two(len(emb_prob), expected_probability_tokens):
             raise ValueError(
                 f"Example {ex_id} embeddings_probability/{component} len={len(emb_prob)}; expected "
-                f"{expected_probability_tokens} or {expected_probability_tokens + 1}."
+                f"{expected_probability_tokens} or {expected_probability_tokens + 2}."
             )
         emb_prob = emb_prob[:expected_probability_tokens]
 
@@ -533,19 +533,19 @@ def compute_concat_whole_means(
 
         if not isinstance(emb_guess, list):
             raise ValueError(f"Example {ex_id} embeddings_guess/concat must be a list.")
-        if not _is_expected_or_plus_one(len(emb_guess), expected_guess_tokens):
+        if len(emb_guess) != expected_guess_tokens:
             raise ValueError(
                 f"Example {ex_id} embeddings_guess/concat len={len(emb_guess)}; expected "
-                f"{expected_guess_tokens} or {expected_guess_tokens + 1}."
+                f"{expected_guess_tokens}."
             )
         emb_guess = emb_guess[:expected_guess_tokens]
 
         if not isinstance(emb_prob, list):
             raise ValueError(f"Example {ex_id} embeddings_probability/concat must be a list.")
-        if not _is_expected_or_plus_one(len(emb_prob), expected_probability_tokens):
+        if not _is_expected_or_plus_two(len(emb_prob), expected_probability_tokens):
             raise ValueError(
                 f"Example {ex_id} embeddings_probability/concat len={len(emb_prob)}; expected "
-                f"{expected_probability_tokens} or {expected_probability_tokens + 1}."
+                f"{expected_probability_tokens} or {expected_probability_tokens + 2}."
             )
         emb_prob = emb_prob[:expected_probability_tokens]
 
@@ -652,19 +652,19 @@ def compute_kv_whole_means(
 
         if not isinstance(emb_guess, list):
             raise ValueError(f"Example {ex_id} embeddings_guess/{component} must be a list.")
-        if not _is_expected_or_plus_one(len(emb_guess), expected_guess_tokens):
+        if len(emb_guess) != expected_guess_tokens:
             raise ValueError(
                 f"Example {ex_id} embeddings_guess/{component} len={len(emb_guess)}; expected "
-                f"{expected_guess_tokens} or {expected_guess_tokens + 1}."
+                f"{expected_guess_tokens}."
             )
         emb_guess = emb_guess[:expected_guess_tokens]
 
         if not isinstance(emb_prob, list):
             raise ValueError(f"Example {ex_id} embeddings_probability/{component} must be a list.")
-        if not _is_expected_or_plus_one(len(emb_prob), expected_probability_tokens):
+        if not _is_expected_or_plus_two(len(emb_prob), expected_probability_tokens):
             raise ValueError(
                 f"Example {ex_id} embeddings_probability/{component} len={len(emb_prob)}; expected "
-                f"{expected_probability_tokens} or {expected_probability_tokens + 1}."
+                f"{expected_probability_tokens} or {expected_probability_tokens + 2}."
             )
         emb_prob = emb_prob[:expected_probability_tokens]
 

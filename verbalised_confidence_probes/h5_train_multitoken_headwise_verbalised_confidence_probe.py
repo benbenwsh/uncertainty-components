@@ -122,8 +122,8 @@ def _reshape_layer_hidden_to_heads(arr_like: np.ndarray, *, n_heads: int, d_head
     return arr.reshape(arr.shape[0], n_heads, d_head)
 
 
-def _is_expected_or_plus_one(actual_len: int, expected_len: int) -> bool:
-    return actual_len in (expected_len, expected_len + 1)
+def _is_expected_or_plus_two(actual_len: int, expected_len: int) -> bool:
+    return actual_len in (expected_len, expected_len + 2)
 
 
 def _validate_concat_field(resp0: dict, ex_id: str, field_name: str):
@@ -190,14 +190,14 @@ def _normalize_probability_concat_list(
     example_id: str,
     path: str,
 ) -> list[np.ndarray] | None:
-    if not _is_expected_or_plus_one(len(emb_prob), expected_probability_tokens):
+    if not _is_expected_or_plus_two(len(emb_prob), expected_probability_tokens):
         logging.warning(
             "%s: example %s embeddings_probability/concat len=%s; expected %s or %s. Skipping.",
             path,
             example_id,
             len(emb_prob),
             expected_probability_tokens,
-            expected_probability_tokens + 1,
+            expected_probability_tokens + 2,
         )
         return None
     return emb_prob[:expected_probability_tokens]
@@ -343,10 +343,10 @@ def _validate_h5_concat_probability_lengths(
                     f"{path}: example {example_id_str} missing embeddings_probability/concat. "
                     "Please regenerate processed H5 with --collect_concat_embeddings."
                 )
-            if not _is_expected_or_plus_one(len(emb_prob), expected_probability_tokens):
+            if not _is_expected_or_plus_two(len(emb_prob), expected_probability_tokens):
                 raise ValueError(
                     f"{path}: example {example_id_str} embeddings_probability/concat len={len(emb_prob)}; "
-                    f"expected {expected_probability_tokens} or {expected_probability_tokens + 1}."
+                    f"expected {expected_probability_tokens} or {expected_probability_tokens + 2}."
                 )
             checked_examples += 1
     logging.info("Validated concat probability token lengths for %s examples in %s", checked_examples, path)

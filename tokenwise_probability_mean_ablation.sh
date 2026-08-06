@@ -47,18 +47,19 @@ uptime
 # Gemma
 python3 ./tokenwise_probability_mean_ablation/run_tokenwise_probability_mean_ablation.py \
   --model_name mistralai/Mistral-7B-Instruct-v0.1 \
-  --input_h5 ./process_generations/processed_generations_more_h5/mistral/3_nq_mistral_500_train/train_verbalised_embeddings.h5 \
-  --dataset nq \
+  --input_h5 ./process_generations/processed_generations_more_h5/mistral/2_200_9_prob_toks/train_verbalised_embeddings.h5 \
+  --dataset trivia_qa \
   --no-enable_brief \
-  --num_samples 33 \
+  --num_samples 22 \
   --device cuda:0 \
   --dtype bfloat16 \
   --new_h5_format \
-  --low_conf_threshold 0.0 \
-  --high_conf_threshold 1.0 \
+  --low_conf_threshold 0.1 \
+  --high_conf_threshold 0.9 \
   --individual_layers \
   --expected_guess_tokens 5 \
   --expected_probability_tokens 7 \
+  --extend_probability_span \
   --no-mean_from_low_confidence
 
 # so the oom on cpu is indeed because of the process weight float upcasting
