@@ -22,20 +22,21 @@ uptime
 
 # Both attn+mlp simultaneously (individual-layer heatmap):
 python3 ./subblock_tokenwise_mean_ablation/run_subblock_tokenwise_mean_ablation.py \
-  --model_name Qwen/Qwen2.5-32B-Instruct \
-  --input_h5 ./process_generations/processed_generations_more_h5/qwen_32B/23_32B_1000_train/balanced/train_verbalised_embeddings.h5 \
+  --model_name mistralai/Mistral-7B-Instruct-v0.1 \
+  --input_h5 ./process_generations/processed_generations_more_h5/mistral/2_200_9_prob_toks/train_verbalised_embeddings.h5 \
   --dataset trivia_qa \
   --no-enable_brief \
   --num_samples 20 \
   --device cuda:0 \
   --dtype bfloat16 \
   --new_h5_format \
-  --ablate_subblocks attn mlp \
-  --low_conf_threshold 0.2 \
-  --high_conf_threshold 0.8 \
+  --ablate_subblocks mlp \
+  --low_conf_threshold 0.1 \
+  --high_conf_threshold 0.9 \
   --individual_layers \
-  --expected_guess_tokens 2 \
-  --expected_probability_tokens 5 \
+  --expected_guess_tokens 5 \
+  --expected_probability_tokens 7 \
+  --extend_probability_span \
   --no-mean_from_low_confidence
 
 # N.B. num_samples refer to the max number of iterations to perform, not limiting

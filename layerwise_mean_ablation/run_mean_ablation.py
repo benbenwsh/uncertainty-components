@@ -748,7 +748,6 @@ def compute_confidence_group_means(
     expected_probability_tokens: int,
     mean_from_low_confidence: bool,
     new_h5_format: bool = False,
-    extend_probability_span: bool = False,
 ) -> Tuple[np.ndarray, set[str], set[str]]:
     """
     Returns:
@@ -759,7 +758,6 @@ def compute_confidence_group_means(
     source_vectors: List[np.ndarray] = []
     low_ids: set[str] = set()
     high_ids: set[str] = set()
-    prob_token_budget = expected_probability_tokens + (2 if extend_probability_span else 0)
 
     for ex_id, ex_obj in examples_h5.items():
         responses = ex_obj.get("responses")
@@ -786,12 +784,12 @@ def compute_confidence_group_means(
         )
         if not isinstance(emb_prob, list):
             raise ValueError(f"Example {ex_id} responses/0/embeddings_probability must be a list.")
-        if not _is_expected_or_plus_two(len(emb_prob), prob_token_budget):
+        if not _is_expected_or_plus_two(len(emb_prob), expected_probability_tokens):
             raise ValueError(
                 f"Example {ex_id} embeddings_probability len={len(emb_prob)}; "
-                f"expected {prob_token_budget} or {prob_token_budget + 2}."
+                f"expected {expected_probability_tokens} or {expected_probability_tokens + 2}."
             )
-        emb_prob = emb_prob[:prob_token_budget]
+        emb_prob = emb_prob[:expected_probability_tokens]
 
         token_vectors: List[np.ndarray] = []
         for tok_arr in emb_prob:
@@ -850,7 +848,6 @@ def compute_verbalised_embedding_group_means(
     expected_guess_tokens: int,
     mean_from_low_confidence: bool,
     new_h5_format: bool = False,
-    extend_probability_span: bool = False,
 ) -> Tuple[Dict[str, np.ndarray], set[str], set[str]]:
     """Build per-layer mean replacement vectors for verbalised-embedding regions.
 
@@ -862,8 +859,9 @@ def compute_verbalised_embedding_group_means(
       - Probability marker-span rows (`embeddings_probability`)
       - Mean probability-value embedding (`embeddings_mean_prob_val`)
 
-    When ``extend_probability_span`` is true, probability rows are truncated to
-    ``expected_probability_tokens + 2`` (matching process_generations H5 builds).
+    ``embeddings_probability`` lists may have length ``expected_probability_tokens``
+    or ``expected_probability_tokens + 2``; only the first
+    ``expected_probability_tokens`` rows are used.
 
     Returns:
       - dict of mean tensors keyed by region (`prompt_mean`, `guess`,
@@ -879,7 +877,6 @@ def compute_verbalised_embedding_group_means(
     guess_vectors: List[np.ndarray] = []
     probability_vectors: List[np.ndarray] = []
     probability_value_mean_vectors: List[np.ndarray] = []
-    prob_token_budget = expected_probability_tokens + (2 if extend_probability_span else 0)
 
     for ex_id, ex_obj in examples_h5.items():
         responses = ex_obj.get("responses")
@@ -938,12 +935,12 @@ def compute_verbalised_embedding_group_means(
         emb_guess = emb_guess[:expected_guess_tokens]
         if not isinstance(emb_prob, list):
             raise ValueError(f"Example {ex_id} responses/0/embeddings_probability must be a list.")
-        if not _is_expected_or_plus_two(len(emb_prob), prob_token_budget):
+        if not _is_expected_or_plus_two(len(emb_prob), expected_probability_tokens):
             raise ValueError(
                 f"Example {ex_id} embeddings_probability len={len(emb_prob)}; "
-                f"expected {prob_token_budget} or {prob_token_budget + 2}."
+                f"expected {expected_probability_tokens} or {expected_probability_tokens + 2}."
             )
-        emb_prob = emb_prob[:prob_token_budget]
+        emb_prob = emb_prob[:expected_probability_tokens]
 
         resid_post_layers = np.asarray(ablate_layers) + 1
         prompt_layer_hidden = _as_layer_hidden(emb_prompt)[resid_post_layers, :]
@@ -2218,15 +2215,6 @@ def main() -> None:
     parser.add_argument("--expected_probability_tokens", type=int, default=7)
     parser.add_argument("--expected_guess_tokens", type=int, default=5)
     parser.add_argument(
-        "--extend_probability_span",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "If true, treat probability span length as expected_probability_tokens + 2 "
-            "(matching process_generations --extend_probability_span H5 builds)."
-        ),
-    )
-    parser.add_argument(
         "--parse_mode_verbalised_confidence",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -2318,7 +2306,6 @@ def main() -> None:
             expected_guess_tokens=args.expected_guess_tokens,
             mean_from_low_confidence=args.mean_from_low_confidence,
             new_h5_format=args.new_h5_format,
-            extend_probability_span=args.extend_probability_span,
         )
     else:
         low_ids, high_ids = collect_confidence_group_ids(

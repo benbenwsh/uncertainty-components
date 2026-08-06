@@ -142,20 +142,20 @@ def _probability_span_token_budget(
 
 def _probability_span_bounds(
     decoded_tokens: Sequence[str],
-    *,
-    extend_probability_span: bool,
 ) -> Optional[Tuple[int, int]]:
-    """Return (first_prob, span_end) inclusive, or None if parse/extend fails."""
+    """Return non-extended (first_prob, end_prob) inclusive, or None if parse fails.
+
+    Extend extras are not required here: interventions unlock once this base
+    Probability: span is available; extra value-token positions activate later
+    once their abs positions enter the sequence.
+    """
     parsed = parse_guess_and_probability_indices(list(decoded_tokens))
     if parsed is None:
         return None
     _, first_prob, end_prob = parsed
-    span_end = end_prob + (2 if extend_probability_span else 0)
-    if extend_probability_span and end_prob + 2 >= len(decoded_tokens):
+    if end_prob >= len(decoded_tokens):
         return None
-    if span_end >= len(decoded_tokens):
-        return None
-    return first_prob, span_end
+    return first_prob, end_prob
 
 
 def _extract_probability_tokens(
@@ -164,19 +164,21 @@ def _extract_probability_tokens(
     expected_probability_tokens: int,
     extend_probability_span: bool = False,
 ) -> Optional[List[str]]:
-    bounds = _probability_span_bounds(
-        decoded_tokens, extend_probability_span=extend_probability_span
-    )
+    bounds = _probability_span_bounds(decoded_tokens)
     if bounds is None:
         return None
-    first_prob, span_end = bounds
-    span = list(decoded_tokens[first_prob : span_end + 1])
-    span_budget = _probability_span_token_budget(
-        expected_probability_tokens, extend_probability_span=extend_probability_span
-    )
-    if len(span) != span_budget:
+    first_prob, end_prob = bounds
+    base_span = list(decoded_tokens[first_prob : end_prob + 1])
+    if len(base_span) != expected_probability_tokens:
         return None
-    return span
+    if not extend_probability_span:
+        return base_span
+    # Include up to two extra value tokens for labels when present; do not skip
+    # the example if they are missing.
+    extra_end = min(end_prob + 2, len(decoded_tokens) - 1)
+    if extra_end > end_prob:
+        return list(decoded_tokens[first_prob : extra_end + 1])
+    return base_span
 
 
 def _absolute_prob_single_position(
@@ -187,16 +189,16 @@ def _absolute_prob_single_position(
     expected_probability_tokens: int,
     extend_probability_span: bool = False,
 ) -> List[int]:
-    bounds = _probability_span_bounds(
-        decoded_tokens, extend_probability_span=extend_probability_span
-    )
+    bounds = _probability_span_bounds(decoded_tokens)
     if bounds is None:
         return []
-    first_prob, span_end = bounds
+    first_prob, end_prob = bounds
+    if (end_prob - first_prob + 1) != expected_probability_tokens:
+        return []
     span_budget = _probability_span_token_budget(
         expected_probability_tokens, extend_probability_span=extend_probability_span
     )
-    if (span_end - first_prob + 1) != span_budget:
+    if token_position < 0 or token_position >= span_budget:
         return []
     target_rel_pos = first_prob + token_position
     seq_len = prompt_len + len(decoded_tokens)

@@ -47,7 +47,6 @@ from mass_mean_probe.run_mass_mean_probe import (
     CONFIDENCE_PROMPT_NUMERIC,
     _expected_probability_span_token_budget,
     _format_alpha,
-    _is_expected_or_plus_two,
     compute_low_high_span_means_and_directions,
     configure_prefix_tokens_for_model,
     normalize_direction_spans_to_unit_norm_budget,
@@ -142,20 +141,25 @@ def _extract_probability_tokens(
     if parsed is None:
         return None
     _, first_prob, end_prob = parsed
-    apply_extend = extend_probability_span and not linguistic_confidence_prompt
-    if apply_extend and end_prob + 2 >= len(decoded_tokens):
+    if end_prob >= len(decoded_tokens):
         return None
-    span_end = end_prob + (2 if apply_extend else 0)
-    span = list(decoded_tokens[first_prob : span_end + 1])
-    span_budget = _expected_probability_span_token_budget(
-        linguistic_confidence_prompt=linguistic_confidence_prompt,
-        expected_probability_tokens=expected_probability_tokens,
-        expected_confidence_tokens=expected_confidence_tokens,
-        extend_probability_span=extend_probability_span,
+    base_span = list(decoded_tokens[first_prob : end_prob + 1])
+    base_budget = (
+        expected_confidence_tokens
+        if linguistic_confidence_prompt
+        else expected_probability_tokens
     )
-    if not _is_expected_or_plus_two(len(span), span_budget):
+    if len(base_span) != base_budget:
         return None
-    return span[:span_budget]
+    apply_extend = extend_probability_span and not linguistic_confidence_prompt
+    if not apply_extend:
+        return base_span
+    # Include up to two extra value tokens for labels when present; do not skip
+    # the example if they are missing.
+    extra_end = min(end_prob + 2, len(decoded_tokens) - 1)
+    if extra_end > end_prob:
+        return list(decoded_tokens[first_prob : extra_end + 1])
+    return base_span
 
 
 def _absolute_prob_single_position(
@@ -175,19 +179,21 @@ def _absolute_prob_single_position(
     if parsed is None:
         return []
     _, first_prob, end_prob = parsed
-    apply_extend = extend_probability_span and not linguistic_confidence_prompt
-    if apply_extend and end_prob + 2 >= len(decoded_tokens):
+    if end_prob >= len(decoded_tokens):
         return []
-    span_end = end_prob + (2 if apply_extend else 0)
+    base_budget = (
+        expected_confidence_tokens
+        if linguistic_confidence_prompt
+        else expected_probability_tokens
+    )
+    if (end_prob - first_prob + 1) != base_budget:
+        return []
     span_budget = _expected_probability_span_token_budget(
         linguistic_confidence_prompt=linguistic_confidence_prompt,
         expected_probability_tokens=expected_probability_tokens,
         expected_confidence_tokens=expected_confidence_tokens,
         extend_probability_span=extend_probability_span,
     )
-    span_len = span_end - first_prob + 1
-    if not _is_expected_or_plus_two(span_len, span_budget):
-        return []
     if token_position < 0 or token_position >= span_budget:
         return []
     target_rel_pos = first_prob + token_position
@@ -930,15 +936,21 @@ def main() -> None:
     run_layers = list(range(model.cfg.n_layers)) if args.individual_layers else ablate_layers
 
     examples_h5 = load_examples_h5(Path(args.input_h5))
+    # Shared H5 helper accepts expected or expected+2 and truncates to the budget
+    # we pass. For numeric extend mode, pass the extended span count.
+    direction_prob_token_budget = (
+        args.expected_probability_tokens
+        if args.linguistic_confidence_prompt
+        else span_token_count
+    )
     _mean_low, _mean_high, direction, low_ids, high_ids = compute_low_high_span_means_and_directions(
         examples_h5,
         run_layers,
         low_conf_threshold=args.low_conf_threshold,
         high_conf_threshold=args.high_conf_threshold,
-        expected_probability_tokens=args.expected_probability_tokens,
+        expected_probability_tokens=direction_prob_token_budget,
         expected_guess_tokens=args.expected_guess_tokens,
         new_h5_format=args.new_h5_format,
-        extend_probability_span=args.extend_probability_span,
     )
     if args.normalize_span_directions:
         normalization_stats = normalize_direction_spans_to_unit_norm_budget(

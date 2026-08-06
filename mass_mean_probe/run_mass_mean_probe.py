@@ -1864,7 +1864,6 @@ def compute_low_high_span_means_and_directions(
     expected_probability_tokens: int,
     expected_guess_tokens: int,
     new_h5_format: bool = False,
-    extend_probability_span: bool = False,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray], set[str], set[str]]:
     low_vectors: Dict[str, List[np.ndarray]] = {
         "prompt_mean": [],
@@ -1883,7 +1882,6 @@ def compute_low_high_span_means_and_directions(
     low_ids: set[str] = set()
     high_ids: set[str] = set()
     resid_post_layers = np.asarray(ablate_layers) + 1
-    prob_token_budget = expected_probability_tokens + (2 if extend_probability_span else 0)
 
     for ex_id, ex_obj in examples_h5.items():
         responses = ex_obj.get("responses")
@@ -1934,12 +1932,12 @@ def compute_low_high_span_means_and_directions(
         emb_guess = emb_guess[:expected_guess_tokens]
         if not isinstance(emb_prob, list):
             raise ValueError(f"Example {ex_id} responses/0/embeddings_probability must be a list.")
-        if not _is_expected_or_plus_two(len(emb_prob), prob_token_budget):
+        if not _is_expected_or_plus_two(len(emb_prob), expected_probability_tokens):
             raise ValueError(
                 f"Example {ex_id} embeddings_probability len={len(emb_prob)}; "
-                f"expected {prob_token_budget} or {prob_token_budget + 2}."
+                f"expected {expected_probability_tokens} or {expected_probability_tokens + 2}."
             )
-        emb_prob = emb_prob[:prob_token_budget]
+        emb_prob = emb_prob[:expected_probability_tokens]
 
         prompt_selected = _as_layer_hidden(emb_prompt)[resid_post_layers, :]
         sem_answer_selected = _as_layer_hidden(emb_sem_answer)[resid_post_layers, :]
@@ -2210,15 +2208,6 @@ def main() -> None:
     )
     parser.add_argument("--expected_guess_tokens", type=int, default=5)
     parser.add_argument(
-        "--extend_probability_span",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "If true, treat probability span length as expected_probability_tokens + 2 "
-            "(matching process_generations --extend_probability_span H5 builds)."
-        ),
-    )
-    parser.add_argument(
         "--normalize_span_directions",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -2334,7 +2323,6 @@ def main() -> None:
         expected_probability_tokens=args.expected_probability_tokens,
         expected_guess_tokens=args.expected_guess_tokens,
         new_h5_format=args.new_h5_format,
-        extend_probability_span=args.extend_probability_span,
     )
     if args.normalize_span_directions:
         # Mutates direction dict in place
