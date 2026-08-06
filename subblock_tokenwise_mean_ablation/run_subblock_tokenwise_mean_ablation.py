@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Tokenwise probability-span mean ablation runner.
+"""Subblock tokenwise probability-span mean ablation runner.
 
-This script mirrors the layerwise mean-ablation setup but removes ablation modes and
-always performs:
+Mirrors tokenwise residual-stream mean ablation, but intervenes at attn-out and/or
+mlp-out instead of hook_resid_post. Always performs:
 1) baseline no-replacement generation, and
-2) seven independent single-token probability-span replacements (positions 0..6).
+2) independent single-token probability-span mean replacements (one position at a time).
+
+When --ablate_subblocks includes both attn and mlp, both subblocks are ablated
+simultaneously in the same forward pass. Otherwise only the listed subblock is used.
 
 Outputs are intentionally compact:
     - ablation_results_mini.json
@@ -36,14 +39,16 @@ REPO_ROOT = SCRIPT_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from blockwise_mean_ablation.run_blockwise_mean_ablation import (
+    compute_pre_probability_group_means_by_component,
+)
+from blockwise_zero_ablation.run_blockwise_zero_ablation import SUBBLOCK_TO_HOOK
 from layerwise_mean_ablation.run_mean_ablation import (
     BRIEF_PROMPTS,
     CONFIDENCE_PROMPT,
-    _build_resid_post_mean_replace_hooks,
     _completion_token_index_to_abs_pos,
     _greedy_extend_with_fwd_hooks,
     collect_confidence_group_ids,
-    compute_verbalised_embedding_group_means,
     configure_prefix_tokens_for_model,
     construct_fewshot_prompt_from_indices,
     encode_example_id,
@@ -59,6 +64,11 @@ from layerwise_mean_ablation.run_mean_ablation import (
 
 
 TRAIN_RATIO = 0.9
+MODULE_NAME = "subblock_tokenwise_mean_ablation"
+
+
+def _format_subblocks(subblocks: Sequence[str]) -> str:
+    return "+".join(subblocks)
 
 
 def _token_mode_key(token_position: int) -> str:
@@ -71,9 +81,9 @@ def _resolve_run_root(cli_output_dir: Optional[str], *, individual_layers: bool)
         return cli_output_dir
 
     if individual_layers:
-        base_dir = os.path.join("tokenwise_probability_mean_ablation", "results", "individual_layers")
+        base_dir = os.path.join(MODULE_NAME, "results", "individual_layers")
     else:
-        base_dir = os.path.join("tokenwise_probability_mean_ablation", "results")
+        base_dir = os.path.join(MODULE_NAME, "results")
     os.makedirs(base_dir, exist_ok=True)
 
     existing = [
@@ -196,8 +206,8 @@ def _absolute_prob_single_position(
     return []
 
 
-def build_single_token_probability_hooks(
-    layer_to_mean_vectors: Dict[int, torch.Tensor],
+def build_single_token_subblock_mean_replace_hooks(
+    component_to_layer_to_mean_vectors: Dict[str, Dict[int, torch.Tensor]],
     *,
     prompt_len: int,
     seq_len_provider: Callable[[], int],
@@ -207,6 +217,11 @@ def build_single_token_probability_hooks(
     extend_probability_span: bool = False,
     log_context: str = "",
 ) -> List[Tuple[str, Callable]]:
+    """Build mean-replace hooks for one or more subblocks at a single token position.
+
+    When multiple subblocks are present, all hooks are registered together so
+    attn and mlp are ablated simultaneously in the same forward pass.
+    """
     _last_logged_key: Dict[str, object | None] = {"value": None}
 
     def _abs_positions() -> List[int]:
@@ -226,21 +241,51 @@ def build_single_token_probability_hooks(
                 prefix = f"{log_context} " if log_context else ""
                 rendered_tokens = [_render_token_label(token) for token in decoded_tokens]
                 logging.info(
-                    "%sAblation forward pass (parse ok): ablation_positions=%s prompt_len=%d seq_len=%d decoded_tokens=%s",
+                    "%sAblation forward pass (parse ok): ablation_positions=%s "
+                    "subblocks=%s prompt_len=%d seq_len=%d decoded_tokens=%s",
                     prefix,
                     positions,
+                    list(component_to_layer_to_mean_vectors.keys()),
                     prompt_len,
                     seq_len,
                     rendered_tokens,
                 )
         return positions
 
-    return _build_resid_post_mean_replace_hooks(
-        layer_to_mean_vectors,
-        seq_len_provider=seq_len_provider,
-        abs_positions_provider=_abs_positions,
-        strict_num_prob_positions=True,
-    )
+    hooks: List[Tuple[str, Callable]] = []
+    for subblock, layer_to_mean_vectors in component_to_layer_to_mean_vectors.items():
+        hook_suffix = SUBBLOCK_TO_HOOK[subblock]
+        for layer_idx, replacement in layer_to_mean_vectors.items():
+            hook_name = f"blocks.{layer_idx}.{hook_suffix}"
+
+            def _make_hook(
+                layer_key: int = layer_idx,
+                mean_vec: torch.Tensor = replacement,
+            ):
+                def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
+                    del hook
+                    abs_positions = _abs_positions()
+                    if not abs_positions:
+                        return activation
+                    if mean_vec.ndim != 2:
+                        raise ValueError(
+                            f"Expected replacement for layer {layer_key} to have shape "
+                            f"[num_positions, hidden_dim], got {tuple(mean_vec.shape)}."
+                        )
+                    if mean_vec.shape[0] != len(abs_positions):
+                        raise ValueError(
+                            f"Mean-replace position count mismatch at layer {layer_key}: "
+                            f"abs_positions={len(abs_positions)} replacement_rows={mean_vec.shape[0]}."
+                        )
+                    for pos_i, abs_pos in enumerate(abs_positions):
+                        if 0 <= abs_pos < activation.shape[1]:
+                            activation[:, abs_pos, :] = mean_vec[pos_i].to(activation.dtype)
+                    return activation
+
+                return hook_fn
+
+            hooks.append((hook_name, _make_hook()))
+    return hooks
 
 
 def greedy_generate_probability_single_token_mean_replaced(
@@ -248,7 +293,7 @@ def greedy_generate_probability_single_token_mean_replaced(
     *,
     local_prompt: str,
     max_new_tokens: int,
-    layer_to_mean_vectors: Dict[int, torch.Tensor],
+    component_to_layer_to_mean_vectors: Dict[str, Dict[int, torch.Tensor]],
     token_position: int,
     expected_probability_tokens: int,
     extend_probability_span: bool = False,
@@ -267,8 +312,8 @@ def greedy_generate_probability_single_token_mean_replaced(
     def _decoded_tokens() -> List[str]:
         return decoded_tokens
 
-    hooks = build_single_token_probability_hooks(
-        layer_to_mean_vectors,
+    hooks = build_single_token_subblock_mean_replace_hooks(
+        component_to_layer_to_mean_vectors,
         prompt_len=prompt_len,
         seq_len_provider=_seq_len,
         decoded_tokens_provider=_decoded_tokens,
@@ -366,7 +411,7 @@ def run_tokenwise_evaluation(
     val_ds,
     model,
     fewshot_prefix: str,
-    layer_to_verbalised_embedding_means_eval: Dict[int, Dict[str, torch.Tensor]],
+    component_to_layer_to_verbalised_embedding_means_eval: Dict[str, Dict[int, Dict[str, torch.Tensor]]],
     none_cache: Dict[str, Dict[str, Dict[str, object]]],
     ablation_target_ids: Sequence[str],
     ablation_target_group: str,
@@ -402,7 +447,7 @@ def run_tokenwise_evaluation(
             eval_ds, ablation_target_ids, split_name, num_samples
         )
         logging.info(
-            "Evaluating %d examples on %s split for tokenwise ablation.",
+            "Evaluating %d examples on %s split for subblock tokenwise ablation.",
             len(selected_ids),
             split_name,
         )
@@ -457,18 +502,21 @@ def run_tokenwise_evaluation(
 
             for token_position in range(span_token_count):
                 key = _token_mode_key(token_position)
-                layer_to_mean_vectors_eval = {
-                    layer_idx: layer_to_verbalised_embedding_means_eval[layer_idx]["probability"][
-                        token_position : token_position + 1, :
-                    ]
-                    for layer_idx in layer_to_verbalised_embedding_means_eval
+                component_to_layer_to_mean_vectors_eval: Dict[str, Dict[int, torch.Tensor]] = {
+                    component: {
+                        layer_idx: layer_means["probability"][
+                            token_position : token_position + 1, :
+                        ]
+                        for layer_idx, layer_means in layer_map.items()
+                    }
+                    for component, layer_map in component_to_layer_to_verbalised_embedding_means_eval.items()
                 }
                 response, _decoded_tokens = (
                     greedy_generate_probability_single_token_mean_replaced(
                         model=model,
                         local_prompt=local_prompt,
                         max_new_tokens=max_new_tokens,
-                        layer_to_mean_vectors=layer_to_mean_vectors_eval,
+                        component_to_layer_to_mean_vectors=component_to_layer_to_mean_vectors_eval,
                         token_position=token_position,
                         expected_probability_tokens=expected_probability_tokens,
                         extend_probability_span=extend_probability_span,
@@ -547,8 +595,8 @@ def write_config_txt(
     finished_at: str,
 ) -> None:
     lines = [
-        "Tokenwise Probability Mean Ablation Config",
-        "=========================================",
+        "Subblock Tokenwise Probability Mean Ablation Config",
+        "===================================================",
         "",
         "[Run]",
         f"finished_at={finished_at}",
@@ -561,6 +609,7 @@ def write_config_txt(
         f"model_n_layers={model_n_layers}",
         f"run_layers={','.join(str(x) for x in run_layers)}",
         f"individual_layers={args.individual_layers}",
+        f"ablate_subblocks={_format_subblocks(args.ablate_subblocks)}",
         "",
         "[Sampling]",
         f"random_seed={args.random_seed}",
@@ -670,7 +719,7 @@ def write_line_plot(
     ax.set_xlabel("Probability token position")
     ax.set_ylabel("Verbalised confidence")
     ax.set_ylim(0.0, 1.0)
-    ax.set_title("Tokenwise probability-span ablation")
+    ax.set_title("Subblock tokenwise probability-span ablation")
     ax.set_xticks(list(range(span_token_count)))
     ax.set_xticklabels(
         [f"{i}:{_render_token_label(tok)}" for i, tok in enumerate(token_labels)],
@@ -764,15 +813,18 @@ def write_layer_token_grid_plot(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Tokenwise probability mean replacement inference (TransformerLens)."
+        description=(
+            "Subblock tokenwise probability mean replacement inference "
+            "(TransformerLens attn-out / mlp-out)."
+        )
     )
     parser.add_argument("--model_name", type=str, default="google/gemma-3-12b-it")
     parser.add_argument("--input_h5", type=str, required=True, help="Path to *_verbalised_embeddings.h5 file.")
     parser.add_argument(
         "--new_h5_format",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="If set, read 'res' from the new {res,attn,mlp} H5 response format.",
+        default=True,
+        help="Required. Read attn/mlp from the {res,attn,mlp} H5 response format.",
     )
     parser.add_argument("--device", type=str, default=None, help="e.g. cuda, cuda:0, cpu")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
@@ -795,6 +847,17 @@ def main() -> None:
         type=str,
         default="12-15",
         help="Inclusive range '12-15' or comma list '12,13,14,15' (0-indexed).",
+    )
+    parser.add_argument(
+        "--ablate_subblocks",
+        type=str,
+        nargs="+",
+        required=True,
+        choices=["attn", "mlp"],
+        help=(
+            "Non-empty list of subblocks to ablate. If both attn and mlp are listed, "
+            "both are ablated simultaneously at each layer/token position."
+        ),
     )
     parser.add_argument("--low_conf_threshold", type=float, default=0.1)
     parser.add_argument("--high_conf_threshold", type=float, default=0.9)
@@ -848,10 +911,19 @@ def main() -> None:
         "--output_dir",
         type=str,
         default=None,
-        help="Optional run directory. If unset, auto-creates under tokenwise_probability_mean_ablation/results.",
+        help=f"Optional run directory. If unset, auto-creates under {MODULE_NAME}/results.",
     )
     args = parser.parse_args()
     configure_prefix_tokens_for_model(args.model_name)
+
+    if len(set(args.ablate_subblocks)) != len(args.ablate_subblocks):
+        raise ValueError(f"Duplicate subblocks are not allowed: {args.ablate_subblocks}")
+    if len(args.ablate_subblocks) < 1:
+        raise ValueError("--ablate_subblocks must contain at least one of ['attn', 'mlp'].")
+    if not args.new_h5_format:
+        raise ValueError(
+            "--new_h5_format is required for subblock interventions (attn/mlp fields)."
+        )
 
     logging.basicConfig(
         format="%(asctime)s %(levelname)-8s %(message)s",
@@ -864,8 +936,8 @@ def main() -> None:
     logging.info("Writing run log to %s", output_log_path)
     logging.info(
         "Run parameters: model_name=%s input_h5=%s dataset=%s dtype=%s num_samples=%s "
-        "ablate_layers=%s individual_layers=%s low_conf_threshold=%s high_conf_threshold=%s "
-        "mean_from_low_confidence=%s ablate_with_same_confidence=%s "
+        "ablate_layers=%s ablate_subblocks=%s individual_layers=%s low_conf_threshold=%s "
+        "high_conf_threshold=%s mean_from_low_confidence=%s ablate_with_same_confidence=%s "
         "expected_probability_tokens=%s extend_probability_span=%s "
         "expected_guess_tokens=%s new_h5_format=%s random_seed=%s output_dir=%s",
         args.model_name,
@@ -874,6 +946,7 @@ def main() -> None:
         args.dtype,
         args.num_samples,
         args.ablate_layers,
+        args.ablate_subblocks,
         args.individual_layers,
         args.low_conf_threshold,
         args.high_conf_threshold,
@@ -894,6 +967,9 @@ def main() -> None:
         args.expected_probability_tokens,
         extend_probability_span=args.extend_probability_span,
     )
+    # Blockwise mean helper truncates to expected_probability_tokens; pass the
+    # effective span budget so extend_probability_span keeps matching token rows.
+    mean_prob_token_budget = span_token_count
 
     train_ds, val_ds = load_eval_dataset(args.dataset, args.random_seed)
     random.seed(args.random_seed)
@@ -921,20 +997,17 @@ def main() -> None:
     logging.info("Loading examples: %s", args.input_h5)
     examples_h5 = load_examples_h5(Path(args.input_h5))
     logging.info("Examples loaded")
-    verbalised_embedding_means, low_ids, high_ids = compute_verbalised_embedding_group_means(
+    means_by_component, low_ids, high_ids = compute_pre_probability_group_means_by_component(
         examples_h5,
-        run_layers,
+        ablate_layers=run_layers,
         low_conf_threshold=args.low_conf_threshold,
         high_conf_threshold=args.high_conf_threshold,
-        expected_probability_tokens=args.expected_probability_tokens,
-        expected_guess_tokens=args.expected_guess_tokens,
         mean_from_low_confidence=args.mean_from_low_confidence,
-        new_h5_format=args.new_h5_format,
-        extend_probability_span=args.extend_probability_span,
+        expected_probability_tokens=mean_prob_token_budget,
+        expected_guess_tokens=args.expected_guess_tokens,
     )
-    logging.info("Verbalised embedding means computed")
+    logging.info("Subblock verbalised embedding means computed for %s", args.ablate_subblocks)
     if not args.parse_mode_verbalised_confidence:
-        # Keep confidence-group checks and IDs consistent with the base implementation.
         low_ids, high_ids = collect_confidence_group_ids(
             examples_h5,
             low_conf_threshold=args.low_conf_threshold,
@@ -958,21 +1031,28 @@ def main() -> None:
         raise ValueError("No mean source IDs found for the configured thresholds.")
     logging.info(
         "Confidence groups: mean_source=%s ablation_target=%s ablate_with_same_confidence=%s "
-        "(mean_source_count=%d ablation_target_count=%d)",
+        "(mean_source_count=%d ablation_target_count=%d) ablate_subblocks=%s",
         mean_source_group,
         ablation_target_group,
         args.ablate_with_same_confidence,
         len(mean_source_ids),
         len(ablation_target_ids),
+        args.ablate_subblocks,
     )
 
-    layer_to_verbalised_embedding_means: Dict[int, Dict[str, torch.Tensor]] = {}
-    for i, layer_idx in enumerate(run_layers):
-        layer_to_verbalised_embedding_means[layer_idx] = {
-            "probability": torch.tensor(
-                verbalised_embedding_means["probability"][i], device=device, dtype=torch_dtype
-            )
-        }
+    component_to_layer_to_verbalised_embedding_means: Dict[
+        str, Dict[int, Dict[str, torch.Tensor]]
+    ] = {}
+    for component in args.ablate_subblocks:
+        component_to_layer_to_verbalised_embedding_means[component] = {}
+        for i, layer_idx in enumerate(run_layers):
+            component_to_layer_to_verbalised_embedding_means[component][layer_idx] = {
+                "probability": torch.tensor(
+                    means_by_component[component]["probability"][i],
+                    device=device,
+                    dtype=torch_dtype,
+                )
+            }
 
     none_cache = build_none_cache(
         train_ds=train_ds,
@@ -998,7 +1078,7 @@ def main() -> None:
             val_ds=val_ds,
             model=model,
             fewshot_prefix=fewshot_prefix,
-            layer_to_verbalised_embedding_means_eval=layer_to_verbalised_embedding_means,
+            component_to_layer_to_verbalised_embedding_means_eval=component_to_layer_to_verbalised_embedding_means,
             none_cache=none_cache,
             ablation_target_ids=ablation_target_ids,
             ablation_target_group=ablation_target_group,
@@ -1043,6 +1123,7 @@ def main() -> None:
         summary = {
             "run_root": run_root,
             "dataset": args.dataset,
+            "ablate_subblocks": list(args.ablate_subblocks),
             "mean_from_low_confidence": args.mean_from_low_confidence,
             "ablate_with_same_confidence": args.ablate_with_same_confidence,
             "mean_source_group": mean_source_group,
@@ -1098,7 +1179,10 @@ def main() -> None:
 
     for layer_idx in run_layers:
         logging.info("Running individual layer tokenwise sweep for layer %d", layer_idx)
-        layer_map = {layer_idx: layer_to_verbalised_embedding_means[layer_idx]}
+        layer_map = {
+            component: {layer_idx: component_to_layer_to_verbalised_embedding_means[component][layer_idx]}
+            for component in args.ablate_subblocks
+        }
         (
             mini_results,
             token_position_means,
@@ -1110,7 +1194,7 @@ def main() -> None:
             val_ds=val_ds,
             model=model,
             fewshot_prefix=fewshot_prefix,
-            layer_to_verbalised_embedding_means_eval=layer_map,
+            component_to_layer_to_verbalised_embedding_means_eval=layer_map,
             none_cache=none_cache,
             ablation_target_ids=ablation_target_ids,
             ablation_target_group=ablation_target_group,
@@ -1193,6 +1277,7 @@ def main() -> None:
         "dataset": args.dataset,
         "individual_layers": True,
         "run_layers": list(run_layers),
+        "ablate_subblocks": list(args.ablate_subblocks),
         "mean_from_low_confidence": args.mean_from_low_confidence,
         "ablate_with_same_confidence": args.ablate_with_same_confidence,
         "mean_source_group": mean_source_group,

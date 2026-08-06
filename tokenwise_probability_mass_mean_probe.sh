@@ -32,7 +32,6 @@ python3 ./tokenwise_probability_mass_mean_probe/run_tokenwise_probability_mass_m
   --extend_probability_span \
   --low_conf_threshold 0.1 \
   --high_conf_threshold 0.9 \
-  --no-mean_from_low_confidence
 
 # Low-confidence cohort (uncomment to steer low-conf examples toward higher confidence):
 # python3 ./tokenwise_probability_mass_mean_probe/run_tokenwise_probability_mass_mean_probe.py \

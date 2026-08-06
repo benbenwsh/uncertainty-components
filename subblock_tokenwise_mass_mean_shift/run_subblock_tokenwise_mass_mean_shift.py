@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
-"""Tokenwise probability-span mean ablation runner.
+"""Subblock tokenwise probability-span mass-mean direction steering runner.
 
-This script mirrors the layerwise mean-ablation setup but removes ablation modes and
-always performs:
-1) baseline no-replacement generation, and
-2) seven independent single-token probability-span replacements (positions 0..6).
+Mirrors tokenwise residual-stream mass-mean probing, but intervenes at attn-out
+and/or mlp-out instead of hook_resid_post. Applies additive direction steering
+(high_mean - low_mean) at one probability token at a time, using a single alpha.
 
-Outputs are intentionally compact:
-    - ablation_results_mini.json
-    - config.txt
-    - summary.json
-    - output.log
-    - plot PNG(s)
+When --ablate_subblocks includes both attn and mlp, both subblocks are steered
+simultaneously in the same forward pass. Otherwise only the listed subblock is used.
 """
 
 from __future__ import annotations
@@ -36,15 +31,12 @@ REPO_ROOT = SCRIPT_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from blockwise_zero_ablation.run_blockwise_zero_ablation import SUBBLOCK_TO_HOOK
 from layerwise_mean_ablation.run_mean_ablation import (
     BRIEF_PROMPTS,
-    CONFIDENCE_PROMPT,
-    _build_resid_post_mean_replace_hooks,
     _completion_token_index_to_abs_pos,
     _greedy_extend_with_fwd_hooks,
     collect_confidence_group_ids,
-    compute_verbalised_embedding_group_means,
-    configure_prefix_tokens_for_model,
     construct_fewshot_prompt_from_indices,
     encode_example_id,
     greedy_generate,
@@ -52,17 +44,40 @@ from layerwise_mean_ablation.run_mean_ablation import (
     load_hooked_transformer,
     load_eval_dataset,
     parse_ablate_layers,
-    parse_guess_and_probability_indices,
-    parse_mode_confidence_from_response,
     split_answerable_indices,
+)
+from mass_mean_probe.run_mass_mean_probe import (
+    CONFIDENCE_PROMPT_LINGUISTIC,
+    CONFIDENCE_PROMPT_NUMERIC,
+    _expected_probability_span_token_budget,
+    _format_alpha,
+    _is_expected_or_plus_two,
+    configure_prefix_tokens_for_model,
+    parse_guess_and_marker_indices,
+    parse_mode_confidence_from_response,
+)
+from subblock_mass_mean_probe.run_subblock_mass_mean_probe import (
+    compute_low_high_span_means_and_directions_by_component,
+    normalize_component_direction_spans_to_unit_norm_budget,
 )
 
 
 TRAIN_RATIO = 0.9
+MODULE_NAME = "subblock_tokenwise_mass_mean_shift"
 
 
-def _token_mode_key(token_position: int) -> str:
-    return f"probability_token_{token_position}_mean_replace"
+def _format_subblocks(subblocks: Sequence[str]) -> str:
+    return "+".join(subblocks)
+
+
+def _derive_steering_params(mean_from_low_confidence: bool) -> Tuple[str, float]:
+    if mean_from_low_confidence:
+        return "high", -1.0
+    return "low", 1.0
+
+
+def _token_mode_key(token_position: int, target: str, alpha: float) -> str:
+    return f"probability_token_{token_position}__target_{target}__alpha_{_format_alpha(alpha)}"
 
 
 def _resolve_run_root(cli_output_dir: Optional[str], *, individual_layers: bool) -> str:
@@ -71,9 +86,9 @@ def _resolve_run_root(cli_output_dir: Optional[str], *, individual_layers: bool)
         return cli_output_dir
 
     if individual_layers:
-        base_dir = os.path.join("tokenwise_probability_mean_ablation", "results", "individual_layers")
+        base_dir = os.path.join(MODULE_NAME, "results", "individual_layers")
     else:
-        base_dir = os.path.join("tokenwise_probability_mean_ablation", "results")
+        base_dir = os.path.join(MODULE_NAME, "results")
     os.makedirs(base_dir, exist_ok=True)
 
     existing = [
@@ -122,51 +137,35 @@ def _render_token_label(token: str) -> str:
     return escaped if escaped else "<empty>"
 
 
-def _probability_span_token_budget(
-    expected_probability_tokens: int,
-    *,
-    extend_probability_span: bool,
-) -> int:
-    return expected_probability_tokens + (2 if extend_probability_span else 0)
-
-
-def _probability_span_bounds(
-    decoded_tokens: Sequence[str],
-    *,
-    extend_probability_span: bool,
-) -> Optional[Tuple[int, int]]:
-    """Return (first_prob, span_end) inclusive, or None if parse/extend fails."""
-    parsed = parse_guess_and_probability_indices(list(decoded_tokens))
-    if parsed is None:
-        return None
-    _, first_prob, end_prob = parsed
-    span_end = end_prob + (2 if extend_probability_span else 0)
-    if extend_probability_span and end_prob + 2 >= len(decoded_tokens):
-        return None
-    if span_end >= len(decoded_tokens):
-        return None
-    return first_prob, span_end
-
-
 def _extract_probability_tokens(
     decoded_tokens: Sequence[str],
     *,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int,
+    linguistic_confidence_prompt: bool = False,
     extend_probability_span: bool = False,
 ) -> Optional[List[str]]:
-    bounds = _probability_span_bounds(
-        decoded_tokens, extend_probability_span=extend_probability_span
+    parsed = parse_guess_and_marker_indices(
+        list(decoded_tokens),
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
     )
-    if bounds is None:
+    if parsed is None:
         return None
-    first_prob, span_end = bounds
+    _, first_prob, end_prob = parsed
+    apply_extend = extend_probability_span and not linguistic_confidence_prompt
+    if apply_extend and end_prob + 2 >= len(decoded_tokens):
+        return None
+    span_end = end_prob + (2 if apply_extend else 0)
     span = list(decoded_tokens[first_prob : span_end + 1])
-    span_budget = _probability_span_token_budget(
-        expected_probability_tokens, extend_probability_span=extend_probability_span
+    span_budget = _expected_probability_span_token_budget(
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
+        expected_probability_tokens=expected_probability_tokens,
+        expected_confidence_tokens=expected_confidence_tokens,
+        extend_probability_span=extend_probability_span,
     )
-    if len(span) != span_budget:
+    if not _is_expected_or_plus_two(len(span), span_budget):
         return None
-    return span
+    return span[:span_budget]
 
 
 def _absolute_prob_single_position(
@@ -175,18 +174,31 @@ def _absolute_prob_single_position(
     *,
     token_position: int,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int,
+    linguistic_confidence_prompt: bool = False,
     extend_probability_span: bool = False,
 ) -> List[int]:
-    bounds = _probability_span_bounds(
-        decoded_tokens, extend_probability_span=extend_probability_span
+    parsed = parse_guess_and_marker_indices(
+        decoded_tokens,
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
     )
-    if bounds is None:
+    if parsed is None:
         return []
-    first_prob, span_end = bounds
-    span_budget = _probability_span_token_budget(
-        expected_probability_tokens, extend_probability_span=extend_probability_span
+    _, first_prob, end_prob = parsed
+    apply_extend = extend_probability_span and not linguistic_confidence_prompt
+    if apply_extend and end_prob + 2 >= len(decoded_tokens):
+        return []
+    span_end = end_prob + (2 if apply_extend else 0)
+    span_budget = _expected_probability_span_token_budget(
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
+        expected_probability_tokens=expected_probability_tokens,
+        expected_confidence_tokens=expected_confidence_tokens,
+        extend_probability_span=extend_probability_span,
     )
-    if (span_end - first_prob + 1) != span_budget:
+    span_len = span_end - first_prob + 1
+    if not _is_expected_or_plus_two(span_len, span_budget):
+        return []
+    if token_position < 0 or token_position >= span_budget:
         return []
     target_rel_pos = first_prob + token_position
     seq_len = prompt_len + len(decoded_tokens)
@@ -196,86 +208,83 @@ def _absolute_prob_single_position(
     return []
 
 
-def build_single_token_probability_hooks(
-    layer_to_mean_vectors: Dict[int, torch.Tensor],
+def build_single_token_subblock_direction_hooks(
+    component_to_layer_to_prob_delta: Dict[str, Dict[int, torch.Tensor]],
     *,
     prompt_len: int,
-    seq_len_provider: Callable[[], int],
     decoded_tokens_provider: Callable[[], List[str]],
     token_position: int,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int,
+    linguistic_confidence_prompt: bool = False,
     extend_probability_span: bool = False,
-    log_context: str = "",
 ) -> List[Tuple[str, Callable]]:
-    _last_logged_key: Dict[str, object | None] = {"value": None}
+    """Build additive direction hooks for one or more subblocks at one token.
 
-    def _abs_positions() -> List[int]:
-        decoded_tokens = decoded_tokens_provider()
-        positions = _absolute_prob_single_position(
-            prompt_len,
-            decoded_tokens,
-            token_position=token_position,
-            expected_probability_tokens=expected_probability_tokens,
-            extend_probability_span=extend_probability_span,
-        )
-        if positions:
-            seq_len = seq_len_provider()
-            log_key = (seq_len, tuple(positions))
-            if _last_logged_key["value"] != log_key:
-                _last_logged_key["value"] = log_key
-                prefix = f"{log_context} " if log_context else ""
-                rendered_tokens = [_render_token_label(token) for token in decoded_tokens]
-                logging.info(
-                    "%sAblation forward pass (parse ok): ablation_positions=%s prompt_len=%d seq_len=%d decoded_tokens=%s",
-                    prefix,
-                    positions,
-                    prompt_len,
-                    seq_len,
-                    rendered_tokens,
-                )
-        return positions
+    When multiple subblocks are present, all hooks are registered together so
+    attn and mlp are steered simultaneously in the same forward pass.
+    """
+    hooks: List[Tuple[str, Callable]] = []
 
-    return _build_resid_post_mean_replace_hooks(
-        layer_to_mean_vectors,
-        seq_len_provider=seq_len_provider,
-        abs_positions_provider=_abs_positions,
-        strict_num_prob_positions=True,
-    )
+    for subblock, layer_to_prob_delta in component_to_layer_to_prob_delta.items():
+        hook_suffix = SUBBLOCK_TO_HOOK[subblock]
+        for layer_idx, delta in layer_to_prob_delta.items():
+
+            def _make_hook(layer_idx: int = layer_idx, delta: torch.Tensor = delta):
+                def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
+                    del hook
+                    abs_positions = _absolute_prob_single_position(
+                        prompt_len,
+                        decoded_tokens_provider(),
+                        token_position=token_position,
+                        expected_probability_tokens=expected_probability_tokens,
+                        expected_confidence_tokens=expected_confidence_tokens,
+                        linguistic_confidence_prompt=linguistic_confidence_prompt,
+                        extend_probability_span=extend_probability_span,
+                    )
+                    if not abs_positions:
+                        return activation
+                    abs_pos = abs_positions[0]
+                    if 0 <= abs_pos < activation.shape[1]:
+                        activation[:, abs_pos, :] = (
+                            activation[:, abs_pos, :] + delta.to(activation.dtype)
+                        )
+                    return activation
+
+                return hook_fn
+
+            hooks.append((f"blocks.{layer_idx}.{hook_suffix}", _make_hook()))
+    return hooks
 
 
-def greedy_generate_probability_single_token_mean_replaced(
+def greedy_generate_probability_single_token_direction_perturbed(
     model,
     *,
     local_prompt: str,
     max_new_tokens: int,
-    layer_to_mean_vectors: Dict[int, torch.Tensor],
+    component_to_layer_to_prob_delta: Dict[str, Dict[int, torch.Tensor]],
     token_position: int,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int,
+    linguistic_confidence_prompt: bool = False,
     extend_probability_span: bool = False,
-    log_context: str = "",
 ) -> Tuple[str, List[str]]:
     tokens = model.to_tokens(local_prompt)
     prompt_len = int(tokens.shape[1])
     decoded_tokens: List[str] = []
 
-    def _seq_len() -> int:
-        # `_greedy_extend_with_fwd_hooks()` grows its own local `tokens`, so use
-        # prompt length plus the shared decoded-token buffer to reflect the
-        # current autoregressive sequence length seen by this hook callback.
-        return prompt_len + len(decoded_tokens)
-
     def _decoded_tokens() -> List[str]:
         return decoded_tokens
 
-    hooks = build_single_token_probability_hooks(
-        layer_to_mean_vectors,
+    hooks = build_single_token_subblock_direction_hooks(
+        component_to_layer_to_prob_delta,
         prompt_len=prompt_len,
-        seq_len_provider=_seq_len,
         decoded_tokens_provider=_decoded_tokens,
         token_position=token_position,
         expected_probability_tokens=expected_probability_tokens,
+        expected_confidence_tokens=expected_confidence_tokens,
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
         extend_probability_span=extend_probability_span,
-        log_context=log_context,
     )
     return _greedy_extend_with_fwd_hooks(
         model,
@@ -312,8 +321,10 @@ def build_none_cache(
     ablation_target_ids: Sequence[str],
     num_samples: int,
     fewshot_prefix: str,
+    confidence_prompt: str,
     max_new_tokens: int,
     parse_mode_verbalised_confidence: bool,
+    linguistic_confidence_prompt: bool,
 ) -> Dict[str, Dict[str, Dict[str, object]]]:
     none_cache: Dict[str, Dict[str, Dict[str, object]]] = {"train": {}, "validation": {}}
     for split_name, eval_ds in [("train", train_ds), ("validation", val_ds)]:
@@ -326,7 +337,7 @@ def build_none_cache(
                 continue
             example = eval_ds[int(ds_idx)]
             question = example["question"]
-            local_prompt = fewshot_prefix + CONFIDENCE_PROMPT + question
+            local_prompt = fewshot_prefix + confidence_prompt + question
             response, decoded_tokens = greedy_generate(
                 model=model,
                 local_prompt=local_prompt,
@@ -334,7 +345,9 @@ def build_none_cache(
                 fwd_hooks=None,
             )
             mode_confidence = (
-                parse_mode_confidence_from_response(response)
+                parse_mode_confidence_from_response(
+                    response, linguistic_prompt=linguistic_confidence_prompt
+                )
                 if parse_mode_verbalised_confidence
                 else None
             )
@@ -366,17 +379,21 @@ def run_tokenwise_evaluation(
     val_ds,
     model,
     fewshot_prefix: str,
-    layer_to_verbalised_embedding_means_eval: Dict[int, Dict[str, torch.Tensor]],
+    confidence_prompt: str,
+    component_to_layer_to_probability_direction: Dict[str, Dict[int, torch.Tensor]],
     none_cache: Dict[str, Dict[str, Dict[str, object]]],
     ablation_target_ids: Sequence[str],
-    ablation_target_group: str,
-    ablate_with_same_confidence: bool,
     num_samples: int,
     max_new_tokens: int,
     parse_mode_verbalised_confidence: bool,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int,
+    linguistic_confidence_prompt: bool,
     extend_probability_span: bool,
-    mean_from_low_confidence: bool,
+    span_token_count: int,
+    steering_target: str,
+    steering_sign: float,
+    alpha: float,
 ) -> Tuple[
     Dict[str, dict],
     Dict[int, Optional[float]],
@@ -384,9 +401,6 @@ def run_tokenwise_evaluation(
     Dict[int, int],
     Dict[int, Counter[str]],
 ]:
-    span_token_count = _probability_span_token_budget(
-        expected_probability_tokens, extend_probability_span=extend_probability_span
-    )
     mini_results = {"train": {}, "validation": {}}
     token_position_values: Dict[int, List[float]] = {
         i: [] for i in range(span_token_count)
@@ -402,7 +416,7 @@ def run_tokenwise_evaluation(
             eval_ds, ablation_target_ids, split_name, num_samples
         )
         logging.info(
-            "Evaluating %d examples on %s split for tokenwise ablation.",
+            "Evaluating %d examples on %s split for subblock tokenwise direction steering.",
             len(selected_ids),
             split_name,
         )
@@ -412,12 +426,8 @@ def run_tokenwise_evaluation(
                 raise ValueError(f"Example id {ex_id} missing from {split_name} split.")
             example = eval_ds[int(ds_idx)]
             question = example["question"]
-            local_prompt = fewshot_prefix + CONFIDENCE_PROMPT + question
-            mini_entry = {
-                "question": question,
-                "confidence_group": ablation_target_group,
-                "ablate_with_same_confidence": ablate_with_same_confidence,
-            }
+            local_prompt = fewshot_prefix + confidence_prompt + question
+            mini_entry = {"question": question}
 
             cached = none_cache[split_name].get(ex_id)
             if cached is None:
@@ -438,11 +448,13 @@ def run_tokenwise_evaluation(
             prob_tokens = _extract_probability_tokens(
                 baseline_decoded_tokens,
                 expected_probability_tokens=expected_probability_tokens,
+                expected_confidence_tokens=expected_confidence_tokens,
+                linguistic_confidence_prompt=linguistic_confidence_prompt,
                 extend_probability_span=extend_probability_span,
             )
             if prob_tokens is None:
                 logging.warning(
-                    "Skipping example %s/%s: could not form probability span "
+                    "Skipping example %s/%s: could not form probability/confidence span "
                     "(extend_probability_span=%s, expected_base=%d, decoded_len=%d). response=%r",
                     split_name,
                     ex_id,
@@ -456,27 +468,35 @@ def run_tokenwise_evaluation(
                 token_label_counters[pos][token] += 1
 
             for token_position in range(span_token_count):
-                key = _token_mode_key(token_position)
-                layer_to_mean_vectors_eval = {
-                    layer_idx: layer_to_verbalised_embedding_means_eval[layer_idx]["probability"][
-                        token_position : token_position + 1, :
-                    ]
-                    for layer_idx in layer_to_verbalised_embedding_means_eval
+                key = _token_mode_key(token_position, steering_target, alpha)
+                component_to_layer_to_prob_delta = {
+                    component: {
+                        layer_idx: steering_sign
+                        * alpha
+                        * component_to_layer_to_probability_direction[component][layer_idx][
+                            token_position, :
+                        ]
+                        for layer_idx in component_to_layer_to_probability_direction[component]
+                    }
+                    for component in component_to_layer_to_probability_direction
                 }
                 response, _decoded_tokens = (
-                    greedy_generate_probability_single_token_mean_replaced(
+                    greedy_generate_probability_single_token_direction_perturbed(
                         model=model,
                         local_prompt=local_prompt,
                         max_new_tokens=max_new_tokens,
-                        layer_to_mean_vectors=layer_to_mean_vectors_eval,
+                        component_to_layer_to_prob_delta=component_to_layer_to_prob_delta,
                         token_position=token_position,
                         expected_probability_tokens=expected_probability_tokens,
+                        expected_confidence_tokens=expected_confidence_tokens,
+                        linguistic_confidence_prompt=linguistic_confidence_prompt,
                         extend_probability_span=extend_probability_span,
-                        log_context=f"{split_name} {ex_id} {_token_mode_key(token_position)}",
                     )
                 )
                 confidence = (
-                    parse_mode_confidence_from_response(response)
+                    parse_mode_confidence_from_response(
+                        response, linguistic_prompt=linguistic_confidence_prompt
+                    )
                     if parse_mode_verbalised_confidence
                     else None
                 )
@@ -492,10 +512,10 @@ def run_tokenwise_evaluation(
                 if parse_mode_verbalised_confidence:
                     if confidence is None or baseline_confidence is None:
                         meets_baseline_direction = None
-                    elif mean_from_low_confidence:
-                        meets_baseline_direction = confidence < baseline_confidence
-                    else:
+                    elif steering_target == "low":
                         meets_baseline_direction = confidence > baseline_confidence
+                    else:
+                        meets_baseline_direction = confidence < baseline_confidence
                     item["meets_none_confidence_direction"] = meets_baseline_direction
                     if confidence is not None:
                         token_position_values[token_position].append(float(confidence))
@@ -544,11 +564,14 @@ def write_config_txt(
     token_position_means: Dict[int, Optional[float]],
     token_position_counts: Dict[int, int],
     responses_identical_true: Dict[int, int],
+    steering_target: str,
+    steering_sign: float,
+    direction_probability_shape: Dict[str, Tuple[int, ...]],
     finished_at: str,
 ) -> None:
     lines = [
-        "Tokenwise Probability Mean Ablation Config",
-        "=========================================",
+        "Subblock Tokenwise Probability Mass Mean Shift Config",
+        "========================================================",
         "",
         "[Run]",
         f"finished_at={finished_at}",
@@ -561,6 +584,7 @@ def write_config_txt(
         f"model_n_layers={model_n_layers}",
         f"run_layers={','.join(str(x) for x in run_layers)}",
         f"individual_layers={args.individual_layers}",
+        f"ablate_subblocks={_format_subblocks(args.ablate_subblocks)}",
         "",
         "[Sampling]",
         f"random_seed={args.random_seed}",
@@ -575,30 +599,30 @@ def write_config_txt(
         f"brief_always={args.brief_always}",
         f"enable_brief={args.enable_brief}",
         f"use_context={args.use_context}",
+        f"linguistic_confidence_prompt={args.linguistic_confidence_prompt}",
         "",
         "[Confidence groups]",
         f"low_conf_threshold={args.low_conf_threshold}",
         f"high_conf_threshold={args.high_conf_threshold}",
         f"mean_from_low_confidence={args.mean_from_low_confidence}",
-        f"ablate_with_same_confidence={args.ablate_with_same_confidence}",
-        f"mean_source_group={'low_confidence' if args.mean_from_low_confidence else 'high_confidence'}",
-        (
-            f"ablation_target_group="
-            f"{'low_confidence' if args.mean_from_low_confidence else 'high_confidence'}"
-            if args.ablate_with_same_confidence
-            else (
-                f"ablation_target_group="
-                f"{'high_confidence' if args.mean_from_low_confidence else 'low_confidence'}"
-            )
-        ),
+        f"steering_target={steering_target}",
+        f"steering_sign={steering_sign}",
+        f"ablation_target_group={'high_confidence' if args.mean_from_low_confidence else 'low_confidence'}",
         f"low_conf_count={low_conf_count}",
         f"high_conf_count={high_conf_count}",
         f"h5_example_count={h5_example_count}",
         "",
+        "[Direction steering]",
+        f"alpha={args.alpha}",
+        f"normalize_span_directions={args.normalize_span_directions}",
+        f"direction_probability_shape={direction_probability_shape}",
+        "",
         "[Tokenwise settings]",
         f"expected_probability_tokens={args.expected_probability_tokens}",
+        f"expected_confidence_tokens={args.expected_confidence_tokens}",
         f"extend_probability_span={args.extend_probability_span}",
-        f"span_token_count={_probability_span_token_budget(args.expected_probability_tokens, extend_probability_span=args.extend_probability_span)}",
+        f"span_token_count={_expected_probability_span_token_budget(linguistic_confidence_prompt=args.linguistic_confidence_prompt, expected_probability_tokens=args.expected_probability_tokens, expected_confidence_tokens=args.expected_confidence_tokens, extend_probability_span=args.extend_probability_span)}",
+        f"expected_guess_tokens={args.expected_guess_tokens}",
         f"parse_mode_verbalised_confidence={args.parse_mode_verbalised_confidence}",
         "",
         "[Baseline]",
@@ -608,8 +632,10 @@ def write_config_txt(
         "[Per-position means]",
     ]
 
-    span_token_count = _probability_span_token_budget(
-        args.expected_probability_tokens,
+    span_token_count = _expected_probability_span_token_budget(
+        linguistic_confidence_prompt=args.linguistic_confidence_prompt,
+        expected_probability_tokens=args.expected_probability_tokens,
+        expected_confidence_tokens=args.expected_confidence_tokens,
         extend_probability_span=args.extend_probability_span,
     )
     for pos in range(span_token_count):
@@ -647,6 +673,9 @@ def write_line_plot(
     baseline_mean: Optional[float],
     span_token_count: int,
     token_labels: Sequence[str],
+    steering_target: str,
+    alpha: float,
+    linguistic_confidence_prompt: bool = False,
 ) -> None:
     xs: List[int] = []
     ys: List[float] = []
@@ -656,9 +685,10 @@ def write_line_plot(
             xs.append(pos)
             ys.append(float(y_val))
 
+    label = f"direction_steering_target_{steering_target}_alpha_{_format_alpha(alpha)}"
     fig, ax = plt.subplots(figsize=(10, 5))
     if ys:
-        ax.plot(xs, ys, marker="o", label="single_token_mean_replace")
+        ax.plot(xs, ys, marker="o", label=label)
     if baseline_mean is not None:
         ax.axhline(
             y=float(baseline_mean),
@@ -667,10 +697,11 @@ def write_line_plot(
             label="no_replacement (baseline)",
         )
     ax.set_xlim(-0.3, max(span_token_count - 1, 0) + 0.3)
-    ax.set_xlabel("Probability token position")
+    xlabel = "Confidence token position" if linguistic_confidence_prompt else "Probability token position"
+    ax.set_xlabel(xlabel)
     ax.set_ylabel("Verbalised confidence")
     ax.set_ylim(0.0, 1.0)
-    ax.set_title("Tokenwise probability-span ablation")
+    ax.set_title("Subblock tokenwise probability-span direction steering")
     ax.set_xticks(list(range(span_token_count)))
     ax.set_xticklabels(
         [f"{i}:{_render_token_label(tok)}" for i, tok in enumerate(token_labels)],
@@ -708,9 +739,10 @@ def write_layer_token_grid_plot(
     path: str,
     run_layers: Sequence[int],
     token_labels: Sequence[str],
-    matrix_values: np.ndarray,  # [n_layers, n_tokens], may include nan
-    matrix_deviation_desired: np.ndarray,  # [n_layers, n_tokens], >=0 in desired direction only
+    matrix_values: np.ndarray,
+    matrix_deviation_desired: np.ndarray,
     mean_from_low_confidence: bool,
+    linguistic_confidence_prompt: bool = False,
 ) -> None:
     n_rows, n_cols = matrix_values.shape
     max_dev = (
@@ -719,16 +751,16 @@ def write_layer_token_grid_plot(
         else 0.0
     )
     if max_dev > 0:
-        alpha = np.clip(matrix_deviation_desired / max_dev, 0.0, 1.0)
+        alpha_grid = np.clip(matrix_deviation_desired / max_dev, 0.0, 1.0)
     else:
-        alpha = np.zeros_like(matrix_deviation_desired)
-    alpha = np.nan_to_num(alpha, nan=0.0)
+        alpha_grid = np.zeros_like(matrix_deviation_desired)
+    alpha_grid = np.nan_to_num(alpha_grid, nan=0.0)
 
     rgba = np.zeros((n_rows, n_cols, 4), dtype=np.float32)
     rgba[:, :, 0] = 0.1
     rgba[:, :, 1] = 0.3
     rgba[:, :, 2] = 1.0
-    rgba[:, :, 3] = alpha
+    rgba[:, :, 3] = alpha_grid
 
     fig, ax = plt.subplots(figsize=(max(9.0, 1.4 * n_cols), max(6.0, 0.35 * n_rows)))
     ax.imshow(rgba, aspect="auto", interpolation="nearest")
@@ -749,9 +781,13 @@ def write_layer_token_grid_plot(
     )
     ax.xaxis.tick_top()
     ax.xaxis.set_label_position("top")
-    ax.set_xlabel("Probability token position")
+    xlabel = "Confidence token position" if linguistic_confidence_prompt else "Probability token position"
+    ax.set_xlabel(xlabel)
     ax.set_ylabel("Layer")
-    ax.set_title("Layer x token confidence (blue alpha = |deviation from baseline|)")
+    direction = "below" if mean_from_low_confidence else "above"
+    ax.set_title(
+        f"Layer x token confidence (blue alpha = deviation {direction} baseline; opposite = 0)"
+    )
 
     ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
     ax.set_yticks(np.arange(-0.5, n_rows, 1), minor=True)
@@ -764,18 +800,21 @@ def write_layer_token_grid_plot(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Tokenwise probability mean replacement inference (TransformerLens)."
+        description=(
+            "Subblock tokenwise probability direction steering inference "
+            "(TransformerLens attn-out / mlp-out)."
+        )
     )
     parser.add_argument("--model_name", type=str, default="google/gemma-3-12b-it")
     parser.add_argument("--input_h5", type=str, required=True, help="Path to *_verbalised_embeddings.h5 file.")
     parser.add_argument(
         "--new_h5_format",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="If set, read 'res' from the new {res,attn,mlp} H5 response format.",
+        default=True,
+        help="Required. Read attn/mlp from the {res,attn,mlp} H5 response format.",
     )
     parser.add_argument("--device", type=str, default=None, help="e.g. cuda, cuda:0, cpu")
-    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    parser.add_argument("--dtype", type=str, default="float32", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--random_seed", type=int, default=10)
     parser.add_argument(
         "--dataset",
@@ -796,6 +835,17 @@ def main() -> None:
         default="12-15",
         help="Inclusive range '12-15' or comma list '12,13,14,15' (0-indexed).",
     )
+    parser.add_argument(
+        "--ablate_subblocks",
+        type=str,
+        nargs="+",
+        required=True,
+        choices=["attn", "mlp"],
+        help=(
+            "Non-empty list of subblocks to steer. If both attn and mlp are listed, "
+            "both are steered simultaneously at each layer/token position."
+        ),
+    )
     parser.add_argument("--low_conf_threshold", type=float, default=0.1)
     parser.add_argument("--high_conf_threshold", type=float, default=0.9)
     parser.add_argument(
@@ -803,29 +853,35 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "If true (default), compute means from low-confidence examples and ablate high-confidence examples. "
-            "If false, reverse source and target groups. "
-            "When --ablate_with_same_confidence is set, targets match the mean-source group instead."
+            "If true (default), steer high-confidence examples (target=high, sign=-1). "
+            "If false, steer low-confidence examples (target=low, sign=+1)."
         ),
     )
+    parser.add_argument("--alpha", type=float, default=1.0, help="Direction steering strength.")
     parser.add_argument(
-        "--ablate_with_same_confidence",
+        "--normalize_span_directions",
         action=argparse.BooleanOptionalAction,
         default=False,
+        help="Normalize guess and probability direction spans to a fixed L2 budget before alpha.",
+    )
+    parser.add_argument("--expected_probability_tokens", type=int, default=7)
+    parser.add_argument(
+        "--expected_confidence_tokens",
+        type=int,
+        default=5,
         help=(
-            "If true, ablate examples from the same confidence group used for the mean "
-            "(within-group control). If false (default), ablate the opposite group."
+            "When --linguistic_confidence_prompt, expected number of completion tokens in the Confidence: "
+            "span for position parsing checks and truncation (instead of --expected_probability_tokens)."
         ),
     )
-    parser.add_argument("--expected_probability_tokens", type=int, default=5)
-    parser.add_argument("--expected_guess_tokens", type=int, default=2)
+    parser.add_argument("--expected_guess_tokens", type=int, default=5)
     parser.add_argument(
         "--extend_probability_span",
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "If true, treat probability span length as expected_probability_tokens + 2 "
-            "(matching process_generations --extend_probability_span H5 builds). "
+            "If true (and not using linguistic confidence), treat probability span length as "
+            "expected_probability_tokens + 2 (matching process_generations --extend_probability_span). "
             "Eval examples lacking two tokens past the first probability-value token are skipped."
         ),
     )
@@ -834,6 +890,15 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Parse verbalised confidence from each generated response.",
+    )
+    parser.add_argument(
+        "--linguistic_confidence_prompt",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If true, use the natural-language Confidence: prompt and map phrases to numeric confidence; "
+            "if false (default), use the numeric Probability: prompt and float parsing."
+        ),
     )
     parser.add_argument(
         "--individual_layers",
@@ -848,10 +913,19 @@ def main() -> None:
         "--output_dir",
         type=str,
         default=None,
-        help="Optional run directory. If unset, auto-creates under tokenwise_probability_mean_ablation/results.",
+        help=f"Optional run directory. If unset, auto-creates under {MODULE_NAME}/results.",
     )
     args = parser.parse_args()
     configure_prefix_tokens_for_model(args.model_name)
+
+    if len(set(args.ablate_subblocks)) != len(args.ablate_subblocks):
+        raise ValueError(f"Duplicate subblocks are not allowed: {args.ablate_subblocks}")
+    if len(args.ablate_subblocks) < 1:
+        raise ValueError("--ablate_subblocks must contain at least one of ['attn', 'mlp'].")
+    if not args.new_h5_format:
+        raise ValueError(
+            "--new_h5_format is required for subblock interventions (attn/mlp fields)."
+        )
 
     logging.basicConfig(
         format="%(asctime)s %(levelname)-8s %(message)s",
@@ -862,38 +936,12 @@ def main() -> None:
     output_log_path = _attach_output_log(run_root)
     logging.info("Saving outputs to %s", run_root)
     logging.info("Writing run log to %s", output_log_path)
-    logging.info(
-        "Run parameters: model_name=%s input_h5=%s dataset=%s dtype=%s num_samples=%s "
-        "ablate_layers=%s individual_layers=%s low_conf_threshold=%s high_conf_threshold=%s "
-        "mean_from_low_confidence=%s ablate_with_same_confidence=%s "
-        "expected_probability_tokens=%s extend_probability_span=%s "
-        "expected_guess_tokens=%s new_h5_format=%s random_seed=%s output_dir=%s",
-        args.model_name,
-        args.input_h5,
-        args.dataset,
-        args.dtype,
-        args.num_samples,
-        args.ablate_layers,
-        args.individual_layers,
-        args.low_conf_threshold,
-        args.high_conf_threshold,
-        args.mean_from_low_confidence,
-        args.ablate_with_same_confidence,
-        args.expected_probability_tokens,
-        args.extend_probability_span,
-        args.expected_guess_tokens,
-        args.new_h5_format,
-        args.random_seed,
-        args.output_dir,
-    )
 
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     torch_dtype = dtype_map[args.dtype]
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    span_token_count = _probability_span_token_budget(
-        args.expected_probability_tokens,
-        extend_probability_span=args.extend_probability_span,
-    )
+
+    steering_target, steering_sign = _derive_steering_params(args.mean_from_low_confidence)
 
     train_ds, val_ds = load_eval_dataset(args.dataset, args.random_seed)
     random.seed(args.random_seed)
@@ -912,67 +960,98 @@ def main() -> None:
         use_context=args.use_context,
     )
 
+    confidence_prompt = (
+        CONFIDENCE_PROMPT_LINGUISTIC if args.linguistic_confidence_prompt else CONFIDENCE_PROMPT_NUMERIC
+    )
+    span_token_count = _expected_probability_span_token_budget(
+        linguistic_confidence_prompt=args.linguistic_confidence_prompt,
+        expected_probability_tokens=args.expected_probability_tokens,
+        expected_confidence_tokens=args.expected_confidence_tokens,
+        extend_probability_span=args.extend_probability_span,
+    )
+    # Direction helper truncates to expected_probability_tokens; pass the effective
+    # numeric span budget when extend_probability_span is enabled (linguistic mode
+    # keeps the H5 probability-row count at expected_probability_tokens).
+    direction_prob_token_budget = (
+        args.expected_probability_tokens
+        if args.linguistic_confidence_prompt
+        else span_token_count
+    )
+
     logging.info("Loading HookedTransformer: %s", args.model_name)
     model = load_hooked_transformer(args.model_name, device=device, torch_dtype=torch_dtype)
-    logging.info("Model loaded")
     ablate_layers = parse_ablate_layers(args.ablate_layers, model.cfg.n_layers)
     run_layers = list(range(model.cfg.n_layers)) if args.individual_layers else ablate_layers
 
-    logging.info("Loading examples: %s", args.input_h5)
     examples_h5 = load_examples_h5(Path(args.input_h5))
-    logging.info("Examples loaded")
-    verbalised_embedding_means, low_ids, high_ids = compute_verbalised_embedding_group_means(
-        examples_h5,
-        run_layers,
-        low_conf_threshold=args.low_conf_threshold,
-        high_conf_threshold=args.high_conf_threshold,
-        expected_probability_tokens=args.expected_probability_tokens,
-        expected_guess_tokens=args.expected_guess_tokens,
-        mean_from_low_confidence=args.mean_from_low_confidence,
-        new_h5_format=args.new_h5_format,
-        extend_probability_span=args.extend_probability_span,
+    _mean_low, _mean_high, direction_by_component, low_ids, high_ids = (
+        compute_low_high_span_means_and_directions_by_component(
+            examples_h5,
+            ablate_layers=run_layers,
+            low_conf_threshold=args.low_conf_threshold,
+            high_conf_threshold=args.high_conf_threshold,
+            expected_probability_tokens=direction_prob_token_budget,
+            expected_guess_tokens=args.expected_guess_tokens,
+            components=args.ablate_subblocks,
+        )
     )
-    logging.info("Verbalised embedding means computed")
+    if args.normalize_span_directions:
+        normalization_stats = normalize_component_direction_spans_to_unit_norm_budget(
+            direction_by_component,
+            components=args.ablate_subblocks,
+            spans=("guess", "probability"),
+        )
+        for component, span_stats_map in normalization_stats.items():
+            for span_name, span_stats in span_stats_map.items():
+                logging.info(
+                    "Normalized component=%s span=%s direction norms: before=%.6f after=%.6f "
+                    "target=%.6f scale=%.6f",
+                    component,
+                    span_name,
+                    span_stats["sum_before"],
+                    span_stats["sum_after"],
+                    span_stats["target_sum"],
+                    span_stats["scale"],
+                )
+
     if not args.parse_mode_verbalised_confidence:
-        # Keep confidence-group checks and IDs consistent with the base implementation.
         low_ids, high_ids = collect_confidence_group_ids(
             examples_h5,
             low_conf_threshold=args.low_conf_threshold,
             high_conf_threshold=args.high_conf_threshold,
         )
 
-    mean_source_ids = low_ids if args.mean_from_low_confidence else high_ids
-    if args.ablate_with_same_confidence:
-        ablation_target_ids = mean_source_ids
-    else:
-        ablation_target_ids = high_ids if args.mean_from_low_confidence else low_ids
-    mean_source_group = "low_confidence" if args.mean_from_low_confidence else "high_confidence"
-    ablation_target_group = (
-        mean_source_group
-        if args.ablate_with_same_confidence
-        else ("high_confidence" if args.mean_from_low_confidence else "low_confidence")
-    )
+    ablation_target_ids = high_ids if args.mean_from_low_confidence else low_ids
     if not ablation_target_ids:
         raise ValueError("No ablation target IDs found for the configured thresholds.")
-    if not mean_source_ids:
-        raise ValueError("No mean source IDs found for the configured thresholds.")
-    logging.info(
-        "Confidence groups: mean_source=%s ablation_target=%s ablate_with_same_confidence=%s "
-        "(mean_source_count=%d ablation_target_count=%d)",
-        mean_source_group,
-        ablation_target_group,
-        args.ablate_with_same_confidence,
-        len(mean_source_ids),
-        len(ablation_target_ids),
-    )
+    if not low_ids:
+        raise ValueError(f"No low-confidence examples found at threshold <= {args.low_conf_threshold}.")
+    if not high_ids:
+        raise ValueError(f"No high-confidence examples found at threshold >= {args.high_conf_threshold}.")
 
-    layer_to_verbalised_embedding_means: Dict[int, Dict[str, torch.Tensor]] = {}
-    for i, layer_idx in enumerate(run_layers):
-        layer_to_verbalised_embedding_means[layer_idx] = {
-            "probability": torch.tensor(
-                verbalised_embedding_means["probability"][i], device=device, dtype=torch_dtype
+    direction_probability_shape = {
+        component: tuple(direction_by_component[component]["probability"].shape)
+        for component in args.ablate_subblocks
+    }
+    component_to_layer_to_probability_direction: Dict[str, Dict[int, torch.Tensor]] = {}
+    for component in args.ablate_subblocks:
+        component_to_layer_to_probability_direction[component] = {}
+        for i, layer_idx in enumerate(run_layers):
+            component_to_layer_to_probability_direction[component][layer_idx] = torch.tensor(
+                direction_by_component[component]["probability"][i],
+                device=device,
+                dtype=torch_dtype,
             )
-        }
+
+    logging.info(
+        "Run root: %s | subblocks=%s target=%s sign=%.1f alpha=%s direction.shapes=%s",
+        run_root,
+        args.ablate_subblocks,
+        steering_target,
+        steering_sign,
+        args.alpha,
+        direction_probability_shape,
+    )
 
     none_cache = build_none_cache(
         train_ds=train_ds,
@@ -981,10 +1060,44 @@ def main() -> None:
         ablation_target_ids=ablation_target_ids,
         num_samples=args.num_samples,
         fewshot_prefix=fewshot_prefix,
+        confidence_prompt=confidence_prompt,
         max_new_tokens=args.model_max_new_tokens,
         parse_mode_verbalised_confidence=args.parse_mode_verbalised_confidence,
+        linguistic_confidence_prompt=args.linguistic_confidence_prompt,
     )
     baseline_mean, baseline_count = _baseline_confidence_stats(none_cache)
+
+    config_kwargs = dict(
+        args=args,
+        device=device,
+        model_n_layers=model.cfg.n_layers,
+        prompt_indices=prompt_indices,
+        low_conf_count=len(low_ids),
+        high_conf_count=len(high_ids),
+        h5_example_count=len(examples_h5),
+        baseline_mean=baseline_mean,
+        baseline_count=baseline_count,
+        steering_target=steering_target,
+        steering_sign=steering_sign,
+        direction_probability_shape=direction_probability_shape,
+    )
+
+    def _summary_token_entry(pos: int, token_labels: List[str], means: Dict[int, Optional[float]],
+                             counts: Dict[int, int], identical: Dict[int, int]) -> dict:
+        return {
+            "mode_key": _token_mode_key(pos, steering_target, args.alpha),
+            "token_label": token_labels[pos],
+            "steering_target": steering_target,
+            "alpha": args.alpha,
+            "mean_confidence": means[pos],
+            "sample_count": counts[pos],
+            "responses_identical_true": identical[pos],
+            "deviation_from_baseline": (
+                None
+                if means[pos] is None or baseline_mean is None
+                else float(means[pos] - baseline_mean)
+            ),
+        }
 
     if not args.individual_layers:
         (
@@ -998,17 +1111,21 @@ def main() -> None:
             val_ds=val_ds,
             model=model,
             fewshot_prefix=fewshot_prefix,
-            layer_to_verbalised_embedding_means_eval=layer_to_verbalised_embedding_means,
+            confidence_prompt=confidence_prompt,
+            component_to_layer_to_probability_direction=component_to_layer_to_probability_direction,
             none_cache=none_cache,
             ablation_target_ids=ablation_target_ids,
-            ablation_target_group=ablation_target_group,
-            ablate_with_same_confidence=args.ablate_with_same_confidence,
             num_samples=args.num_samples,
             max_new_tokens=args.model_max_new_tokens,
             parse_mode_verbalised_confidence=args.parse_mode_verbalised_confidence,
             expected_probability_tokens=args.expected_probability_tokens,
+            expected_confidence_tokens=args.expected_confidence_tokens,
+            linguistic_confidence_prompt=args.linguistic_confidence_prompt,
             extend_probability_span=args.extend_probability_span,
-            mean_from_low_confidence=args.mean_from_low_confidence,
+            span_token_count=span_token_count,
+            steering_target=steering_target,
+            steering_sign=steering_sign,
+            alpha=args.alpha,
         )
         token_labels = _token_labels_from_counters(
             token_label_counters, span_token_count=span_token_count
@@ -1019,34 +1136,23 @@ def main() -> None:
             json.dump(mini_results, f, ensure_ascii=False, indent=2)
         logging.info("Wrote %s", mini_path)
 
-        config_path = _config_txt_path(run_root)
         finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
         write_config_txt(
-            config_path,
-            args=args,
-            device=device,
-            model_n_layers=model.cfg.n_layers,
+            _config_txt_path(run_root),
             run_layers=run_layers,
-            prompt_indices=prompt_indices,
-            low_conf_count=len(low_ids),
-            high_conf_count=len(high_ids),
-            h5_example_count=len(examples_h5),
-            baseline_mean=baseline_mean,
-            baseline_count=baseline_count,
             token_position_means=token_position_means,
             token_position_counts=token_position_counts,
             responses_identical_true=responses_identical_true,
             finished_at=finished_at,
+            **config_kwargs,
         )
-        logging.info("Wrote %s", config_path)
+        logging.info("Wrote %s", _config_txt_path(run_root))
 
         summary = {
             "run_root": run_root,
-            "dataset": args.dataset,
-            "mean_from_low_confidence": args.mean_from_low_confidence,
-            "ablate_with_same_confidence": args.ablate_with_same_confidence,
-            "mean_source_group": mean_source_group,
-            "ablation_target_group": ablation_target_group,
+            "ablate_subblocks": list(args.ablate_subblocks),
+            "steering_target": steering_target,
+            "alpha": args.alpha,
             "baseline": {
                 "mode": "no_replacement",
                 "mean_confidence": baseline_mean,
@@ -1054,38 +1160,33 @@ def main() -> None:
             },
             "expected_probability_tokens": args.expected_probability_tokens,
             "extend_probability_span": args.extend_probability_span,
+            "expected_confidence_tokens": args.expected_confidence_tokens,
             "span_token_count": span_token_count,
+            "linguistic_confidence_prompt": args.linguistic_confidence_prompt,
             "token_positions": {
-                str(pos): {
-                    "mode_key": _token_mode_key(pos),
-                    "token_label": token_labels[pos],
-                    "mean_confidence": token_position_means[pos],
-                    "sample_count": token_position_counts[pos],
-                    "responses_identical_true": responses_identical_true[pos],
-                    "deviation_from_baseline": (
-                        None
-                        if token_position_means[pos] is None or baseline_mean is None
-                        else float(token_position_means[pos] - baseline_mean)
-                    ),
-                }
+                str(pos): _summary_token_entry(
+                    pos, token_labels, token_position_means,
+                    token_position_counts, responses_identical_true,
+                )
                 for pos in range(span_token_count)
             },
         }
 
-        summary_path = _summary_json_path(run_root)
-        with open(summary_path, "w", encoding="utf-8") as f:
+        with open(_summary_json_path(run_root), "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
-        logging.info("Wrote %s", summary_path)
+        logging.info("Wrote %s", _summary_json_path(run_root))
 
-        line_plot_path = _line_plot_path(run_root)
         write_line_plot(
-            path=line_plot_path,
+            path=_line_plot_path(run_root),
             token_position_means=token_position_means,
             baseline_mean=baseline_mean,
             span_token_count=span_token_count,
             token_labels=token_labels,
+            steering_target=steering_target,
+            alpha=args.alpha,
+            linguistic_confidence_prompt=args.linguistic_confidence_prompt,
         )
-        logging.info("Wrote %s", line_plot_path)
+        logging.info("Wrote %s", _line_plot_path(run_root))
         logging.info("Run complete. Output directory: %s", run_root)
         return
 
@@ -1098,7 +1199,12 @@ def main() -> None:
 
     for layer_idx in run_layers:
         logging.info("Running individual layer tokenwise sweep for layer %d", layer_idx)
-        layer_map = {layer_idx: layer_to_verbalised_embedding_means[layer_idx]}
+        layer_map = {
+            component: {
+                layer_idx: component_to_layer_to_probability_direction[component][layer_idx]
+            }
+            for component in args.ablate_subblocks
+        }
         (
             mini_results,
             token_position_means,
@@ -1110,17 +1216,21 @@ def main() -> None:
             val_ds=val_ds,
             model=model,
             fewshot_prefix=fewshot_prefix,
-            layer_to_verbalised_embedding_means_eval=layer_map,
+            confidence_prompt=confidence_prompt,
+            component_to_layer_to_probability_direction=layer_map,
             none_cache=none_cache,
             ablation_target_ids=ablation_target_ids,
-            ablation_target_group=ablation_target_group,
-            ablate_with_same_confidence=args.ablate_with_same_confidence,
             num_samples=args.num_samples,
             max_new_tokens=args.model_max_new_tokens,
             parse_mode_verbalised_confidence=args.parse_mode_verbalised_confidence,
             expected_probability_tokens=args.expected_probability_tokens,
+            expected_confidence_tokens=args.expected_confidence_tokens,
+            linguistic_confidence_prompt=args.linguistic_confidence_prompt,
             extend_probability_span=args.extend_probability_span,
-            mean_from_low_confidence=args.mean_from_low_confidence,
+            span_token_count=span_token_count,
+            steering_target=steering_target,
+            steering_sign=steering_sign,
+            alpha=args.alpha,
         )
         per_layer_token_means[layer_idx] = token_position_means
         per_layer_token_counts[layer_idx] = token_position_counts
@@ -1130,40 +1240,28 @@ def main() -> None:
 
         layer_dir = os.path.join(run_root, str(layer_idx))
         os.makedirs(layer_dir, exist_ok=True)
-        layer_mini_path = _mini_output_json_path(layer_dir)
-        with open(layer_mini_path, "w", encoding="utf-8") as f:
+        with open(_mini_output_json_path(layer_dir), "w", encoding="utf-8") as f:
             json.dump(mini_results, f, ensure_ascii=False, indent=2)
-        logging.info("Wrote %s", layer_mini_path)
+        logging.info("Wrote %s", _mini_output_json_path(layer_dir))
 
-        layer_config_path = _config_txt_path(layer_dir)
         finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
         write_config_txt(
-            layer_config_path,
-            args=args,
-            device=device,
-            model_n_layers=model.cfg.n_layers,
+            _config_txt_path(layer_dir),
             run_layers=[layer_idx],
-            prompt_indices=prompt_indices,
-            low_conf_count=len(low_ids),
-            high_conf_count=len(high_ids),
-            h5_example_count=len(examples_h5),
-            baseline_mean=baseline_mean,
-            baseline_count=baseline_count,
             token_position_means=token_position_means,
             token_position_counts=token_position_counts,
             responses_identical_true=responses_identical_true,
             finished_at=finished_at,
+            **config_kwargs,
         )
-        logging.info("Wrote %s", layer_config_path)
+        logging.info("Wrote %s", _config_txt_path(layer_dir))
 
     token_labels = _token_labels_from_counters(
         global_token_label_counter, span_token_count=span_token_count
     )
 
     matrix_values = np.full((len(run_layers), span_token_count), np.nan, dtype=np.float32)
-    matrix_dev_desired = np.full(
-        (len(run_layers), span_token_count), np.nan, dtype=np.float32
-    )
+    matrix_dev_desired = np.full((len(run_layers), span_token_count), np.nan, dtype=np.float32)
     for r, layer_idx in enumerate(run_layers):
         for c in range(span_token_count):
             val = per_layer_token_means[layer_idx].get(c)
@@ -1183,20 +1281,22 @@ def main() -> None:
     line_token_counts: Dict[int, int] = {}
     line_identical_counts: Dict[int, int] = {}
     for pos in range(span_token_count):
-        vals = [per_layer_token_means[layer][pos] for layer in run_layers if per_layer_token_means[layer][pos] is not None]
+        vals = [
+            per_layer_token_means[layer][pos]
+            for layer in run_layers
+            if per_layer_token_means[layer][pos] is not None
+        ]
         line_token_means[pos] = float(np.mean(vals)) if vals else None
         line_token_counts[pos] = sum(per_layer_token_counts[layer][pos] for layer in run_layers)
         line_identical_counts[pos] = sum(per_layer_identical_counts[layer][pos] for layer in run_layers)
 
     summary = {
         "run_root": run_root,
-        "dataset": args.dataset,
         "individual_layers": True,
         "run_layers": list(run_layers),
-        "mean_from_low_confidence": args.mean_from_low_confidence,
-        "ablate_with_same_confidence": args.ablate_with_same_confidence,
-        "mean_source_group": mean_source_group,
-        "ablation_target_group": ablation_target_group,
+        "ablate_subblocks": list(args.ablate_subblocks),
+        "steering_target": steering_target,
+        "alpha": args.alpha,
         "baseline": {
             "mode": "no_replacement",
             "mean_confidence": baseline_mean,
@@ -1204,11 +1304,15 @@ def main() -> None:
         },
         "expected_probability_tokens": args.expected_probability_tokens,
         "extend_probability_span": args.extend_probability_span,
+        "expected_confidence_tokens": args.expected_confidence_tokens,
         "span_token_count": span_token_count,
+        "linguistic_confidence_prompt": args.linguistic_confidence_prompt,
         "token_positions": {
             str(pos): {
-                "mode_key": _token_mode_key(pos),
+                "mode_key": _token_mode_key(pos, steering_target, args.alpha),
                 "token_label": token_labels[pos],
+                "steering_target": steering_target,
+                "alpha": args.alpha,
                 "mean_confidence_across_layers": line_token_means[pos],
                 "sample_count_across_layers": line_token_counts[pos],
                 "responses_identical_true_across_layers": line_identical_counts[pos],
@@ -1239,52 +1343,44 @@ def main() -> None:
             for layer_idx in run_layers
         },
     }
-    summary_path = _summary_json_path(run_root)
-    with open(summary_path, "w", encoding="utf-8") as f:
+    with open(_summary_json_path(run_root), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
-    logging.info("Wrote %s", summary_path)
+    logging.info("Wrote %s", _summary_json_path(run_root))
 
-    root_config_path = _config_txt_path(run_root)
     finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
     write_config_txt(
-        root_config_path,
-        args=args,
-        device=device,
-        model_n_layers=model.cfg.n_layers,
+        _config_txt_path(run_root),
         run_layers=run_layers,
-        prompt_indices=prompt_indices,
-        low_conf_count=len(low_ids),
-        high_conf_count=len(high_ids),
-        h5_example_count=len(examples_h5),
-        baseline_mean=baseline_mean,
-        baseline_count=baseline_count,
         token_position_means=line_token_means,
         token_position_counts=line_token_counts,
         responses_identical_true=line_identical_counts,
         finished_at=finished_at,
+        **config_kwargs,
     )
-    logging.info("Wrote %s", root_config_path)
+    logging.info("Wrote %s", _config_txt_path(run_root))
 
-    grid_path = _grid_plot_path(run_root)
     write_layer_token_grid_plot(
-        path=grid_path,
+        path=_grid_plot_path(run_root),
         run_layers=run_layers,
         token_labels=token_labels,
         matrix_values=matrix_values,
         matrix_deviation_desired=matrix_dev_desired,
         mean_from_low_confidence=args.mean_from_low_confidence,
+        linguistic_confidence_prompt=args.linguistic_confidence_prompt,
     )
-    logging.info("Wrote %s", grid_path)
+    logging.info("Wrote %s", _grid_plot_path(run_root))
 
-    line_plot_path = _line_plot_path(run_root)
     write_line_plot(
-        path=line_plot_path,
+        path=_line_plot_path(run_root),
         token_position_means=line_token_means,
         baseline_mean=baseline_mean,
         span_token_count=span_token_count,
         token_labels=token_labels,
+        steering_target=steering_target,
+        alpha=args.alpha,
+        linguistic_confidence_prompt=args.linguistic_confidence_prompt,
     )
-    logging.info("Wrote %s", line_plot_path)
+    logging.info("Wrote %s", _line_plot_path(run_root))
     logging.info("Run complete. Output directory: %s", run_root)
 
 
