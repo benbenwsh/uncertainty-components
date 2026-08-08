@@ -135,15 +135,17 @@ def _probability_span_bounds(
 ) -> Optional[Tuple[int, int]]:
     """Return non-extended (first_prob, end_prob) inclusive, or None if parse fails.
 
-    Extend extras are not required here: interventions unlock once this base
-    Probability: span is available; extra value-token positions activate later
-    once their abs positions enter the sequence.
+    Interventions unlock once the Probability: prefix tokens are parseable
+    (same gate as parse_guess_and_probability_indices: end_prob > len fails).
+    When len == end_prob the digit at end_prob is about to be generated, so
+    token_position targeting that index can replace the current last residual.
+    Extend extras activate later once their abs positions enter the sequence.
     """
     parsed = parse_guess_and_probability_indices(list(decoded_tokens))
     if parsed is None:
         return None
     _, first_prob, end_prob = parsed
-    if end_prob >= len(decoded_tokens):
+    if end_prob > len(decoded_tokens):
         return None
     return first_prob, end_prob
 

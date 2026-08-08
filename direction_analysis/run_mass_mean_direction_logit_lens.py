@@ -15,24 +15,22 @@ import logging
 import os
 from pathlib import Path
 import sys
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
-import torch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from layerwise_mean_ablation.run_mean_ablation import load_examples_h5
 from mass_mean_probe.run_mass_mean_probe import (
-    _as_layer_hidden,
     _expected_probability_span_token_budget,
-    _extract_res_field,
     _prefix_tokens_for_linguistic_confidence,
-    compute_low_high_span_means_and_directions,
     configure_prefix_tokens_for_model,
+)
+from direction_analysis.h5_probability_directions import (
+    compute_probability_mass_mean_direction_streaming,
 )
 from logit_lens_improved.run_logit_lens_improved import (
     SUPPORTED_MODEL_NAMES,
@@ -52,7 +50,8 @@ def _resolve_run_root(cli_output_dir: Optional[str]) -> str:
         os.makedirs(cli_output_dir, exist_ok=True)
         return cli_output_dir
 
-    base_dir = os.path.join(MODULE_NAME, "results", RESULTS_STEM)
+    # Anchor to this file's directory so cwd does not create nested paths.
+    base_dir = str(SCRIPT_DIR / "results" / RESULTS_STEM)
     os.makedirs(base_dir, exist_ok=True)
     existing = [
         d
@@ -73,35 +72,6 @@ def _attach_output_log(run_root: str) -> str:
     )
     logging.getLogger().addHandler(file_handler)
     return output_log_path
-
-
-def _infer_n_layers(examples_h5: Dict[str, dict], *, new_h5_format: bool) -> int:
-    for ex_id, ex_obj in examples_h5.items():
-        responses = ex_obj.get("responses")
-        if not isinstance(responses, list) or not responses:
-            continue
-        resp0 = responses[0]
-        if not isinstance(resp0, dict):
-            continue
-        emb_prob = _extract_res_field(
-            resp0, ex_id, "embeddings_probability", new_h5_format=new_h5_format
-        )
-        if emb_prob is None:
-            continue
-        if isinstance(emb_prob, list):
-            if not emb_prob:
-                continue
-            layer_hidden = _as_layer_hidden(emb_prob[0])
-        else:
-            layer_hidden = _as_layer_hidden(emb_prob)
-        n_stream = int(layer_hidden.shape[0])
-        if n_stream < 2:
-            raise ValueError(
-                f"Example {ex_id} residual stream length {n_stream} is too short "
-                "(need embedding + at least one resid_post)."
-            )
-        return n_stream - 1
-    raise ValueError("Could not infer n_layers: no usable embeddings_probability found in H5.")
 
 
 def _token_labels_from_prefix(
@@ -259,30 +229,28 @@ def main() -> None:
         else span_token_count
     )
 
-    logging.info("Loading H5: %s", args.input_h5)
-    examples_h5 = load_examples_h5(Path(args.input_h5))
-    n_layers = _infer_n_layers(examples_h5, new_h5_format=args.new_h5_format)
-    run_layers = list(range(n_layers))
-    logging.info("Inferred n_layers=%d from residual stream", n_layers)
-
-    _mean_low, _mean_high, direction, low_ids, high_ids = compute_low_high_span_means_and_directions(
-        examples_h5,
-        run_layers,
-        low_conf_threshold=args.low_conf_threshold,
-        high_conf_threshold=args.high_conf_threshold,
-        expected_probability_tokens=direction_prob_token_budget,
-        expected_guess_tokens=args.expected_guess_tokens,
-        new_h5_format=args.new_h5_format,
+    logging.info("Computing probability mass-mean directions (streaming H5)...")
+    direction_probability, low_ids, high_ids, n_layers, h5_example_count = (
+        compute_probability_mass_mean_direction_streaming(
+            args.input_h5,
+            expected_probability_tokens=direction_prob_token_budget,
+            low_conf_threshold=args.low_conf_threshold,
+            high_conf_threshold=args.high_conf_threshold,
+            new_h5_format=args.new_h5_format,
+        )
     )
-    direction_probability = np.asarray(direction["probability"], dtype=np.float32)
+    logging.info(
+        "Direction shape=%s | n_layers=%d | low=%d high=%d examples=%d",
+        tuple(direction_probability.shape),
+        n_layers,
+        len(low_ids),
+        len(high_ids),
+        h5_example_count,
+    )
     if direction_probability.ndim != 3:
         raise ValueError(
-            f"Expected direction['probability'] shape (layers, tokens, d_model), "
+            f"Expected direction shape (layers, tokens, d_model), "
             f"got {direction_probability.shape}."
-        )
-    if direction_probability.shape[0] != n_layers:
-        raise ValueError(
-            f"Direction layer count {direction_probability.shape[0]} != inferred n_layers {n_layers}."
         )
     if direction_probability.shape[1] != direction_prob_token_budget:
         raise ValueError(
@@ -348,7 +316,7 @@ def main() -> None:
         direction_probability_shape=tuple(direction_probability.shape),
         low_conf_count=len(low_ids),
         high_conf_count=len(high_ids),
-        h5_example_count=len(examples_h5),
+        h5_example_count=h5_example_count,
         vocab_size=vocab_size,
         softcap=softcap,
         table_paths=table_paths,
@@ -368,7 +336,7 @@ def main() -> None:
         "vocab_size": vocab_size,
         "low_conf_count": len(low_ids),
         "high_conf_count": len(high_ids),
-        "h5_example_count": len(examples_h5),
+        "h5_example_count": h5_example_count,
         "token_labels": token_labels,
         "tables": table_paths,
     }

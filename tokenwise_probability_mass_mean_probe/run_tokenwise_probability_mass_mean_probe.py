@@ -141,7 +141,7 @@ def _extract_probability_tokens(
     if parsed is None:
         return None
     _, first_prob, end_prob = parsed
-    if end_prob >= len(decoded_tokens):
+    if end_prob > len(decoded_tokens):
         return None
     base_span = list(decoded_tokens[first_prob : end_prob + 1])
     base_budget = (
@@ -179,7 +179,7 @@ def _absolute_prob_single_position(
     if parsed is None:
         return []
     _, first_prob, end_prob = parsed
-    if end_prob >= len(decoded_tokens):
+    if end_prob > len(decoded_tokens):
         return []
     base_budget = (
         expected_confidence_tokens

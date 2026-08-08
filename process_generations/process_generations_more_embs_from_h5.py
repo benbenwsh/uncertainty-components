@@ -1160,7 +1160,7 @@ def main():
     )
     parser.add_argument(
         "--attention_score_tokenwise_k_mode",
-        default=False,
+        default=True,
         action=argparse.BooleanOptionalAction,
         help=(
             "Store tokenwise K prompt/semantic-answer fields for downstream attention "

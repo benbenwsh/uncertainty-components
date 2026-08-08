@@ -993,7 +993,7 @@ def _absolute_prob_positions(
         return []
     _, first_prob, end_prob = parsed
     apply_extend = extend_probability_span and not linguistic_confidence_prompt
-    if apply_extend and end_prob + 2 >= len(decoded_tokens):
+    if apply_extend and end_prob + 2 > len(decoded_tokens):
         return []
     span_end = end_prob + (2 if apply_extend else 0)
     rel_positions = list(range(first_prob, span_end + 1))
@@ -1061,7 +1061,7 @@ def _absolute_prob_last_token_only(
         return []
     _, first_prob, end_prob = parsed
     apply_extend = extend_probability_span and not linguistic_confidence_prompt
-    if apply_extend and end_prob + 2 >= len(decoded_tokens):
+    if apply_extend and end_prob + 2 > len(decoded_tokens):
         return []
     span_end = end_prob + (2 if apply_extend else 0)
     full_rel_positions = list(range(first_prob, span_end + 1))
@@ -1094,7 +1094,7 @@ def _absolute_prob_marker_except_last_token(
         return []
     _, first_prob, end_prob = parsed
     apply_extend = extend_probability_span and not linguistic_confidence_prompt
-    if apply_extend and end_prob + 2 >= len(decoded_tokens):
+    if apply_extend and end_prob + 2 > len(decoded_tokens):
         return []
     span_end = end_prob + (2 if apply_extend else 0)
     full_rel_positions = list(range(first_prob, span_end + 1))
@@ -1205,7 +1205,7 @@ def _absolute_pre_probability_positions(
     guess_positions_rel = guess_positions_rel[:expected_guess_tokens]
 
     apply_extend = extend_probability_span and not linguistic_confidence_prompt
-    if apply_extend and end_prob_token_index + 2 >= len(decoded_tokens):
+    if apply_extend and end_prob_token_index + 2 > len(decoded_tokens):
         return None
     span_end = end_prob_token_index + (2 if apply_extend else 0)
     probability_positions_rel = list(range(first_prob_token_index, span_end + 1))
