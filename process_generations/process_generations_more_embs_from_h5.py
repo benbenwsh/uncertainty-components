@@ -10,13 +10,14 @@ Output:
   HDF5 + JSON with one processed response per example containing:
     - response (original model completion string)
     - verbalised_confidence
-    - embeddings_mean_prompt (default mode)
+    - embeddings_mean_prompt
     - embeddings_guess
-    - embeddings_mean_sem_answer (default mode)
+    - embeddings_mean_sem_answer
     - embeddings_probability
     - embeddings_mean_prob_val
-    - embeddings_prompt_k_tokens (tokenwise K mode)
-    - embeddings_sem_answer_k_tokens (tokenwise K mode)
+    - embeddings_prompt_k_tokens (when --attention_score_tokenwise_k_mode)
+    - embeddings_sem_answer_k_tokens (when --attention_score_tokenwise_k_mode)
+    - decoded_tokens (when --attention_score_tokenwise_k_mode)
 
   Also writes a companion *_summary.json with the same structure but all
   embeddings_* fields omitted.
@@ -829,72 +830,65 @@ def process_example(
         except ValueError as exc:
             logging.error(config["invalid_log"], example_id, exc)
 
+    processed_response = {
+        "response": response_str,
+        "verbalised_confidence": float(prob),
+        "embeddings_mean_prompt": {"res": res_processed["embeddings_mean_prompt"]},
+        "embeddings_guess": {"res": res_processed["embeddings_guess"]},
+        "embeddings_mean_sem_answer": {"res": res_processed["embeddings_mean_sem_answer"]},
+        "embeddings_probability": {"res": res_processed["embeddings_probability"]},
+        "embeddings_mean_prob_val": {"res": res_processed["embeddings_mean_prob_val"]},
+    }
     if attention_score_tokenwise_k_mode:
-        processed_response = {
-            "response": response_str,
-            "decoded_tokens": decoded_tokens,
-            "verbalised_confidence": float(prob),
-            "embeddings_prompt_k_tokens": {"k": k_tokenwise_processed["embeddings_prompt_k_tokens"]},
-            "embeddings_guess": {"res": res_processed["embeddings_guess"]},
-            "embeddings_sem_answer_k_tokens": {
-                "k": k_tokenwise_processed["embeddings_sem_answer_k_tokens"]
-            },
-            "embeddings_probability": {"res": res_processed["embeddings_probability"]},
-            "embeddings_mean_prob_val": {"res": res_processed["embeddings_mean_prob_val"]},
+        processed_response["decoded_tokens"] = decoded_tokens
+        processed_response["embeddings_prompt_k_tokens"] = {
+            "k": k_tokenwise_processed["embeddings_prompt_k_tokens"]
         }
-    else:
-        processed_response = {
-            "response": response_str,
-            "verbalised_confidence": float(prob),
-            "embeddings_mean_prompt": {"res": res_processed["embeddings_mean_prompt"]},
-            "embeddings_guess": {"res": res_processed["embeddings_guess"]},
-            "embeddings_mean_sem_answer": {"res": res_processed["embeddings_mean_sem_answer"]},
-            "embeddings_probability": {"res": res_processed["embeddings_probability"]},
-            "embeddings_mean_prob_val": {"res": res_processed["embeddings_mean_prob_val"]},
+        processed_response["embeddings_sem_answer_k_tokens"] = {
+            "k": k_tokenwise_processed["embeddings_sem_answer_k_tokens"]
         }
-        if collect_attn_block_embeddings:
-            processed_response["embeddings_mean_prompt"]["attn"] = (
-                None if attn_processed is None else attn_processed["embeddings_mean_prompt"]
-            )
-            processed_response["embeddings_guess"]["attn"] = (
-                None if attn_processed is None else attn_processed["embeddings_guess"]
-            )
-            processed_response["embeddings_mean_sem_answer"]["attn"] = (
-                None if attn_processed is None else attn_processed["embeddings_mean_sem_answer"]
-            )
-            processed_response["embeddings_probability"]["attn"] = (
-                None if attn_processed is None else attn_processed["embeddings_probability"]
-            )
-            processed_response["embeddings_mean_prob_val"]["attn"] = (
-                None if attn_processed is None else attn_processed["embeddings_mean_prob_val"]
-            )
-        if collect_mlp_block_embeddings:
-            processed_response["embeddings_mean_prompt"]["mlp"] = (
-                None if mlp_processed is None else mlp_processed["embeddings_mean_prompt"]
-            )
-            processed_response["embeddings_guess"]["mlp"] = (
-                None if mlp_processed is None else mlp_processed["embeddings_guess"]
-            )
-            processed_response["embeddings_mean_sem_answer"]["mlp"] = (
-                None if mlp_processed is None else mlp_processed["embeddings_mean_sem_answer"]
-            )
-            processed_response["embeddings_probability"]["mlp"] = (
-                None if mlp_processed is None else mlp_processed["embeddings_probability"]
-            )
-            processed_response["embeddings_mean_prob_val"]["mlp"] = (
-                None if mlp_processed is None else mlp_processed["embeddings_mean_prob_val"]
-            )
+    if collect_attn_block_embeddings:
+        processed_response["embeddings_mean_prompt"]["attn"] = (
+            None if attn_processed is None else attn_processed["embeddings_mean_prompt"]
+        )
+        processed_response["embeddings_guess"]["attn"] = (
+            None if attn_processed is None else attn_processed["embeddings_guess"]
+        )
+        processed_response["embeddings_mean_sem_answer"]["attn"] = (
+            None if attn_processed is None else attn_processed["embeddings_mean_sem_answer"]
+        )
+        processed_response["embeddings_probability"]["attn"] = (
+            None if attn_processed is None else attn_processed["embeddings_probability"]
+        )
+        processed_response["embeddings_mean_prob_val"]["attn"] = (
+            None if attn_processed is None else attn_processed["embeddings_mean_prob_val"]
+        )
+    if collect_mlp_block_embeddings:
+        processed_response["embeddings_mean_prompt"]["mlp"] = (
+            None if mlp_processed is None else mlp_processed["embeddings_mean_prompt"]
+        )
+        processed_response["embeddings_guess"]["mlp"] = (
+            None if mlp_processed is None else mlp_processed["embeddings_guess"]
+        )
+        processed_response["embeddings_mean_sem_answer"]["mlp"] = (
+            None if mlp_processed is None else mlp_processed["embeddings_mean_sem_answer"]
+        )
+        processed_response["embeddings_probability"]["mlp"] = (
+            None if mlp_processed is None else mlp_processed["embeddings_probability"]
+        )
+        processed_response["embeddings_mean_prob_val"]["mlp"] = (
+            None if mlp_processed is None else mlp_processed["embeddings_mean_prob_val"]
+        )
     for source_label, config in optional_sources.items():
         if not config["enabled"]:
             continue
         source_processed = config["processed"]
-        if not attention_score_tokenwise_k_mode:
-            processed_response["embeddings_mean_prompt"][source_label] = (
-                None if source_processed is None else source_processed["embeddings_mean_prompt"]
-            )
-            processed_response["embeddings_mean_sem_answer"][source_label] = (
-                None if source_processed is None else source_processed["embeddings_mean_sem_answer"]
-            )
+        processed_response["embeddings_mean_prompt"][source_label] = (
+            None if source_processed is None else source_processed["embeddings_mean_prompt"]
+        )
+        processed_response["embeddings_mean_sem_answer"][source_label] = (
+            None if source_processed is None else source_processed["embeddings_mean_sem_answer"]
+        )
         processed_response["embeddings_guess"][source_label] = (
             None if source_processed is None else source_processed["embeddings_guess"]
         )
@@ -1163,8 +1157,9 @@ def main():
         default=True,
         action=argparse.BooleanOptionalAction,
         help=(
-            "Store tokenwise K prompt/semantic-answer fields for downstream attention "
-            "score analysis (`embeddings_prompt_k_tokens`, `embeddings_sem_answer_k_tokens`)."
+            "Also store tokenwise K prompt/semantic-answer fields for downstream attention "
+            "score analysis (`embeddings_prompt_k_tokens`, `embeddings_sem_answer_k_tokens`). "
+            "Mean prompt/sem-answer fields (and attn/mlp/qkvo subfields) are still written."
         ),
     )
     parser.add_argument(
