@@ -12,6 +12,7 @@ import argparse
 from dataclasses import asdict, dataclass
 from datetime import datetime
 import hashlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -22,7 +23,9 @@ import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from huggingface_hub import hf_hub_download
+from safetensors import safe_open
+from transformers import AutoConfig, AutoTokenizer
 from tqdm import tqdm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -43,6 +46,7 @@ POSITION_ALIGNMENT_ASSUMPTION = (
     "cached H5 embeddings_probability rows are already at the predicting residual "
     "for each span token (generation step i predicts decoded_tokens[i]); no -1 shift applied"
 )
+WEIGHT_LOAD_METHOD = "safetensors_selective_cpu"
 
 # ---------------------------------------------------------------------------
 # Model adapter
@@ -63,7 +67,6 @@ class ModelAdapter:
     norm_path: tuple[str, ...]
     layers_path: tuple[str, ...]
     trust_remote_code: bool
-    load_dtype: str
 
 
 ADAPTER_SPECS: dict[str, dict] = {
@@ -76,11 +79,10 @@ ADAPTER_SPECS: dict[str, dict] = {
         "embed_path": ("model", "embed_tokens"),
         "embed_path_fallbacks": (),
         "lm_head_path": ("lm_head",),
+        "lm_head_path_fallbacks": (),
         "rms_norm_eps": 1e-5,
         "trust_remote_code": False,
-        # Load compressed; DLA tensors are cast to float32 on CPU after extraction.
-        "load_dtype": "bfloat16",
-        "config_root": None,  # top-level config
+        "config_root": None,
     },
     "Qwen/Qwen2.5-32B-Instruct": {
         "rmsnorm_gain": "plain_weight",
@@ -91,14 +93,13 @@ ADAPTER_SPECS: dict[str, dict] = {
         "embed_path": ("model", "embed_tokens"),
         "embed_path_fallbacks": (),
         "lm_head_path": ("lm_head",),
+        "lm_head_path_fallbacks": (),
         "rms_norm_eps": 1e-6,
         "trust_remote_code": True,
-        "load_dtype": "bfloat16",
         "config_root": None,
     },
     "google/gemma-3-12b-it": {
         "rmsnorm_gain": "one_plus_weight",
-        # Prefer TextModel paths; fall back if language_model wraps ForCausalLM.
         "norm_path": ("model", "language_model", "norm"),
         "norm_path_fallbacks": (
             ("model", "language_model", "model", "norm"),
@@ -112,38 +113,61 @@ ADAPTER_SPECS: dict[str, dict] = {
             ("model", "language_model", "model", "embed_tokens"),
         ),
         "lm_head_path": ("lm_head",),
+        "lm_head_path_fallbacks": (
+            ("model", "lm_head"),
+            ("model", "language_model", "lm_head"),
+        ),
         "rms_norm_eps": 1e-6,
         "trust_remote_code": True,
-        "load_dtype": "bfloat16",
         "config_root": "text_config",
     },
 }
 
 
-def _try_resolve_attr_path(root, path: tuple[str, ...], fallbacks: tuple[tuple[str, ...], ...] = ()):
-    tried = [path, *fallbacks]
-    errors: list[str] = []
-    for candidate in tried:
-        try:
-            return _resolve_attr_path(root, candidate), candidate
-        except AttributeError as exc:
-            errors.append(f"{candidate}: {exc}")
-    raise AttributeError(
-        "Could not resolve attribute path. Tried:\n  " + "\n  ".join(errors)
-    )
+def _path_to_weight_key(path: tuple[str, ...]) -> str:
+    return ".".join(path) + ".weight"
 
 
-def _resolve_attr_path(root, path: tuple[str, ...]):
-    obj = root
-    for attr in path:
-        obj = getattr(obj, attr)
-    return obj
+def _weight_key_candidates(
+    primary: tuple[str, ...], fallbacks: tuple[tuple[str, ...], ...] = ()
+) -> list[str]:
+    keys = [_path_to_weight_key(primary)]
+    for fb in fallbacks:
+        key = _path_to_weight_key(fb)
+        if key not in keys:
+            keys.append(key)
+    return keys
 
 
-def _text_config(model) -> object:
-    cfg = model.config
-    text_cfg = getattr(cfg, "text_config", None)
-    return text_cfg if text_cfg is not None else cfg
+def _o_proj_key_candidates(
+    layers_path: tuple[str, ...],
+    layers_fallbacks: tuple[tuple[str, ...], ...],
+    layer_idx: int,
+) -> list[str]:
+    keys: list[str] = []
+    for prefix in (layers_path, *layers_fallbacks):
+        key = ".".join(prefix) + f".{layer_idx}.self_attn.o_proj.weight"
+        if key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _layers_prefix_from_o_proj_key(key: str) -> tuple[str, ...]:
+    marker = ".self_attn.o_proj.weight"
+    if not key.endswith(marker):
+        raise ValueError(f"Unexpected o_proj key: {key!r}")
+    # model.layers.12.self_attn.o_proj.weight -> model.layers
+    body = key[: -len(marker)]
+    parts = body.split(".")
+    if len(parts) < 2 or not parts[-1].isdigit():
+        raise ValueError(f"Could not parse layers prefix from o_proj key: {key!r}")
+    return tuple(parts[:-1])
+
+
+def _norm_path_from_weight_key(key: str) -> tuple[str, ...]:
+    if not key.endswith(".weight"):
+        raise ValueError(f"Unexpected norm key: {key!r}")
+    return tuple(key[: -len(".weight")].split("."))
 
 
 def _cfg_int(cfg, *names: str, default: int | None = None) -> int:
@@ -156,16 +180,26 @@ def _cfg_int(cfg, *names: str, default: int | None = None) -> int:
     raise ValueError(f"None of {names} found on config {type(cfg).__name__}")
 
 
-def build_adapter_from_model(model_name: str, model) -> ModelAdapter:
+def _select_text_config(config, *, config_root: str | None):
+    if config_root == "text_config":
+        text_cfg = getattr(config, "text_config", None)
+        if text_cfg is None:
+            raise ValueError(
+                f"config_root=text_config but {type(config).__name__} has no text_config."
+            )
+        return text_cfg
+    return config
+
+
+def build_adapter_from_config(model_name: str) -> ModelAdapter:
     if model_name not in ADAPTER_SPECS:
         raise ValueError(
             f"Unsupported model_name={model_name!r}. Supported: {list(ADAPTER_SPECS)}"
         )
     spec = ADAPTER_SPECS[model_name]
-    cfg = _text_config(model) if spec["config_root"] == "text_config" else model.config
-    # Prefer text_config for Gemma even if top-level also has some fields.
-    if model_name == "google/gemma-3-12b-it":
-        cfg = _text_config(model)
+    trust_remote_code = bool(spec["trust_remote_code"])
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+    cfg = _select_text_config(config, config_root=spec.get("config_root"))
 
     n_query_heads = _cfg_int(cfg, "num_attention_heads", "n_head")
     n_kv_heads = _cfg_int(
@@ -199,7 +233,10 @@ def build_adapter_from_model(model_name: str, model) -> ModelAdapter:
             f"Invalid GQA: n_query_heads={n_query_heads} not divisible by n_kv_heads={n_kv_heads}."
         )
 
-    tie = bool(getattr(model.config, "tie_word_embeddings", False))
+    # Prefer top-level tie flag; fall back to text_config.
+    tie = bool(getattr(config, "tie_word_embeddings", False))
+    if not tie:
+        tie = bool(getattr(cfg, "tie_word_embeddings", False))
     w_u_source = "tied_embeddings" if tie else "lm_head"
 
     return ModelAdapter(
@@ -214,8 +251,7 @@ def build_adapter_from_model(model_name: str, model) -> ModelAdapter:
         rms_norm_eps=float(spec["rms_norm_eps"]),
         norm_path=tuple(spec["norm_path"]),
         layers_path=tuple(spec["layers_path"]),
-        trust_remote_code=bool(spec["trust_remote_code"]),
-        load_dtype=str(spec["load_dtype"]),
+        trust_remote_code=trust_remote_code,
     )
 
 
@@ -226,58 +262,91 @@ class ModelTensors:
     gamma: np.ndarray  # [H]
     w_u: np.ndarray  # [H, V] columns = token directions
     o_proj_weights: list[np.ndarray]  # per layer [out, in] = [H, n_q * d]
+    resolved_weight_keys: dict[str, str]
+    weight_load_method: str = WEIGHT_LOAD_METHOD
 
 
-def _parameter_to_cpu_f32(param: torch.Tensor, name: str) -> np.ndarray:
-    """Copy a model parameter to a float32 NumPy array on CPU.
-
-    Fails clearly if Accelerate disk-offload left the tensor on the meta device.
-    """
-    if param.device.type == "meta" or bool(getattr(param, "is_meta", False)):
-        raise RuntimeError(
-            f"Parameter {name!r} is on the meta device (weights were offloaded to disk). "
-            "This script must load the model onto a real device without disk offload. "
-            "Use a free GPU (--device cuda:N) or --device cpu with enough RAM."
-        )
-    return param.detach().to(dtype=torch.float32, device="cpu").contiguous().numpy()
+# ---------------------------------------------------------------------------
+# Safetensors selective reader (CPU)
+# ---------------------------------------------------------------------------
 
 
-def _validate_torch_device(device: torch.device) -> None:
-    if device.type == "cpu":
-        return
-    if device.type != "cuda":
-        raise ValueError(f"Unsupported device type {device.type!r}; use cuda or cpu.")
-    if not torch.cuda.is_available():
-        raise RuntimeError(
-            f"Requested {device}, but torch.cuda.is_available() is False."
-        )
-    index = 0 if device.index is None else int(device.index)
-    if index < 0 or index >= torch.cuda.device_count():
-        raise RuntimeError(
-            f"Requested {device}, but only {torch.cuda.device_count()} CUDA device(s) "
-            "are visible. Check CUDA_VISIBLE_DEVICES / --device."
-        )
+def _build_weight_map(model_name: str) -> dict[str, str]:
+    """Map state-dict key -> absolute path of the safetensors shard containing it."""
     try:
-        probe = torch.zeros(1, device=torch.device("cuda", index))
-        del probe
-        torch.cuda.synchronize(index)
+        index_path = hf_hub_download(model_name, "model.safetensors.index.json")
+    except Exception:
+        index_path = None
+
+    if index_path is not None:
+        with open(index_path, encoding="utf-8") as f:
+            index = json.load(f)
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise RuntimeError(
+                f"{model_name}: model.safetensors.index.json has empty/missing weight_map."
+            )
+        base = Path(index_path).parent
+        # Ensure referenced shards are present in the hub cache.
+        shard_names = sorted(set(weight_map.values()))
+        shard_paths: dict[str, str] = {}
+        for shard_name in shard_names:
+            shard_paths[shard_name] = hf_hub_download(model_name, shard_name)
+        return {key: shard_paths[shard] for key, shard in weight_map.items()}
+
+    # Single-file checkpoint.
+    try:
+        single_path = hf_hub_download(model_name, "model.safetensors")
     except Exception as exc:
         raise RuntimeError(
-            f"Requested cuda:{index} is not usable ({exc}). "
-            "Pick a free GPU, set CUDA_VISIBLE_DEVICES, or use --device cpu."
+            f"{model_name}: could not find model.safetensors.index.json or "
+            f"model.safetensors in the Hugging Face cache/hub ({exc})."
         ) from exc
+    with safe_open(single_path, framework="pt", device="cpu") as f:
+        keys = list(f.keys())
+    if not keys:
+        raise RuntimeError(f"{model_name}: {single_path} contains no tensors.")
+    return {key: single_path for key in keys}
 
 
-def load_model_tensors(model_name: str, device: torch.device) -> ModelTensors:
+def _load_numpy_tensor(shard_path: str, key: str) -> np.ndarray:
+    # Use PyTorch backend: many checkpoints store bfloat16, which NumPy cannot decode.
+    with safe_open(shard_path, framework="pt", device="cpu") as f:
+        if key not in f.keys():
+            raise KeyError(f"Key {key!r} not in shard {shard_path}")
+        tensor = f.get_tensor(key)
+    return tensor.detach().to(dtype=torch.float32).contiguous().numpy()
+
+
+def load_first_matching_weight(
+    weight_map: dict[str, str], candidates: Sequence[str], *, label: str
+) -> tuple[np.ndarray, str]:
+    tried: list[str] = []
+    for key in candidates:
+        tried.append(key)
+        shard = weight_map.get(key)
+        if shard is None:
+            continue
+        arr = _load_numpy_tensor(shard, key)
+        logging.info("Loaded %s from key %s (shape=%s)", label, key, arr.shape)
+        return arr, key
+    present_sample = sorted(weight_map.keys())[:20]
+    raise RuntimeError(
+        f"Could not load {label}. Tried keys:\n  "
+        + "\n  ".join(tried)
+        + f"\nNone were present in the checkpoint weight map "
+        f"({len(weight_map)} keys). Sample keys: {present_sample}"
+    )
+
+
+def load_model_tensors(model_name: str, *, need_o_proj: bool) -> ModelTensors:
     if model_name not in ADAPTER_SPECS:
         raise ValueError(
             f"Unsupported --model_name={model_name!r}. "
             f"Must be one of: {list(SUPPORTED_MODEL_NAMES)}"
         )
-    _validate_torch_device(device)
     spec = ADAPTER_SPECS[model_name]
     trust_remote_code = bool(spec["trust_remote_code"])
-    load_dtype = getattr(torch, str(spec["load_dtype"]))
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -291,39 +360,25 @@ def load_model_tensors(model_name: str, device: torch.device) -> ModelTensors:
             model_name, trust_remote_code=trust_remote_code, use_fast=False
         )
 
-    # Pin the whole model to the requested device. Do NOT use device_map="auto":
-    # when VRAM is tight it disk-offloads weights onto the meta device, and
-    # subsequent .to("cpu").numpy() extraction fails with NotImplementedError.
-    target = str(device) if device.type == "cuda" else "cpu"
+    adapter = build_adapter_from_config(model_name)
     logging.info(
-        "Loading %s in %s onto %s for weight extraction (no disk offload).",
+        "Loading DLA weights for %s via selective safetensors on CPU "
+        "(need_o_proj=%s).",
         model_name,
-        spec["load_dtype"],
-        target,
+        need_o_proj,
     )
-    load_kwargs: dict = {
-        "torch_dtype": load_dtype,
-        "low_cpu_mem_usage": True,
-        "trust_remote_code": trust_remote_code,
-        "device_map": {"": target},
-    }
-    try:
-        model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
-    except torch.cuda.OutOfMemoryError as exc:
-        raise RuntimeError(
-            f"CUDA OOM while loading {model_name} onto {target}. "
-            "Free GPU memory, choose another --device, or use --device cpu if RAM allows."
-        ) from exc
-    model.eval()
+    weight_map = _build_weight_map(model_name)
+    resolved: dict[str, str] = {}
 
-    adapter = build_adapter_from_model(model_name, model)
-
-    final_norm, resolved_norm_path = _try_resolve_attr_path(
-        model,
-        tuple(spec["norm_path"]),
-        tuple(spec.get("norm_path_fallbacks", ())),
+    norm_candidates = _weight_key_candidates(
+        tuple(spec["norm_path"]), tuple(spec.get("norm_path_fallbacks", ()))
     )
-    norm_weight = _parameter_to_cpu_f32(final_norm.weight, f"{resolved_norm_path}.weight")
+    norm_weight, norm_key = load_first_matching_weight(
+        weight_map, norm_candidates, label="final_norm.weight"
+    )
+    resolved["final_norm"] = norm_key
+    adapter.norm_path = _norm_path_from_weight_key(norm_key)
+
     if adapter.rmsnorm_gain == "one_plus_weight":
         gamma = (1.0 + norm_weight).astype(np.float32, copy=False)
     elif adapter.rmsnorm_gain == "plain_weight":
@@ -331,53 +386,71 @@ def load_model_tensors(model_name: str, device: torch.device) -> ModelTensors:
     else:
         raise ValueError(f"Unknown rmsnorm_gain={adapter.rmsnorm_gain!r}")
 
-    if adapter.w_u_source == "tied_embeddings":
-        embed, resolved_embed_path = _try_resolve_attr_path(
-            model,
-            tuple(spec["embed_path"]),
-            tuple(spec.get("embed_path_fallbacks", ())),
-        )
-        # embed.weight is [V, H]; columns of W_U are token directions → transpose
-        w_u = _parameter_to_cpu_f32(
-            embed.weight, f"{resolved_embed_path}.weight"
-        ).T
-    else:
-        lm_head = _resolve_attr_path(model, tuple(spec["lm_head_path"]))
-        # lm_head.weight is [V, H]
-        w_u = _parameter_to_cpu_f32(lm_head.weight, "lm_head.weight").T
-
-    layers, resolved_layers_path = _try_resolve_attr_path(
-        model,
-        tuple(spec["layers_path"]),
-        tuple(spec.get("layers_path_fallbacks", ())),
+    embed_candidates = _weight_key_candidates(
+        tuple(spec["embed_path"]), tuple(spec.get("embed_path_fallbacks", ()))
     )
-    adapter.norm_path = resolved_norm_path
-    adapter.layers_path = resolved_layers_path
-    if len(layers) != adapter.n_layers:
+    lm_head_candidates = _weight_key_candidates(
+        tuple(spec["lm_head_path"]), tuple(spec.get("lm_head_path_fallbacks", ()))
+    )
+    if adapter.w_u_source == "tied_embeddings":
+        w_u_candidates = embed_candidates + [
+            k for k in lm_head_candidates if k not in embed_candidates
+        ]
+        w_u_label = "tied_embeddings / W_U"
+    else:
+        w_u_candidates = lm_head_candidates + [
+            k for k in embed_candidates if k not in lm_head_candidates
+        ]
+        w_u_label = "lm_head / W_U"
+    # Checkpoint stores [V, H]; DLA uses columns as token directions → transpose.
+    w_u_raw, w_u_key = load_first_matching_weight(
+        weight_map, w_u_candidates, label=w_u_label
+    )
+    if w_u_raw.ndim != 2:
+        raise ValueError(f"W_U source {w_u_key!r} has shape {w_u_raw.shape}, expected 2D.")
+    w_u = np.asarray(w_u_raw.T, dtype=np.float32)
+    resolved["w_u"] = w_u_key
+    if w_u.shape[0] != adapter.hidden_size:
         raise ValueError(
-            f"Layer count mismatch: adapter.n_layers={adapter.n_layers}, "
-            f"len(layers)={len(layers)}"
+            f"W_U hidden dim {w_u.shape[0]} != adapter.hidden_size={adapter.hidden_size} "
+            f"(key={w_u_key})."
         )
-    o_proj_weights: list[np.ndarray] = []
-    expected_in = adapter.n_query_heads * adapter.head_dim
-    for layer_idx, layer in enumerate(layers):
-        o_proj = layer.self_attn.o_proj
-        w = _parameter_to_cpu_f32(
-            o_proj.weight, f"layers[{layer_idx}].self_attn.o_proj.weight"
-        )
-        if w.ndim != 2:
-            raise ValueError(f"o_proj.weight at layer {layer_idx} has shape {w.shape}")
-        if w.shape[0] != adapter.hidden_size or w.shape[1] != expected_in:
-            raise ValueError(
-                f"o_proj.weight at layer {layer_idx} has shape {w.shape}, "
-                f"expected [{adapter.hidden_size}, {expected_in}] "
-                f"(out=hidden, in=n_query_heads*head_dim)."
-            )
-        o_proj_weights.append(np.asarray(w, dtype=np.float32))
 
-    del model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    o_proj_weights: list[np.ndarray] = []
+    if need_o_proj:
+        expected_in = adapter.n_query_heads * adapter.head_dim
+        resolved_layers_path: tuple[str, ...] | None = None
+        for layer_idx in range(adapter.n_layers):
+            candidates = _o_proj_key_candidates(
+                tuple(spec["layers_path"]),
+                tuple(spec.get("layers_path_fallbacks", ())),
+                layer_idx,
+            )
+            w, key = load_first_matching_weight(
+                weight_map, candidates, label=f"o_proj layer {layer_idx}"
+            )
+            if w.ndim != 2:
+                raise ValueError(f"o_proj.weight at layer {layer_idx} has shape {w.shape}")
+            if w.shape[0] != adapter.hidden_size or w.shape[1] != expected_in:
+                raise ValueError(
+                    f"o_proj.weight at layer {layer_idx} (key={key}) has shape {w.shape}, "
+                    f"expected [{adapter.hidden_size}, {expected_in}] "
+                    f"(out=hidden, in=n_query_heads*head_dim)."
+                )
+            o_proj_weights.append(np.asarray(w, dtype=np.float32))
+            resolved[f"o_proj_L{layer_idx}"] = key
+            prefix = _layers_prefix_from_o_proj_key(key)
+            if resolved_layers_path is None:
+                resolved_layers_path = prefix
+            elif resolved_layers_path != prefix:
+                raise ValueError(
+                    f"Inconsistent layers prefix across o_proj keys: "
+                    f"{resolved_layers_path} vs {prefix}"
+                )
+        assert resolved_layers_path is not None
+        adapter.layers_path = resolved_layers_path
+    else:
+        logging.info("Skipping o_proj weight load (coarse-only run).")
 
     return ModelTensors(
         adapter=adapter,
@@ -385,6 +458,8 @@ def load_model_tensors(model_name: str, device: torch.device) -> ModelTensors:
         gamma=gamma,
         w_u=w_u,
         o_proj_weights=o_proj_weights,
+        resolved_weight_keys=resolved,
+        weight_load_method=WEIGHT_LOAD_METHOD,
     )
 
 
@@ -933,6 +1008,11 @@ def run_dla_for_experiment(
                     f"Example {ex.example_id}: fine granularity requires concat "
                     "embeddings, but none were loaded."
                 )
+            if len(tensors.o_proj_weights) != n_layers:
+                raise ValueError(
+                    f"Fine granularity requires o_proj weights for all {n_layers} layers, "
+                    f"but only {len(tensors.o_proj_weights)} were loaded."
+                )
             concat_tok = ex.concat[pos_idx]
 
         if attn_tok.shape[0] != n_layers or mlp_tok.shape[0] != n_layers:
@@ -1455,7 +1535,10 @@ def write_readme(path: Path) -> None:
         "components to the unembedding. A component that acts by changing a *downstream* "
         "component's behaviour is invisible here.\n\n"
         "Treat these rankings as a **filter for candidate components**, not a complete "
-        "circuit analysis.\n",
+        "circuit analysis.\n\n"
+        "Model weights for this run were loaded selectively from safetensors shards on CPU "
+        "(final norm, unembedding, and o_proj only when fine granularity is requested) — "
+        "the full model is not loaded.\n",
         encoding="utf-8",
     )
 
@@ -1474,6 +1557,9 @@ def write_config_txt(
     actual_n_examples: int,
     completeness_summaries: dict,
     finished_at: str,
+    weight_load_method: str,
+    resolved_weight_keys: dict[str, str],
+    need_o_proj: bool,
 ) -> None:
     lines = [
         "Direct Logit Attribution Config",
@@ -1487,6 +1573,8 @@ def write_config_txt(
         f"output_dir={args.output_dir}",
         f"dtype=float32",
         f"device={args.device}",
+        f"weight_load_method={weight_load_method}",
+        f"need_o_proj={need_o_proj}",
         "",
         "[ModelAdapter]",
         f"model_name={adapter.model_name}",
@@ -1494,6 +1582,12 @@ def write_config_txt(
     for k, v in asdict(adapter).items():
         if k == "model_name":
             continue
+        lines.append(f"{k}={v}")
+    lines += [
+        "",
+        "[ResolvedWeightKeys]",
+    ]
+    for k, v in sorted(resolved_weight_keys.items()):
         lines.append(f"{k}={v}")
     lines += [
         "",
@@ -1569,11 +1663,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--device",
         type=str,
-        default=None,
+        default="cpu",
         help=(
-            "Device used to load the model for weight extraction "
-            "(e.g. cuda:0, cpu). DLA itself still runs on CPU float32. "
-            "The full model is pinned to this device (no disk offload)."
+            "Retained for config compatibility. Weight I/O is always selective "
+            "safetensors on CPU; DLA math is float32 NumPy on CPU. Default: cpu."
         ),
     )
     p.add_argument(
@@ -1641,13 +1734,26 @@ def main() -> None:
     logging.info("Run directory: %s", run_root)
     write_readme(run_root / "README.md")
 
-    device = torch.device(
-        args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
+    need_o_proj = "fine" in gran_list
+    require_concat = need_o_proj
+    if need_o_proj:
+        logging.info(
+            "Fine granularity requested; concat embeddings and o_proj weights are required."
+        )
+    else:
+        logging.info(
+            "Coarse-only run; concat embeddings and o_proj weights are optional/skipped."
+        )
+
+    logging.info(
+        "Loading selective safetensors weights for %s on CPU (device arg=%s).",
+        args.model_name,
+        args.device,
     )
-    logging.info("Loading model tensors for %s on %s", args.model_name, device)
-    tensors = load_model_tensors(args.model_name, device)
+    tensors = load_model_tensors(args.model_name, need_o_proj=need_o_proj)
     adapter = tensors.adapter
     logging.info("Adapter: %s", asdict(adapter))
+    logging.info("Resolved weight keys: %s", tensors.resolved_weight_keys)
 
     digit_ids = resolve_all_digit_ids(tensors.tokenizer)
     for d, (tid, form) in digit_ids.items():
@@ -1662,11 +1768,6 @@ def main() -> None:
     input_hash = file_sha256(input_h5)
     logging.info("input_h5 sha256=%s", input_hash)
 
-    require_concat = "fine" in gran_list
-    if require_concat:
-        logging.info("Fine granularity requested; concat embeddings are required.")
-    else:
-        logging.info("Coarse-only run; concat embeddings are optional.")
     examples = load_usable_examples(
         input_h5,
         expected_probability_tokens=args.expected_probability_tokens,
@@ -1740,6 +1841,9 @@ def main() -> None:
         actual_n_examples=actual_n,
         completeness_summaries=completeness_summaries,
         finished_at=finished_at,
+        weight_load_method=tensors.weight_load_method,
+        resolved_weight_keys=tensors.resolved_weight_keys,
+        need_o_proj=need_o_proj,
     )
     logging.info("Finished. Results at %s", run_root)
 
