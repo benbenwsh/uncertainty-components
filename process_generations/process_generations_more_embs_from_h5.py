@@ -580,6 +580,7 @@ def process_example(
     collect_attn_block_embeddings: bool,
     collect_mlp_block_embeddings: bool,
     collect_qkvo_embeddings: bool,
+    collect_concat_embeddings: bool,
     attention_score_tokenwise_k_mode: bool,
     extend_probability_span: bool,
 ) -> dict | None:
@@ -598,6 +599,7 @@ def process_example(
     all_k_embeddings = most_likely.get("all_k_embeddings")
     all_v_embeddings = most_likely.get("all_v_embeddings")
     all_o_embeddings = most_likely.get("all_o_embeddings")
+    all_concat_embeddings = most_likely.get("all_concat_embeddings")
 
     if response_str is None or decoded_tokens is None or all_embeddings is None:
         logging.warning(
@@ -771,6 +773,18 @@ def process_example(
                 "setting o outputs to null."
             ),
             "invalid_log": "Example %s has invalid all_o_embeddings: %s. Setting o outputs to null.",
+            "processed": None,
+        },
+        "concat": {
+            "enabled": collect_concat_embeddings,
+            "source_embeddings": all_concat_embeddings,
+            "missing_log": (
+                "Example %s missing all_concat_embeddings while --collect_concat_embeddings is enabled; "
+                "setting concat outputs to null."
+            ),
+            "invalid_log": (
+                "Example %s has invalid all_concat_embeddings: %s. Setting concat outputs to null."
+            ),
             "processed": None,
         },
     }
@@ -1153,6 +1167,15 @@ def main():
         help="Include q/k/v/o_proj outputs under each embedding field as keys 'q', 'k', 'v', 'o'.",
     )
     parser.add_argument(
+        "--collect_concat_embeddings",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Include pre-W_O concatenated attention-head activations under each embedding "
+            "field as key 'concat'."
+        ),
+    )
+    parser.add_argument(
         "--attention_score_tokenwise_k_mode",
         default=True,
         action=argparse.BooleanOptionalAction,
@@ -1326,6 +1349,7 @@ def main():
                 collect_attn_block_embeddings=args.collect_attn_block_embeddings,
                 collect_mlp_block_embeddings=args.collect_mlp_block_embeddings,
                 collect_qkvo_embeddings=args.collect_qkvo_embeddings,
+                collect_concat_embeddings=args.collect_concat_embeddings,
                 attention_score_tokenwise_k_mode=args.attention_score_tokenwise_k_mode,
                 extend_probability_span=args.extend_probability_span,
             )

@@ -316,6 +316,7 @@ class CausalLMWithEmbeddings:
         collect_attn_block_embeddings=False,
         collect_mlp_block_embeddings=False,
         collect_qkvo_embeddings=False,
+        collect_concat_embeddings=True,
     ):
         if isinstance(input_data, tuple):
             input_data = input_data[0]
@@ -355,21 +356,24 @@ class CausalLMWithEmbeddings:
         k_layer_outputs = []
         v_layer_outputs = []
         o_layer_outputs = []
+        concat_layer_inputs = []
         hook_handles = []
 
         collect_attn = collect_attn_block_embeddings
         collect_mlp = collect_mlp_block_embeddings
         collect_qkvo = collect_qkvo_embeddings
+        collect_concat = collect_concat_embeddings
 
-        if collect_attn or collect_mlp or collect_qkvo:
+        if collect_attn or collect_mlp or collect_qkvo or collect_concat:
             layers = get_transformer_layers(self.model)
             if layers is None:
                 logging.warning(
-                    "Could not locate transformer layers; skipping attn/mlp/qkvo collection."
+                    "Could not locate transformer layers; skipping attn/mlp/qkvo/concat collection."
                 )
                 collect_attn = False
                 collect_mlp = False
                 collect_qkvo = False
+                collect_concat = False
             else:
                 if collect_attn:
                     attn_layer_outputs = [[] for _ in range(len(layers))]
@@ -380,6 +384,8 @@ class CausalLMWithEmbeddings:
                     k_layer_outputs = [[] for _ in range(len(layers))]
                     v_layer_outputs = [[] for _ in range(len(layers))]
                     o_layer_outputs = [[] for _ in range(len(layers))]
+                if collect_concat:
+                    concat_layer_inputs = [[] for _ in range(len(layers))]
 
                 def _extract_hidden_tensor(module_output):
                     if isinstance(module_output, (tuple, list)):
@@ -409,6 +415,24 @@ class CausalLMWithEmbeddings:
                         tensor = _extract_hidden_tensor(module_output)
                         if tensor is not None:
                             layer_outputs[layer_idx].append(tensor.detach())
+
+                    return _hook
+
+                def _extract_pre_hook_input(module_input):
+                    if not isinstance(module_input, (tuple, list)) or len(module_input) == 0:
+                        return None
+                    tensor = module_input[0]
+                    if isinstance(tensor, (tuple, list)):
+                        if len(tensor) == 0:
+                            return None
+                        tensor = tensor[0]
+                    return tensor
+
+                def _make_concat_pre_hook(layer_idx):
+                    def _hook(_, module_input):
+                        tensor = _extract_pre_hook_input(module_input)
+                        if tensor is not None:
+                            concat_layer_inputs[layer_idx].append(tensor.detach())
 
                     return _hook
 
@@ -445,6 +469,14 @@ class CausalLMWithEmbeddings:
                             hook_handles.append(
                                 self_attn.o_proj.register_forward_hook(
                                     _make_qkvo_hook(o_layer_outputs, layer_idx)
+                                )
+                            )
+                    if collect_concat and hasattr(layer, "self_attn"):
+                        self_attn = layer.self_attn
+                        if hasattr(self_attn, "o_proj"):
+                            hook_handles.append(
+                                self_attn.o_proj.register_forward_pre_hook(
+                                    _make_concat_pre_hook(layer_idx)
                                 )
                             )
 
@@ -569,6 +601,9 @@ class CausalLMWithEmbeddings:
         all_o_embeddings = (
             _pack_layerwise_outputs(o_layer_outputs, "o_proj") if collect_qkvo else None
         )
+        all_concat_embeddings = (
+            _pack_layerwise_outputs(concat_layer_inputs, "concat") if collect_concat else None
+        )
 
         # Gemma3Config (and similar multimodal configs) may lack top-level vocab_size.
         ensure_config_vocab_size(self.model, self.tokenizer)
@@ -593,6 +628,7 @@ class CausalLMWithEmbeddings:
             all_k_embeddings,
             all_v_embeddings,
             all_o_embeddings,
+            all_concat_embeddings,
         )
         return sliced_answer, log_likelihoods, hidden_states, sliced_decoded_tokens
 
@@ -711,6 +747,7 @@ def main(args):
                         all_k_embeddings,
                         all_v_embeddings,
                         all_o_embeddings,
+                        all_concat_embeddings,
                     ),
                     decoded_tokens,
                 ) = model.predict(
@@ -718,6 +755,7 @@ def main(args):
                     collect_attn_block_embeddings=args.collect_attn_block_embeddings,
                     collect_mlp_block_embeddings=args.collect_mlp_block_embeddings,
                     collect_qkvo_embeddings=args.collect_qkvo_embeddings,
+                    collect_concat_embeddings=args.collect_concat_embeddings,
                 )
 
                 if (it % WRITE_LOG_EVERY) == 0 or it == 1:
@@ -740,6 +778,7 @@ def main(args):
                     "all_k_embeddings": all_k_embeddings,
                     "all_v_embeddings": all_v_embeddings,
                     "all_o_embeddings": all_o_embeddings,
+                    "all_concat_embeddings": all_concat_embeddings,
                     "decoded_tokens": decoded_tokens,
                 }
 
@@ -806,6 +845,15 @@ def build_parser():
         "--collect_qkvo_embeddings",
         default=False,
         action=argparse.BooleanOptionalAction,
+    )
+    parser.add_argument(
+        "--collect_concat_embeddings",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Collect concatenated attention-head activations immediately before o_proj/W_O "
+            "as all_concat_embeddings."
+        ),
     )
     parser.add_argument(
         "--load_in_8bit",
