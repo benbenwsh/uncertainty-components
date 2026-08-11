@@ -162,6 +162,19 @@ def _o_proj_key_candidates(
     return keys
 
 
+def _post_attn_norm_key_candidates(
+    layers_path: tuple[str, ...],
+    layers_fallbacks: tuple[tuple[str, ...], ...],
+    layer_idx: int,
+) -> list[str]:
+    keys: list[str] = []
+    for prefix in (layers_path, *layers_fallbacks):
+        key = ".".join(prefix) + f".{layer_idx}.post_attention_layernorm.weight"
+        if key not in keys:
+            keys.append(key)
+    return keys
+
+
 def _layers_prefix_from_o_proj_key(key: str) -> tuple[str, ...]:
     marker = ".self_attn.o_proj.weight"
     if not key.endswith(marker):
@@ -273,6 +286,8 @@ class ModelTensors:
     w_u: np.ndarray  # [H, V] columns = token directions
     o_proj_weights: list[np.ndarray]  # per layer [out, in] = [H, n_q * d]
     resolved_weight_keys: dict[str, str]
+    # Gemma fine DLA: per-layer post_attention_layernorm gain (1+w). Empty for other models.
+    post_attn_norm_gammas: list[np.ndarray] | None = None
     weight_load_method: str = WEIGHT_LOAD_METHOD
 
 
@@ -427,9 +442,15 @@ def load_model_tensors(model_name: str, *, need_o_proj: bool) -> ModelTensors:
         )
 
     o_proj_weights: list[np.ndarray] = []
+    post_attn_norm_gammas: list[np.ndarray] | None = None
+    # Gemma stores post-norm attn writes in H5; fine DLA must apply the same
+    # post_attention_layernorm (shared RMS over summed pre-norm heads).
+    need_post_attn_norm = need_o_proj and adapter.rmsnorm_gain == "one_plus_weight"
     if need_o_proj:
         expected_in = adapter.n_query_heads * adapter.head_dim
         resolved_layers_path: tuple[str, ...] | None = None
+        if need_post_attn_norm:
+            post_attn_norm_gammas = []
         for layer_idx in range(adapter.n_layers):
             candidates = _o_proj_key_candidates(
                 tuple(spec["layers_path"]),
@@ -457,6 +478,28 @@ def load_model_tensors(model_name: str, *, need_o_proj: bool) -> ModelTensors:
                     f"Inconsistent layers prefix across o_proj keys: "
                     f"{resolved_layers_path} vs {prefix}"
                 )
+            if need_post_attn_norm:
+                assert post_attn_norm_gammas is not None
+                pn_candidates = _post_attn_norm_key_candidates(
+                    tuple(spec["layers_path"]),
+                    tuple(spec.get("layers_path_fallbacks", ())),
+                    layer_idx,
+                )
+                pn_w, pn_key = load_first_matching_weight(
+                    weight_map,
+                    pn_candidates,
+                    label=f"post_attention_layernorm layer {layer_idx}",
+                )
+                if pn_w.ndim != 1 or pn_w.shape[0] != adapter.hidden_size:
+                    raise ValueError(
+                        f"post_attention_layernorm.weight at layer {layer_idx} "
+                        f"(key={pn_key}) has shape {pn_w.shape}, "
+                        f"expected [{adapter.hidden_size}]."
+                    )
+                post_attn_norm_gammas.append(
+                    (1.0 + np.asarray(pn_w, dtype=np.float32)).astype(np.float32, copy=False)
+                )
+                resolved[f"post_attn_norm_L{layer_idx}"] = pn_key
         assert resolved_layers_path is not None
         adapter.layers_path = resolved_layers_path
     else:
@@ -469,6 +512,7 @@ def load_model_tensors(model_name: str, *, need_o_proj: bool) -> ModelTensors:
         w_u=w_u,
         o_proj_weights=o_proj_weights,
         resolved_weight_keys=resolved,
+        post_attn_norm_gammas=post_attn_norm_gammas,
         weight_load_method=WEIGHT_LOAD_METHOD,
     )
 
@@ -567,6 +611,14 @@ def resolve_all_digit_ids(tokenizer) -> dict[str, tuple[int, str]]:
 def high_low_digit_sets(
     high_conf_threshold: float, low_conf_threshold: float
 ) -> tuple[set[str], set[str]]:
+    """Digit token sets for the high_vs_low contrast direction only.
+
+    Example cohort splits (``__high_conf`` / ``__low_conf``) still use the raw
+    verbalised-confidence thresholds and are unaffected by this mapping.
+
+    Digit ``\"0\"`` is never included in the low set: with the default thresholds
+    this yields high={9}, low={1} rather than low={0,1}.
+    """
     if not (0.0 <= low_conf_threshold <= 1.0 and 0.0 <= high_conf_threshold <= 1.0):
         raise ValueError("Confidence thresholds must be in [0, 1].")
     if low_conf_threshold >= high_conf_threshold:
@@ -576,13 +628,15 @@ def high_low_digit_sets(
         )
     high = {str(d) for d in range(int(high_conf_threshold * 10), 10)}
     low = {str(d) for d in range(0, int(low_conf_threshold * 10) + 1)}
+    low.discard("0")
     if not high:
         raise ValueError(
             f"high_conf_threshold={high_conf_threshold} produced empty high digit set."
         )
     if not low:
         raise ValueError(
-            f"low_conf_threshold={low_conf_threshold} produced empty low digit set."
+            f"low_conf_threshold={low_conf_threshold} produced empty low digit set "
+            "after excluding digit '0' from the high_vs_low direction."
         )
     if high & low:
         raise ValueError(
@@ -1016,8 +1070,15 @@ def decompose_heads(
     attn_reference: np.ndarray,
     atol: float,
     context: str,
+    post_attn_norm_gamma: np.ndarray | None = None,
+    post_attn_norm_eps: float | None = None,
 ) -> list[np.ndarray]:
-    """Return per-head residual writes; assert they re-sum to cached attn."""
+    """Return per-head residual writes; assert they re-sum to cached attn.
+
+    When ``post_attn_norm_gamma`` is set (Gemma), apply the shared post-attention
+    RMSNorm gain to each pre-norm head write so they match post-norm H5 attn:
+    ``write_h = head_h * gamma / rms(sum_heads)``.
+    """
     expected_width = n_query_heads * head_dim
     if concat_layer.shape[-1] != expected_width:
         raise ValueError(
@@ -1035,12 +1096,32 @@ def decompose_heads(
         write = z_h @ w_h.T  # [H]
         heads.append(write)
         total += write
+
+    if post_attn_norm_gamma is not None:
+        if post_attn_norm_eps is None:
+            raise ValueError(f"{context}: post_attn_norm_eps required with post_attn_norm_gamma")
+        if post_attn_norm_gamma.shape != total.shape:
+            raise ValueError(
+                f"{context}: post_attn_norm_gamma shape {post_attn_norm_gamma.shape} != "
+                f"hidden {total.shape}"
+            )
+        inv_rms = 1.0 / rms(total, float(post_attn_norm_eps))
+        scale = post_attn_norm_gamma.astype(np.float32) * np.float32(inv_rms)
+        heads = [h_vec * scale for h_vec in heads]
+        total = total * scale
+
     max_abs = float(np.max(np.abs(total - attn_reference.astype(np.float32))))
     if max_abs > atol:
         raise ValueError(
             f"{context}: per-head contributions do not re-sum to cached attn "
             f"(max |sum_heads - attn|={max_abs} > atol={atol}). "
-            "Check o_proj slicing / transposition."
+            "Check o_proj slicing / transposition"
+            + (
+                " / Gemma post_attention_layernorm"
+                if post_attn_norm_gamma is not None
+                else ""
+            )
+            + "."
         )
     return heads
 
@@ -1152,6 +1233,14 @@ def run_dla_for_experiment(
                     f"Fine granularity requires o_proj weights for all {n_layers} layers, "
                     f"but only {len(tensors.o_proj_weights)} were loaded."
                 )
+            if tensors.post_attn_norm_gammas is not None and len(
+                tensors.post_attn_norm_gammas
+            ) != n_layers:
+                raise ValueError(
+                    f"Fine granularity Gemma path requires post_attention_layernorm "
+                    f"gains for all {n_layers} layers, but only "
+                    f"{len(tensors.post_attn_norm_gammas)} were loaded."
+                )
             concat_tok = ex.concat[pos_idx]
 
         if attn_tok.shape[0] != n_layers or mlp_tok.shape[0] != n_layers:
@@ -1199,6 +1288,16 @@ def run_dla_for_experiment(
                     attn_reference=a,
                     atol=head_resum_atol,
                     context=f"ex={ex.example_id} layer={l}",
+                    post_attn_norm_gamma=(
+                        None
+                        if tensors.post_attn_norm_gammas is None
+                        else tensors.post_attn_norm_gammas[l]
+                    ),
+                    post_attn_norm_eps=(
+                        adapter.rms_norm_eps
+                        if tensors.post_attn_norm_gammas is not None
+                        else None
+                    ),
                 )
                 for h_vec in heads:
                     row[col] = attr_vec(h_vec, u_tilde, sigma)
@@ -1832,8 +1931,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="DLA computation dtype (forced float32 on CPU).",
     )
     p.add_argument("--expected_probability_tokens", type=int, default=5)
-    p.add_argument("--low_conf_threshold", type=float, default=0.1)
-    p.add_argument("--high_conf_threshold", type=float, default=0.9)
+    p.add_argument(
+        "--low_conf_threshold",
+        type=float,
+        default=0.1,
+        help=(
+            "Low verbalised-confidence cutoff for example cohorts, and for mapping "
+            "digits into the high_vs_low contrast direction (digit '0' is excluded "
+            "from that direction's low set)."
+        ),
+    )
+    p.add_argument(
+        "--high_conf_threshold",
+        type=float,
+        default=0.9,
+        help=(
+            "High verbalised-confidence cutoff for example cohorts, and for mapping "
+            "digits into the high_vs_low contrast direction."
+        ),
+    )
     p.add_argument(
         "--confidence_split",
         action=argparse.BooleanOptionalAction,
