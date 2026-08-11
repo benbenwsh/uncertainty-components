@@ -175,6 +175,19 @@ def _post_attn_norm_key_candidates(
     return keys
 
 
+def _post_ff_norm_key_candidates(
+    layers_path: tuple[str, ...],
+    layers_fallbacks: tuple[tuple[str, ...], ...],
+    layer_idx: int,
+) -> list[str]:
+    keys: list[str] = []
+    for prefix in (layers_path, *layers_fallbacks):
+        key = ".".join(prefix) + f".{layer_idx}.post_feedforward_layernorm.weight"
+        if key not in keys:
+            keys.append(key)
+    return keys
+
+
 def _layers_prefix_from_o_proj_key(key: str) -> tuple[str, ...]:
     marker = ".self_attn.o_proj.weight"
     if not key.endswith(marker):
@@ -286,8 +299,10 @@ class ModelTensors:
     w_u: np.ndarray  # [H, V] columns = token directions
     o_proj_weights: list[np.ndarray]  # per layer [out, in] = [H, n_q * d]
     resolved_weight_keys: dict[str, str]
-    # Gemma fine DLA: per-layer post_attention_layernorm gain (1+w). Empty for other models.
+    # Gemma: per-layer post_attention_layernorm gain (1+w). None for other models.
     post_attn_norm_gammas: list[np.ndarray] | None = None
+    # Gemma legacy H5: per-layer post_feedforward_layernorm gain (1+w).
+    post_ff_norm_gammas: list[np.ndarray] | None = None
     weight_load_method: str = WEIGHT_LOAD_METHOD
 
 
@@ -364,7 +379,12 @@ def load_first_matching_weight(
     )
 
 
-def load_model_tensors(model_name: str, *, need_o_proj: bool) -> ModelTensors:
+def load_model_tensors(
+    model_name: str,
+    *,
+    need_o_proj: bool,
+    legacy_gemma_pre_postnorm_h5: bool = False,
+) -> ModelTensors:
     if model_name not in ADAPTER_SPECS:
         raise ValueError(
             f"Unsupported --model_name={model_name!r}. "
@@ -388,9 +408,10 @@ def load_model_tensors(model_name: str, *, need_o_proj: bool) -> ModelTensors:
     adapter = build_adapter_from_config(model_name)
     logging.info(
         "Loading DLA weights for %s via selective safetensors on CPU "
-        "(need_o_proj=%s).",
+        "(need_o_proj=%s, legacy_gemma_pre_postnorm_h5=%s).",
         model_name,
         need_o_proj,
+        legacy_gemma_pre_postnorm_h5,
     )
     weight_map = _build_weight_map(model_name)
     resolved: dict[str, str] = {}
@@ -443,14 +464,49 @@ def load_model_tensors(model_name: str, *, need_o_proj: bool) -> ModelTensors:
 
     o_proj_weights: list[np.ndarray] = []
     post_attn_norm_gammas: list[np.ndarray] | None = None
-    # Gemma stores post-norm attn writes in H5; fine DLA must apply the same
-    # post_attention_layernorm (shared RMS over summed pre-norm heads).
-    need_post_attn_norm = need_o_proj and adapter.rmsnorm_gain == "one_plus_weight"
+    post_ff_norm_gammas: list[np.ndarray] | None = None
+    is_gemma = adapter.rmsnorm_gain == "one_plus_weight"
+    # New Gemma H5 stores post-norm attn; fine DLA still needs post-attn gains to
+    # map o_proj head slices onto that write. Legacy H5 stores pre-norm attn/mlp,
+    # so both post-attn and post-FF gains are required even for coarse-only.
+    need_post_attn_norm = is_gemma and (need_o_proj or legacy_gemma_pre_postnorm_h5)
+    need_post_ff_norm = is_gemma and legacy_gemma_pre_postnorm_h5
+    if need_post_attn_norm:
+        post_attn_norm_gammas = []
+    if need_post_ff_norm:
+        post_ff_norm_gammas = []
+
+    def _load_post_block_norm(
+        layer_idx: int,
+        *,
+        kind: str,
+        candidates_fn,
+        out_list: list[np.ndarray],
+        resolved_prefix: str,
+    ) -> None:
+        candidates = candidates_fn(
+            tuple(spec["layers_path"]),
+            tuple(spec.get("layers_path_fallbacks", ())),
+            layer_idx,
+        )
+        pn_w, pn_key = load_first_matching_weight(
+            weight_map,
+            candidates,
+            label=f"{kind} layer {layer_idx}",
+        )
+        if pn_w.ndim != 1 or pn_w.shape[0] != adapter.hidden_size:
+            raise ValueError(
+                f"{kind}.weight at layer {layer_idx} (key={pn_key}) has shape "
+                f"{pn_w.shape}, expected [{adapter.hidden_size}]."
+            )
+        out_list.append(
+            (1.0 + np.asarray(pn_w, dtype=np.float32)).astype(np.float32, copy=False)
+        )
+        resolved[f"{resolved_prefix}_L{layer_idx}"] = pn_key
+
     if need_o_proj:
         expected_in = adapter.n_query_heads * adapter.head_dim
         resolved_layers_path: tuple[str, ...] | None = None
-        if need_post_attn_norm:
-            post_attn_norm_gammas = []
         for layer_idx in range(adapter.n_layers):
             candidates = _o_proj_key_candidates(
                 tuple(spec["layers_path"]),
@@ -480,30 +536,46 @@ def load_model_tensors(model_name: str, *, need_o_proj: bool) -> ModelTensors:
                 )
             if need_post_attn_norm:
                 assert post_attn_norm_gammas is not None
-                pn_candidates = _post_attn_norm_key_candidates(
-                    tuple(spec["layers_path"]),
-                    tuple(spec.get("layers_path_fallbacks", ())),
+                _load_post_block_norm(
                     layer_idx,
+                    kind="post_attention_layernorm",
+                    candidates_fn=_post_attn_norm_key_candidates,
+                    out_list=post_attn_norm_gammas,
+                    resolved_prefix="post_attn_norm",
                 )
-                pn_w, pn_key = load_first_matching_weight(
-                    weight_map,
-                    pn_candidates,
-                    label=f"post_attention_layernorm layer {layer_idx}",
+            if need_post_ff_norm:
+                assert post_ff_norm_gammas is not None
+                _load_post_block_norm(
+                    layer_idx,
+                    kind="post_feedforward_layernorm",
+                    candidates_fn=_post_ff_norm_key_candidates,
+                    out_list=post_ff_norm_gammas,
+                    resolved_prefix="post_ff_norm",
                 )
-                if pn_w.ndim != 1 or pn_w.shape[0] != adapter.hidden_size:
-                    raise ValueError(
-                        f"post_attention_layernorm.weight at layer {layer_idx} "
-                        f"(key={pn_key}) has shape {pn_w.shape}, "
-                        f"expected [{adapter.hidden_size}]."
-                    )
-                post_attn_norm_gammas.append(
-                    (1.0 + np.asarray(pn_w, dtype=np.float32)).astype(np.float32, copy=False)
-                )
-                resolved[f"post_attn_norm_L{layer_idx}"] = pn_key
         assert resolved_layers_path is not None
         adapter.layers_path = resolved_layers_path
     else:
         logging.info("Skipping o_proj weight load (coarse-only run).")
+        if need_post_attn_norm or need_post_ff_norm:
+            for layer_idx in range(adapter.n_layers):
+                if need_post_attn_norm:
+                    assert post_attn_norm_gammas is not None
+                    _load_post_block_norm(
+                        layer_idx,
+                        kind="post_attention_layernorm",
+                        candidates_fn=_post_attn_norm_key_candidates,
+                        out_list=post_attn_norm_gammas,
+                        resolved_prefix="post_attn_norm",
+                    )
+                if need_post_ff_norm:
+                    assert post_ff_norm_gammas is not None
+                    _load_post_block_norm(
+                        layer_idx,
+                        kind="post_feedforward_layernorm",
+                        candidates_fn=_post_ff_norm_key_candidates,
+                        out_list=post_ff_norm_gammas,
+                        resolved_prefix="post_ff_norm",
+                    )
 
     return ModelTensors(
         adapter=adapter,
@@ -513,6 +585,7 @@ def load_model_tensors(model_name: str, *, need_o_proj: bool) -> ModelTensors:
         o_proj_weights=o_proj_weights,
         resolved_weight_keys=resolved,
         post_attn_norm_gammas=post_attn_norm_gammas,
+        post_ff_norm_gammas=post_ff_norm_gammas,
         weight_load_method=WEIGHT_LOAD_METHOD,
     )
 
@@ -1061,6 +1134,31 @@ def attr_vec(v: np.ndarray, u_tilde: np.ndarray, sigma: float) -> float:
     return float(np.dot(v.astype(np.float32), u_tilde) / sigma)
 
 
+def apply_gemma_rmsnorm(
+    x: np.ndarray, gamma: np.ndarray, eps: float
+) -> np.ndarray:
+    """Gemma-style RMSNorm: x * gamma / rms(x) with gamma = (1+w)."""
+    x32 = x.astype(np.float32, copy=False)
+    g32 = gamma.astype(np.float32, copy=False)
+    if g32.shape != x32.shape:
+        raise ValueError(
+            f"apply_gemma_rmsnorm: gamma shape {g32.shape} != x shape {x32.shape}"
+        )
+    return x32 * g32 * np.float32(1.0 / rms(x32, eps))
+
+
+def _scale_heads_with_shared_post_attn_norm(
+    heads: list[np.ndarray],
+    gamma: np.ndarray,
+    eps: float,
+) -> list[np.ndarray]:
+    total = np.zeros_like(heads[0], dtype=np.float32)
+    for h_vec in heads:
+        total += h_vec
+    scale = gamma.astype(np.float32) * np.float32(1.0 / rms(total, eps))
+    return [h_vec * scale for h_vec in heads]
+
+
 def decompose_heads(
     concat_layer: np.ndarray,
     o_proj_weight: np.ndarray,
@@ -1192,6 +1290,7 @@ def run_dla_for_experiment(
     tensors: ModelTensors,
     head_resum_atol: float,
     completeness_atol: float,
+    legacy_gemma_pre_postnorm_h5: bool = False,
 ) -> ExperimentResult:
     adapter = tensors.adapter
     u_tilde = (tensors.gamma * contrast.u).astype(np.float32)
@@ -1204,6 +1303,23 @@ def run_dla_for_experiment(
         labels = component_labels_fine(n_layers, n_heads)
     else:
         raise ValueError(f"Unknown granularity {granularity!r}")
+
+    if legacy_gemma_pre_postnorm_h5:
+        if tensors.post_attn_norm_gammas is None or tensors.post_ff_norm_gammas is None:
+            raise ValueError(
+                "legacy_gemma_pre_postnorm_h5 requires post_attn_norm_gammas and "
+                "post_ff_norm_gammas to be loaded."
+            )
+        if len(tensors.post_attn_norm_gammas) != n_layers:
+            raise ValueError(
+                f"Expected {n_layers} post_attn_norm_gammas, got "
+                f"{len(tensors.post_attn_norm_gammas)}."
+            )
+        if len(tensors.post_ff_norm_gammas) != n_layers:
+            raise ValueError(
+                f"Expected {n_layers} post_ff_norm_gammas, got "
+                f"{len(tensors.post_ff_norm_gammas)}."
+            )
 
     n_ex = len(examples)
     n_comp = len(labels)
@@ -1271,6 +1387,15 @@ def run_dla_for_experiment(
             for l in range(n_layers):
                 a = attn_tok[l].astype(np.float32)
                 m = mlp_tok[l].astype(np.float32)
+                if legacy_gemma_pre_postnorm_h5:
+                    assert tensors.post_attn_norm_gammas is not None
+                    assert tensors.post_ff_norm_gammas is not None
+                    a = apply_gemma_rmsnorm(
+                        a, tensors.post_attn_norm_gammas[l], adapter.rms_norm_eps
+                    )
+                    m = apply_gemma_rmsnorm(
+                        m, tensors.post_ff_norm_gammas[l], adapter.rms_norm_eps
+                    )
                 row[2 * l] = attr_vec(a, u_tilde, sigma)
                 row[2 * l + 1] = attr_vec(m, u_tilde, sigma)
                 block_sum += a + m
@@ -1280,31 +1405,60 @@ def run_dla_for_experiment(
             for l in range(n_layers):
                 a = attn_tok[l].astype(np.float32)
                 m = mlp_tok[l].astype(np.float32)
-                heads = decompose_heads(
-                    concat_tok[l].astype(np.float32),
-                    tensors.o_proj_weights[l],
-                    n_query_heads=n_heads,
-                    head_dim=adapter.head_dim,
-                    attn_reference=a,
-                    atol=head_resum_atol,
-                    context=f"ex={ex.example_id} layer={l}",
-                    post_attn_norm_gamma=(
-                        None
-                        if tensors.post_attn_norm_gammas is None
-                        else tensors.post_attn_norm_gammas[l]
-                    ),
-                    post_attn_norm_eps=(
-                        adapter.rms_norm_eps
-                        if tensors.post_attn_norm_gammas is not None
-                        else None
-                    ),
-                )
+                if legacy_gemma_pre_postnorm_h5:
+                    # H5 attn is pre-norm: re-sum check without post-attn norm, then
+                    # scale heads to residual writes; MLP needs post-FF norm.
+                    heads = decompose_heads(
+                        concat_tok[l].astype(np.float32),
+                        tensors.o_proj_weights[l],
+                        n_query_heads=n_heads,
+                        head_dim=adapter.head_dim,
+                        attn_reference=a,
+                        atol=head_resum_atol,
+                        context=f"ex={ex.example_id} layer={l}",
+                        post_attn_norm_gamma=None,
+                        post_attn_norm_eps=None,
+                    )
+                    assert tensors.post_attn_norm_gammas is not None
+                    assert tensors.post_ff_norm_gammas is not None
+                    heads = _scale_heads_with_shared_post_attn_norm(
+                        heads,
+                        tensors.post_attn_norm_gammas[l],
+                        adapter.rms_norm_eps,
+                    )
+                    m = apply_gemma_rmsnorm(
+                        m, tensors.post_ff_norm_gammas[l], adapter.rms_norm_eps
+                    )
+                    a_write = np.zeros_like(a, dtype=np.float32)
+                    for h_vec in heads:
+                        a_write += h_vec
+                else:
+                    heads = decompose_heads(
+                        concat_tok[l].astype(np.float32),
+                        tensors.o_proj_weights[l],
+                        n_query_heads=n_heads,
+                        head_dim=adapter.head_dim,
+                        attn_reference=a,
+                        atol=head_resum_atol,
+                        context=f"ex={ex.example_id} layer={l}",
+                        post_attn_norm_gamma=(
+                            None
+                            if tensors.post_attn_norm_gammas is None
+                            else tensors.post_attn_norm_gammas[l]
+                        ),
+                        post_attn_norm_eps=(
+                            adapter.rms_norm_eps
+                            if tensors.post_attn_norm_gammas is not None
+                            else None
+                        ),
+                    )
+                    a_write = a
                 for h_vec in heads:
                     row[col] = attr_vec(h_vec, u_tilde, sigma)
                     col += 1
                 row[col] = attr_vec(m, u_tilde, sigma)
                 col += 1
-                block_sum += a + m
+                block_sum += a_write + m
 
         h_embed = h - block_sum
         embed_attr = attr_vec(h_embed, u_tilde, sigma)
@@ -1846,6 +2000,7 @@ def write_config_txt(
         f"high_conf_threshold={args.high_conf_threshold}",
         f"low_conf_threshold={args.low_conf_threshold}",
         f"confidence_split={args.confidence_split}",
+        f"legacy_gemma_pre_postnorm_h5={args.legacy_gemma_pre_postnorm_h5}",
         f"granularity={args.granularity}",
         f"n_individual_examples={args.n_individual_examples}",
         f"max_examples_for_mean={args.max_examples_for_mean}",
@@ -1957,6 +2112,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Also run DLA on high- and low-confidence example cohorts (default: True).",
     )
     p.add_argument(
+        "--legacy_gemma_pre_postnorm_h5",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Gemma-only: treat H5 attn/mlp as pre–post-block-norm activations and "
+            "apply post_attention_layernorm / post_feedforward_layernorm before DLA "
+            "(default: False; use for older Gemma H5s)."
+        ),
+    )
+    p.add_argument(
         "--granularity",
         nargs="+",
         choices=["coarse", "fine"],
@@ -1997,6 +2162,12 @@ def main() -> None:
         raise ValueError("--n_individual_examples must be >= 1")
     if args.bar_chart_top_k < 1:
         raise ValueError("--bar_chart_top_k must be >= 1")
+    if args.legacy_gemma_pre_postnorm_h5 and args.model_name != "google/gemma-3-12b-it":
+        raise ValueError(
+            "--legacy_gemma_pre_postnorm_h5 is only valid with "
+            "--model_name=google/gemma-3-12b-it "
+            f"(got {args.model_name!r})."
+        )
 
     # Deduplicate granularity while preserving order
     gran_list: list[str] = []
@@ -2024,13 +2195,21 @@ def main() -> None:
         logging.info(
             "Coarse-only run; concat embeddings and o_proj weights are optional/skipped."
         )
+    if args.legacy_gemma_pre_postnorm_h5:
+        logging.info(
+            "Legacy Gemma H5 mode: applying post-attn/post-FF norms to cached attn/mlp."
+        )
 
     logging.info(
         "Loading selective safetensors weights for %s on CPU (device arg=%s).",
         args.model_name,
         args.device,
     )
-    tensors = load_model_tensors(args.model_name, need_o_proj=need_o_proj)
+    tensors = load_model_tensors(
+        args.model_name,
+        need_o_proj=need_o_proj,
+        legacy_gemma_pre_postnorm_h5=args.legacy_gemma_pre_postnorm_h5,
+    )
     adapter = tensors.adapter
     logging.info("Adapter: %s", asdict(adapter))
     logging.info("Resolved weight keys: %s", tensors.resolved_weight_keys)
@@ -2150,6 +2329,7 @@ def main() -> None:
                     tensors=tensors,
                     head_resum_atol=HEAD_RESUM_ATOL,
                     completeness_atol=COMPLETENESS_ATOL,
+                    legacy_gemma_pre_postnorm_h5=args.legacy_gemma_pre_postnorm_h5,
                 )
                 summary = write_experiment_outputs(
                     run_root / exp_name,
