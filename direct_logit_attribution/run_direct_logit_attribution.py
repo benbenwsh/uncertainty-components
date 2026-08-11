@@ -468,29 +468,79 @@ def load_model_tensors(model_name: str, *, need_o_proj: bool) -> ModelTensors:
 # ---------------------------------------------------------------------------
 
 
+def _token_decode(tokenizer, token_id: int) -> str:
+    return tokenizer.decode([int(token_id)], clean_up_tokenization_spaces=False)
+
+
+def _is_digit_token_decode(decoded: str, digit: str) -> bool:
+    """True if decoded token content is exactly the digit, optionally with surrounding whitespace."""
+    if decoded == digit:
+        return True
+    # Some tokenizers surface a leading space / SentencePiece underscore as whitespace.
+    return decoded.strip() == digit and digit in decoded
+
+
 def resolve_single_digit_token_id(tokenizer, digit: str) -> tuple[int, str]:
-    """Resolve a digit character to a single tokenizer ID. Tries bare and spaced forms."""
+    """Resolve a digit character to a single tokenizer ID.
+
+    Prefer a true single-token encode. For tokenizers like Mistral that encode
+    ``\"0\"`` as ``[leading_empty_or_space, digit]``, accept the digit piece when
+    decoding that id yields exactly the digit (fail loudly if ambiguous).
+    """
     if len(digit) != 1 or digit not in "0123456789":
         raise ValueError(f"Expected a single digit char, got {digit!r}")
-    candidates = [digit, f" {digit}", f"\n{digit}", f"\t{digit}"]
+
     errors: list[str] = []
+    candidates = [digit, f" {digit}", f"\n{digit}", f"\t{digit}"]
+
+    # 1) Exact single-token encode of a common string form.
     for cand in candidates:
         ids = tokenizer.encode(cand, add_special_tokens=False)
         if len(ids) == 1:
-            return int(ids[0]), cand
-        errors.append(f"{cand!r} -> {ids} ({len(ids)} tokens)")
-    # Also try convert_tokens_to_ids on common BPE forms
-    for tok in (digit, f"▁{digit}", f"Ġ{digit}"):
+            decoded = _token_decode(tokenizer, ids[0])
+            if _is_digit_token_decode(decoded, digit):
+                return int(ids[0]), cand
+            errors.append(
+                f"{cand!r} -> single id {ids[0]} but decode={decoded!r} is not digit {digit!r}"
+            )
+        else:
+            errors.append(f"{cand!r} -> {ids} ({len(ids)} tokens)")
+
+    # 2) convert_tokens_to_ids on bare / SentencePiece / GPT-2 forms.
+    #    Do NOT require encode(decode(id)) to be length-1: Mistral's encode(\"0\")
+    #    always prepends an empty leading piece even when id 28734 alone is \"0\".
+    unk = getattr(tokenizer, "unk_token_id", None)
+    for tok in (digit, f"▁{digit}", f"Ġ{digit}", f" {digit}"):
         tid = tokenizer.convert_tokens_to_ids(tok)
-        unk = getattr(tokenizer, "unk_token_id", None)
-        if tid is None or (unk is not None and tid == unk):
+        if tid is None or (unk is not None and int(tid) == int(unk)):
             continue
-        # Verify round-trip is a single token
-        decoded = tokenizer.decode([tid], clean_up_tokenization_spaces=False)
-        re_ids = tokenizer.encode(decoded, add_special_tokens=False)
-        if len(re_ids) == 1 and int(re_ids[0]) == int(tid):
+        decoded = _token_decode(tokenizer, int(tid))
+        if _is_digit_token_decode(decoded, digit):
             return int(tid), tok
-        errors.append(f"token {tok!r} id={tid} failed single-token round-trip")
+        errors.append(f"token {tok!r} id={tid} decode={decoded!r} is not digit {digit!r}")
+
+    # 3) Multi-token encode where a unique piece decodes to the digit and all
+    #    other pieces decode to empty/whitespace only (Mistral: [\"\", \"0\"]).
+    for cand in candidates:
+        ids = tokenizer.encode(cand, add_special_tokens=False)
+        if len(ids) < 2:
+            continue
+        digit_ids: list[int] = []
+        other_ok = True
+        parts: list[str] = []
+        for tid in ids:
+            decoded = _token_decode(tokenizer, tid)
+            parts.append(decoded)
+            if _is_digit_token_decode(decoded, digit):
+                digit_ids.append(int(tid))
+            elif decoded.strip() != "":
+                other_ok = False
+        if other_ok and len(set(digit_ids)) == 1:
+            return digit_ids[0], f"{cand}#piece"
+        errors.append(
+            f"{cand!r} multi-token pieces={parts!r} digit_ids={digit_ids} other_ok={other_ok}"
+        )
+
     raise ValueError(
         f"Could not resolve digit {digit!r} to a single tokenizer token. Tried:\n  "
         + "\n  ".join(errors)
