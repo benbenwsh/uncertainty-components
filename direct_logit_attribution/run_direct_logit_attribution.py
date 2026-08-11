@@ -99,21 +99,31 @@ ADAPTER_SPECS: dict[str, dict] = {
         "config_root": None,
     },
     "google/gemma-3-12b-it": {
+        # HF Gemma3 multimodal checkpoints store text weights under
+        # language_model.model.* (no leading "model." prefix in safetensors).
         "rmsnorm_gain": "one_plus_weight",
-        "norm_path": ("model", "language_model", "norm"),
+        "norm_path": ("language_model", "model", "norm"),
         "norm_path_fallbacks": (
+            ("language_model", "norm"),
             ("model", "language_model", "model", "norm"),
+            ("model", "language_model", "norm"),
         ),
-        "layers_path": ("model", "language_model", "layers"),
+        "layers_path": ("language_model", "model", "layers"),
         "layers_path_fallbacks": (
+            ("language_model", "layers"),
             ("model", "language_model", "model", "layers"),
+            ("model", "language_model", "layers"),
         ),
-        "embed_path": ("model", "language_model", "embed_tokens"),
+        "embed_path": ("language_model", "model", "embed_tokens"),
         "embed_path_fallbacks": (
+            ("language_model", "embed_tokens"),
             ("model", "language_model", "model", "embed_tokens"),
+            ("model", "language_model", "embed_tokens"),
         ),
+        # Gemma3-IT ties embeddings; no standalone lm_head in the shard map.
         "lm_head_path": ("lm_head",),
         "lm_head_path_fallbacks": (
+            ("language_model", "lm_head"),
             ("model", "lm_head"),
             ("model", "language_model", "lm_head"),
         ),
@@ -796,23 +806,88 @@ def _open_h5_readonly(path: str):
         return h5py.File(path, "r")
 
 
-def load_usable_examples(
+def _try_parse_example_data(
+    *,
+    ex_id: str,
+    r0: h5py.Group,
+    expected_span: int,
+    expected_probability_tokens: int,
+    require_concat: bool,
+) -> ExampleData | None:
+    conf = _read_verbalised_confidence_scalar(r0)
+    if conf is None:
+        return None
+    res = _get_list_embeddings(r0, "res")
+    attn = _get_list_embeddings(r0, "attn")
+    mlp = _get_list_embeddings(r0, "mlp")
+    concat = _get_list_embeddings(r0, "concat")
+    if res is None or attn is None or mlp is None:
+        return None
+    if require_concat and concat is None:
+        return None
+    span_len = len(res)
+    if span_len != expected_span:
+        raise ValueError(
+            f"Example {ex_id}: embeddings_probability span length is {span_len}, "
+            f"but expected exactly expected_probability_tokens+2="
+            f"{expected_probability_tokens}+2={expected_span}. "
+            "Input H5 must have been generated with extend_probability_span."
+        )
+    if len(attn) != span_len or len(mlp) != span_len:
+        raise ValueError(
+            f"Example {ex_id}: mismatched span lengths "
+            f"res={len(res)} attn={len(attn)} mlp={len(mlp)}"
+        )
+    if concat is not None and len(concat) != span_len:
+        raise ValueError(
+            f"Example {ex_id}: mismatched concat span length "
+            f"res={span_len} concat={len(concat)}"
+        )
+    return ExampleData(
+        example_id=str(ex_id),
+        verbalised_confidence=float(conf),
+        response=_read_response_string(r0),
+        res=res,
+        attn=attn,
+        mlp=mlp,
+        concat=concat,
+    )
+
+
+@dataclass
+class ExampleCohorts:
+    all: list[ExampleData]
+    high: list[ExampleData]
+    low: list[ExampleData]
+
+
+def load_usable_example_cohorts(
     input_h5: str,
     *,
     expected_probability_tokens: int,
     max_examples: int,
     require_concat: bool,
-) -> list[ExampleData]:
+    high_conf_threshold: float,
+    low_conf_threshold: float,
+    fill_confidence_splits: bool,
+) -> ExampleCohorts:
+    """Scan H5 once; fill all/high/low cohorts with independent caps at ``max_examples``."""
     expected_span = expected_probability_tokens + 2
-    usable: list[ExampleData] = []
+    examples_all: list[ExampleData] = []
+    examples_high: list[ExampleData] = []
+    examples_low: list[ExampleData] = []
     with _open_h5_readonly(input_h5) as f:
         examples = f.get("examples")
         if examples is None or not isinstance(examples, h5py.Group):
             raise ValueError(f"{input_h5} has no 'examples' group.")
         example_ids = sorted(examples.keys(), key=lambda x: (len(x), x))
         for ex_id in tqdm(example_ids, desc="Scanning H5 examples"):
-            if len(usable) >= max_examples:
+            all_full = len(examples_all) >= max_examples
+            high_full = (not fill_confidence_splits) or len(examples_high) >= max_examples
+            low_full = (not fill_confidence_splits) or len(examples_low) >= max_examples
+            if all_full and high_full and low_full:
                 break
+
             ex_group = examples[ex_id]
             if not isinstance(ex_group, h5py.Group):
                 continue
@@ -822,50 +897,64 @@ def load_usable_examples(
             conf = _read_verbalised_confidence_scalar(r0)
             if conf is None:
                 continue
-            res = _get_list_embeddings(r0, "res")
-            attn = _get_list_embeddings(r0, "attn")
-            mlp = _get_list_embeddings(r0, "mlp")
-            concat = _get_list_embeddings(r0, "concat")
-            if res is None or attn is None or mlp is None:
-                continue
-            if require_concat and concat is None:
-                continue
-            span_len = len(res)
-            if span_len != expected_span:
-                raise ValueError(
-                    f"Example {ex_id}: embeddings_probability span length is {span_len}, "
-                    f"but expected exactly expected_probability_tokens+2="
-                    f"{expected_probability_tokens}+2={expected_span}. "
-                    "Input H5 must have been generated with extend_probability_span."
-                )
-            if len(attn) != span_len or len(mlp) != span_len:
-                raise ValueError(
-                    f"Example {ex_id}: mismatched span lengths "
-                    f"res={len(res)} attn={len(attn)} mlp={len(mlp)}"
-                )
-            if concat is not None and len(concat) != span_len:
-                raise ValueError(
-                    f"Example {ex_id}: mismatched concat span length "
-                    f"res={span_len} concat={len(concat)}"
-                )
-            usable.append(
-                ExampleData(
-                    example_id=str(ex_id),
-                    verbalised_confidence=float(conf),
-                    response=_read_response_string(r0),
-                    res=res,
-                    attn=attn,
-                    mlp=mlp,
-                    concat=concat,
-                )
+            want_all = not all_full
+            want_high = (
+                fill_confidence_splits
+                and (not high_full)
+                and float(conf) >= high_conf_threshold
             )
-    if not usable:
+            want_low = (
+                fill_confidence_splits
+                and (not low_full)
+                and float(conf) <= low_conf_threshold
+            )
+            if not (want_all or want_high or want_low):
+                continue
+
+            parsed = _try_parse_example_data(
+                ex_id=str(ex_id),
+                r0=r0,
+                expected_span=expected_span,
+                expected_probability_tokens=expected_probability_tokens,
+                require_concat=require_concat,
+            )
+            if parsed is None:
+                continue
+
+            if want_all:
+                examples_all.append(parsed)
+            if want_high:
+                examples_high.append(parsed)
+            if want_low:
+                examples_low.append(parsed)
+
+    if not examples_all:
         required = "res/attn/mlp/concat" if require_concat else "res/attn/mlp"
         raise ValueError(
             f"No usable examples found in {input_h5} with required "
             f"{required} probability embeddings."
         )
-    return usable
+    return ExampleCohorts(all=examples_all, high=examples_high, low=examples_low)
+
+
+def load_usable_examples(
+    input_h5: str,
+    *,
+    expected_probability_tokens: int,
+    max_examples: int,
+    require_concat: bool,
+) -> list[ExampleData]:
+    """Backward-compatible wrapper: return the all-examples cohort only."""
+    cohorts = load_usable_example_cohorts(
+        input_h5,
+        expected_probability_tokens=expected_probability_tokens,
+        max_examples=max_examples,
+        require_concat=require_concat,
+        high_conf_threshold=1.0,
+        low_conf_threshold=0.0,
+        fill_confidence_splits=False,
+    )
+    return cohorts.all
 
 
 # ---------------------------------------------------------------------------
@@ -1588,7 +1677,12 @@ def write_readme(path: Path) -> None:
         "circuit analysis.\n\n"
         "Model weights for this run were loaded selectively from safetensors shards on CPU "
         "(final norm, unembedding, and o_proj only when fine granularity is requested) — "
-        "the full model is not loaded.\n",
+        "the full model is not loaded.\n\n"
+        "When `--confidence_split` is enabled (default), each "
+        "`{position}__{contrast}__{granularity}` experiment is also run on high- and "
+        "low-confidence example cohorts "
+        "(`...__high_conf/`, `...__low_conf/`), capped independently at "
+        "`--max_examples_for_mean`. Disable with `--no-confidence_split`.\n",
         encoding="utf-8",
     )
 
@@ -1603,8 +1697,12 @@ def write_config_txt(
     digit_ids: dict[str, tuple[int, str]],
     high_digits: set[str],
     low_digits: set[str],
-    individual_ids: Sequence[str],
-    actual_n_examples: int,
+    individual_ids_all: Sequence[str],
+    individual_ids_high: Sequence[str] | None,
+    individual_ids_low: Sequence[str] | None,
+    actual_n_examples_all: int,
+    actual_n_examples_high: int | None,
+    actual_n_examples_low: int | None,
     completeness_summaries: dict,
     finished_at: str,
     weight_load_method: str,
@@ -1648,6 +1746,7 @@ def write_config_txt(
         f"expected_probability_tokens={args.expected_probability_tokens}",
         f"high_conf_threshold={args.high_conf_threshold}",
         f"low_conf_threshold={args.low_conf_threshold}",
+        f"confidence_split={args.confidence_split}",
         f"granularity={args.granularity}",
         f"n_individual_examples={args.n_individual_examples}",
         f"max_examples_for_mean={args.max_examples_for_mean}",
@@ -1665,8 +1764,14 @@ def write_config_txt(
     lines += [
         "",
         "[Examples]",
-        f"actual_n_examples={actual_n_examples}",
-        f"individual_example_ids={list(individual_ids)}",
+        f"actual_n_examples_all={actual_n_examples_all}",
+        f"individual_example_ids_all={list(individual_ids_all)}",
+        f"actual_n_examples_high={actual_n_examples_high}",
+        f"individual_example_ids_high="
+        f"{None if individual_ids_high is None else list(individual_ids_high)}",
+        f"actual_n_examples_low={actual_n_examples_low}",
+        f"individual_example_ids_low="
+        f"{None if individual_ids_low is None else list(individual_ids_low)}",
         "",
         "[Numerics]",
         f"annotation_rounding_dp={ANNOTATION_ROUNDING_DP}",
@@ -1730,6 +1835,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--low_conf_threshold", type=float, default=0.1)
     p.add_argument("--high_conf_threshold", type=float, default=0.9)
     p.add_argument(
+        "--confidence_split",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also run DLA on high- and low-confidence example cohorts (default: True).",
+    )
+    p.add_argument(
         "--granularity",
         nargs="+",
         choices=["coarse", "fine"],
@@ -1737,12 +1848,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="One or both of: coarse fine. concat embeddings are required only when fine is included.",
     )
     p.add_argument("--n_individual_examples", type=int, default=3)
-    p.add_argument("--max_examples_for_mean", type=int, default=200)
+    p.add_argument("--max_examples_for_mean", type=int, default=100)
     p.add_argument(
         "--individual_example_indices",
         type=str,
         default=None,
-        help="Optional comma-separated H5 example IDs for per-example outputs.",
+        help=(
+            "Optional comma-separated H5 example IDs for per-example outputs "
+            "(all-examples cohort only; high/low cohorts always use first-N)."
+        ),
     )
     p.add_argument("--bar_chart_top_k", type=int, default=25)
     p.add_argument(
@@ -1818,64 +1932,143 @@ def main() -> None:
     input_hash = file_sha256(input_h5)
     logging.info("input_h5 sha256=%s", input_hash)
 
-    examples = load_usable_examples(
+    cohorts = load_usable_example_cohorts(
         input_h5,
         expected_probability_tokens=args.expected_probability_tokens,
         max_examples=args.max_examples_for_mean,
         require_concat=require_concat,
+        high_conf_threshold=args.high_conf_threshold,
+        low_conf_threshold=args.low_conf_threshold,
+        fill_confidence_splits=args.confidence_split,
     )
-    actual_n = len(examples)
-    logging.info("Using %d examples (cap=%d)", actual_n, args.max_examples_for_mean)
+    examples_all = cohorts.all
+    actual_n_all = len(examples_all)
+    logging.info(
+        "Using %d all-examples (cap=%d)", actual_n_all, args.max_examples_for_mean
+    )
+    if actual_n_all <= args.n_individual_examples:
+        raise ValueError(
+            f"All-examples cohort has {actual_n_all} usable examples, which must be "
+            f"strictly greater than --n_individual_examples "
+            f"({args.n_individual_examples})."
+        )
 
     requested_ids = parse_individual_ids(args.individual_example_indices)
-    usable_ids = [ex.example_id for ex in examples]
-    usable_set = set(usable_ids)
+    usable_ids_all = [ex.example_id for ex in examples_all]
+    usable_set_all = set(usable_ids_all)
     if requested_ids is not None:
-        missing = [i for i in requested_ids if i not in usable_set]
+        missing = [i for i in requested_ids if i not in usable_set_all]
         if missing:
             raise ValueError(
-                f"--individual_example_indices not in usable example set: {missing}"
+                f"--individual_example_indices not in usable all-examples set: {missing}"
             )
-        if len(requested_ids) > actual_n:
-            raise ValueError("More individual IDs requested than usable examples.")
-        individual_ids = requested_ids
+        if len(requested_ids) > actual_n_all:
+            raise ValueError("More individual IDs requested than usable all-examples.")
+        individual_ids_all = requested_ids
     else:
-        individual_ids = usable_ids[: args.n_individual_examples]
-    logging.info("Individual example IDs: %s", individual_ids)
+        individual_ids_all = usable_ids_all[: args.n_individual_examples]
+    logging.info("Individual example IDs (all): %s", individual_ids_all)
 
-    examples_by_id = {ex.example_id: ex for ex in examples}
+    individual_ids_high: list[str] | None = None
+    individual_ids_low: list[str] | None = None
+    actual_n_high: int | None = None
+    actual_n_low: int | None = None
+    if args.confidence_split:
+        if not cohorts.high:
+            raise ValueError(
+                "confidence_split enabled but high-confidence cohort is empty "
+                f"(verbalised_confidence >= {args.high_conf_threshold})."
+            )
+        if not cohorts.low:
+            raise ValueError(
+                "confidence_split enabled but low-confidence cohort is empty "
+                f"(verbalised_confidence <= {args.low_conf_threshold})."
+            )
+        actual_n_high = len(cohorts.high)
+        actual_n_low = len(cohorts.low)
+        if actual_n_high <= args.n_individual_examples:
+            raise ValueError(
+                f"High-confidence cohort has {actual_n_high} usable examples, which "
+                f"must be strictly greater than --n_individual_examples "
+                f"({args.n_individual_examples})."
+            )
+        if actual_n_low <= args.n_individual_examples:
+            raise ValueError(
+                f"Low-confidence cohort has {actual_n_low} usable examples, which "
+                f"must be strictly greater than --n_individual_examples "
+                f"({args.n_individual_examples})."
+            )
+        individual_ids_high = [ex.example_id for ex in cohorts.high][
+            : args.n_individual_examples
+        ]
+        individual_ids_low = [ex.example_id for ex in cohorts.low][
+            : args.n_individual_examples
+        ]
+        logging.info(
+            "Using %d high-conf / %d low-conf examples (cap=%d each)",
+            actual_n_high,
+            actual_n_low,
+            args.max_examples_for_mean,
+        )
+        logging.info("Individual example IDs (high_conf): %s", individual_ids_high)
+        logging.info("Individual example IDs (low_conf): %s", individual_ids_low)
+
     contrasts = build_contrasts(tensors.w_u, digit_ids, high_digits, low_digits)
 
+    def _run_cohort_experiments(
+        *,
+        cohort_examples: list[ExampleData],
+        individual_ids: Sequence[str],
+        dirname_suffix: str,
+    ) -> None:
+        examples_by_id = {ex.example_id: ex for ex in cohort_examples}
+        for contrast in contrasts:
+            for gran in gran_list:
+                base = f"{contrast.position}__{contrast.name}__{gran}"
+                exp_name = f"{base}{dirname_suffix}"
+                logging.info("Running experiment %s", exp_name)
+                result = run_dla_for_experiment(
+                    cohort_examples,
+                    contrast=contrast,
+                    granularity=gran,
+                    tensors=tensors,
+                    head_resum_atol=HEAD_RESUM_ATOL,
+                    completeness_atol=COMPLETENESS_ATOL,
+                )
+                summary = write_experiment_outputs(
+                    run_root / exp_name,
+                    result,
+                    examples_by_id,
+                    individual_ids,
+                    n_layers=adapter.n_layers,
+                    n_heads=adapter.n_query_heads,
+                    bar_chart_top_k=args.bar_chart_top_k,
+                    rounding_dp=ANNOTATION_ROUNDING_DP,
+                )
+                completeness_summaries[exp_name] = summary
+                logging.info(
+                    "%s done: max completeness |residual|=%.3g",
+                    exp_name,
+                    summary["completeness_residual_max_abs"],
+                )
+
     completeness_summaries: dict = {}
-    for contrast in contrasts:
-        for gran in gran_list:
-            exp_name = f"{contrast.position}__{contrast.name}__{gran}"
-            logging.info("Running experiment %s", exp_name)
-            result = run_dla_for_experiment(
-                examples,
-                contrast=contrast,
-                granularity=gran,
-                tensors=tensors,
-                head_resum_atol=HEAD_RESUM_ATOL,
-                completeness_atol=COMPLETENESS_ATOL,
-            )
-            exp_dir = run_root / exp_name
-            summary = write_experiment_outputs(
-                exp_dir,
-                result,
-                examples_by_id,
-                individual_ids,
-                n_layers=adapter.n_layers,
-                n_heads=adapter.n_query_heads,
-                bar_chart_top_k=args.bar_chart_top_k,
-                rounding_dp=ANNOTATION_ROUNDING_DP,
-            )
-            completeness_summaries[exp_name] = summary
-            logging.info(
-                "%s done: max completeness |residual|=%.3g",
-                exp_name,
-                summary["completeness_residual_max_abs"],
-            )
+    _run_cohort_experiments(
+        cohort_examples=examples_all,
+        individual_ids=individual_ids_all,
+        dirname_suffix="",
+    )
+    if args.confidence_split:
+        _run_cohort_experiments(
+            cohort_examples=cohorts.high,
+            individual_ids=individual_ids_high or [],
+            dirname_suffix="__high_conf",
+        )
+        _run_cohort_experiments(
+            cohort_examples=cohorts.low,
+            individual_ids=individual_ids_low or [],
+            dirname_suffix="__low_conf",
+        )
 
     finished_at = datetime.now().isoformat(timespec="seconds")
     write_config_txt(
@@ -1887,8 +2080,12 @@ def main() -> None:
         digit_ids=digit_ids,
         high_digits=high_digits,
         low_digits=low_digits,
-        individual_ids=individual_ids,
-        actual_n_examples=actual_n,
+        individual_ids_all=individual_ids_all,
+        individual_ids_high=individual_ids_high,
+        individual_ids_low=individual_ids_low,
+        actual_n_examples_all=actual_n_all,
+        actual_n_examples_high=actual_n_high,
+        actual_n_examples_low=actual_n_low,
         completeness_summaries=completeness_summaries,
         finished_at=finished_at,
         weight_load_method=tensors.weight_load_method,
