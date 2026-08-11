@@ -27,7 +27,7 @@ if _SEM_UNC_ROOT not in sys.path:
 
 CONFIDENCE_PROMPT = "Provide your best guess and the probability that it is correct (0.0 to 1.0) for the following question. Give ONLY the guess and probability, no other words or explanation. For example:\n\nGuess: <most likely guess, as short as possible; not a complete sentence, just the guess!>\n Probability: <the probability between 0.0 and 1.0 that your guess is correct, without any extra commentary whatsoever; just the probability!>\n\nThe question is: "
 
-STOP_SEQUENCES = ["\n\n\n\n", "\n\n\n"]
+STOP_SEQUENCES = ["\n\n\n\n", "\n\n\n", "<end_of_turn>"]
 WRITE_LOG_EVERY = 1
 TRAIN_RATIO = 0.9
 

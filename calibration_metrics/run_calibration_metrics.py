@@ -47,7 +47,7 @@ CONFIDENCE_PROMPT = (
     "The question is: "
 )
 
-STOP_SEQUENCES = ["\n\n\n\n", "\n\n\n"]
+STOP_SEQUENCES = ["\n\n\n\n", "\n\n\n", "<end_of_turn>"]
 WRITE_LOG_EVERY = 1
 TEMPERATURE = 0.0
 

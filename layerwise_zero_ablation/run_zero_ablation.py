@@ -47,7 +47,7 @@ BRIEF_PROMPTS = {
     "chat": "Answer the following question in a single brief but complete sentence.\n",
 }
 
-STOP_SEQUENCES = ["\n\n\n\n", "\n\n\n"]
+STOP_SEQUENCES = ["\n\n\n\n", "\n\n\n", "<end_of_turn>"]
 
 # ---------------------------------------------------------------------------
 # Probability span (match process_generations_verbalised_embeddings_h5.py)
@@ -482,6 +482,22 @@ def _generation_contains_stop(decoded_completion: str) -> bool:
     return any(s in decoded_completion for s in STOP_SEQUENCES)
 
 
+def _eos_token_ids(tokenizer) -> set[int]:
+    """Normalize tokenizer EOS ids (scalar or list) into a set of ints."""
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_id is None:
+        return set()
+    if isinstance(eos_id, (list, tuple, set)):
+        return {int(x) for x in eos_id if x is not None}
+    return {int(eos_id)}
+
+
+def _should_stop_generation(decoded_completion: str, next_id: int, tokenizer) -> bool:
+    if _generation_contains_stop(decoded_completion):
+        return True
+    return next_id in _eos_token_ids(tokenizer)
+
+
 def _strip_stop_suffixes(text: str) -> str:
     stop_at = len(text)
     for stop in STOP_SEQUENCES:
@@ -524,7 +540,6 @@ def greedy_generate_ablated(
     generated: List[int] = []
     decoded_tokens: List[str] = []
 
-    eos_id = model.tokenizer.eos_token_id
 
     def seq_len() -> int:
         return int(tokens.shape[1])
@@ -583,10 +598,7 @@ def greedy_generate_ablated(
             next_t = torch.tensor([[next_id]], device=tokens.device, dtype=tokens.dtype)
             tokens = torch.cat([tokens, next_t], dim=-1)
 
-            completion_str = "".join(decoded_tokens)
-            if _generation_contains_stop(completion_str):
-                break
-            if eos_id is not None and next_id == eos_id:
+            if _should_stop_generation("".join(decoded_tokens), next_id, model.tokenizer):
                 break
 
     response = _postprocess_response_from_full_decode(model, tokens, local_prompt)

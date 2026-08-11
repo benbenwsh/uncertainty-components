@@ -41,9 +41,9 @@ from mass_mean_probe.run_mass_mean_probe import (
     _as_layer_hidden,
     _dedupe_preserve_order,
     _format_alpha,
-    _generation_contains_stop,
     _is_expected_or_plus_two,
     _postprocess_response_from_full_decode,
+    _should_stop_generation,
     construct_fewshot_prompt_from_indices,
     encode_example_id,
     load_examples_h5,
@@ -641,7 +641,6 @@ def greedy_generate(
 ) -> Tuple[str, List[str]]:
     tokens = model.to_tokens(local_prompt)
     decoded_tokens: List[str] = []
-    eos_id = model.tokenizer.eos_token_id
     with torch.inference_mode():
         for _ in range(max_new_tokens):
             out = model.run_with_hooks(tokens, return_type="logits", fwd_hooks=fwd_hooks or [])
@@ -650,10 +649,7 @@ def greedy_generate(
             decoded_tokens.append(model.tokenizer.decode([next_id], skip_special_tokens=False))
             next_t = torch.tensor([[next_id]], device=tokens.device, dtype=tokens.dtype)
             tokens = torch.cat([tokens, next_t], dim=-1)
-            completion_str = "".join(decoded_tokens)
-            if _generation_contains_stop(completion_str):
-                break
-            if eos_id is not None and next_id == eos_id:
+            if _should_stop_generation("".join(decoded_tokens), next_id, model.tokenizer):
                 break
     return _postprocess_response_from_full_decode(model, tokens, local_prompt), decoded_tokens
 
@@ -675,7 +671,6 @@ def greedy_generate_direction_perturbed_headwise(
     tokens = model.to_tokens(local_prompt)
     prompt_len = int(tokens.shape[1])
     decoded_tokens: List[str] = []
-    eos_id = model.tokenizer.eos_token_id
 
     def _decoded_tokens_provider() -> List[str]:
         return decoded_tokens
@@ -700,10 +695,7 @@ def greedy_generate_direction_perturbed_headwise(
             decoded_tokens.append(model.tokenizer.decode([next_id], skip_special_tokens=False))
             next_t = torch.tensor([[next_id]], device=tokens.device, dtype=tokens.dtype)
             tokens = torch.cat([tokens, next_t], dim=-1)
-            completion_str = "".join(decoded_tokens)
-            if _generation_contains_stop(completion_str):
-                break
-            if eos_id is not None and next_id == eos_id:
+            if _should_stop_generation("".join(decoded_tokens), next_id, model.tokenizer):
                 break
     return _postprocess_response_from_full_decode(model, tokens, local_prompt), decoded_tokens
 
@@ -725,7 +717,6 @@ def greedy_generate_direction_perturbed_concat(
     tokens = model.to_tokens(local_prompt)
     prompt_len = int(tokens.shape[1])
     decoded_tokens: List[str] = []
-    eos_id = model.tokenizer.eos_token_id
 
     def _decoded_tokens_provider() -> List[str]:
         return decoded_tokens
@@ -750,10 +741,7 @@ def greedy_generate_direction_perturbed_concat(
             decoded_tokens.append(model.tokenizer.decode([next_id], skip_special_tokens=False))
             next_t = torch.tensor([[next_id]], device=tokens.device, dtype=tokens.dtype)
             tokens = torch.cat([tokens, next_t], dim=-1)
-            completion_str = "".join(decoded_tokens)
-            if _generation_contains_stop(completion_str):
-                break
-            if eos_id is not None and next_id == eos_id:
+            if _should_stop_generation("".join(decoded_tokens), next_id, model.tokenizer):
                 break
     return _postprocess_response_from_full_decode(model, tokens, local_prompt), decoded_tokens
 
