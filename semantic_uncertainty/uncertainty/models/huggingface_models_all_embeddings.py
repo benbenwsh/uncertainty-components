@@ -383,11 +383,45 @@ class HuggingfaceModelAllEmbeddings(BaseModel):
                         concat_layer_inputs[layer_idx].append(tensor.detach())
                     return _hook
 
+                # Gemma3: cache post-norm residual writes when present; else self_attn/mlp.
+                # Gate on post_feedforward_layernorm so Mistral's pre-MLP
+                # post_attention_layernorm is not mistaken for a post-attn write norm.
+                use_gemma_post_norm_hooks = any(
+                    hasattr(layer, "post_feedforward_layernorm") for layer in layers
+                )
+                if collect_attn or collect_mlp:
+                    logging.info(
+                        "Attn/mlp cache hook targets: %s",
+                        (
+                            "post_attention_layernorm / post_feedforward_layernorm"
+                            if use_gemma_post_norm_hooks
+                            else "self_attn / mlp"
+                        ),
+                    )
+
                 for layer_idx, layer in enumerate(layers):
-                    if collect_attn and hasattr(layer, "self_attn"):
-                        hook_handles.append(layer.self_attn.register_forward_hook(_make_attn_hook(layer_idx)))
-                    if collect_mlp and hasattr(layer, "mlp"):
-                        hook_handles.append(layer.mlp.register_forward_hook(_make_mlp_hook(layer_idx)))
+                    if collect_attn:
+                        if use_gemma_post_norm_hooks and hasattr(
+                            layer, "post_attention_layernorm"
+                        ):
+                            attn_mod = layer.post_attention_layernorm
+                        else:
+                            attn_mod = getattr(layer, "self_attn", None)
+                        if attn_mod is not None:
+                            hook_handles.append(
+                                attn_mod.register_forward_hook(_make_attn_hook(layer_idx))
+                            )
+                    if collect_mlp:
+                        if use_gemma_post_norm_hooks and hasattr(
+                            layer, "post_feedforward_layernorm"
+                        ):
+                            mlp_mod = layer.post_feedforward_layernorm
+                        else:
+                            mlp_mod = getattr(layer, "mlp", None)
+                        if mlp_mod is not None:
+                            hook_handles.append(
+                                mlp_mod.register_forward_hook(_make_mlp_hook(layer_idx))
+                            )
                     if collect_qkvo and hasattr(layer, "self_attn"):
                         self_attn = layer.self_attn
                         if hasattr(self_attn, "q_proj"):

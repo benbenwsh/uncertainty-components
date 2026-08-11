@@ -64,6 +64,9 @@ PROBABILITY_PREFIX_TOKENS = [
     [" "],
 ]
 
+# For Gemma2/3 under TransformerLens, hook_attn_out / hook_mlp_out already fire
+# *after* ln1_post / ln2_post (post-norm residual writes). Gemma H5 attn/mlp means
+# must be regenerated with post-norm caching in ans_gen so substitutions match.
 SUBBLOCK_TO_HOOK = {
     "attn": "hook_attn_out",
     "mlp": "hook_mlp_out",
