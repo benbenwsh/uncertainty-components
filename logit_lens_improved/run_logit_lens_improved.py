@@ -84,6 +84,12 @@ LOGIT_LENS_SPECS: dict[str, dict] = {
             ("model", "language_model", "model", "norm"),
             ("model", "language_model", "norm"),
         ),
+        "layers_path": ("language_model", "model", "layers"),
+        "layers_path_fallbacks": (
+            ("language_model", "layers"),
+            ("model", "language_model", "model", "layers"),
+            ("model", "language_model", "layers"),
+        ),
         "embed_path": ("language_model", "model", "embed_tokens"),
         "embed_path_fallbacks": (
             ("language_model", "embed_tokens"),
@@ -179,6 +185,32 @@ def _bias_key_candidates(weight_keys: Sequence[str]) -> list[str]:
         bias_key = weight_key[: -len(".weight")] + ".bias"
         if bias_key not in keys:
             keys.append(bias_key)
+    return keys
+
+
+def _post_attn_norm_key_candidates(
+    layers_path: tuple[str, ...],
+    layers_fallbacks: tuple[tuple[str, ...], ...],
+    layer_idx: int,
+) -> list[str]:
+    keys: list[str] = []
+    for prefix in (layers_path, *layers_fallbacks):
+        key = ".".join(prefix) + f".{layer_idx}.post_attention_layernorm.weight"
+        if key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _post_ff_norm_key_candidates(
+    layers_path: tuple[str, ...],
+    layers_fallbacks: tuple[tuple[str, ...], ...],
+    layer_idx: int,
+) -> list[str]:
+    keys: list[str] = []
+    for prefix in (layers_path, *layers_fallbacks):
+        key = ".".join(prefix) + f".{layer_idx}.post_feedforward_layernorm.weight"
+        if key not in keys:
+            keys.append(key)
     return keys
 
 
@@ -374,6 +406,103 @@ def _load_unembedding(model_name_or_path: str, device: torch.device) -> tuple:
     softcap = float(softcap) if softcap is not None else None
 
     return tokenizer, unembed_w, unembed_b, norm_weight, norm_eps, softcap
+
+
+def _load_gemma_post_block_norm_gammas(
+    model_name_or_path: str,
+) -> tuple[list[np.ndarray], list[np.ndarray], float]:
+    """Load per-layer post-attn / post-FF gains (1+w) for legacy Gemma H5 subblock lensing."""
+    if model_name_or_path not in LOGIT_LENS_SPECS:
+        raise ValueError(f"Unsupported model_name_or_path={model_name_or_path!r}.")
+    spec = LOGIT_LENS_SPECS[model_name_or_path]
+    if "layers_path" not in spec:
+        raise ValueError(
+            f"{model_name_or_path} has no layers_path; cannot load post-block norms."
+        )
+    trust_remote_code = bool(spec["trust_remote_code"])
+    config = AutoConfig.from_pretrained(
+        model_name_or_path, trust_remote_code=trust_remote_code
+    )
+    cfg = _select_text_config(config, config_root=spec.get("config_root"))
+    n_layers = int(getattr(cfg, "num_hidden_layers"))
+    hidden_size = int(getattr(cfg, "hidden_size"))
+    eps = float(spec["rms_norm_eps"])
+    weight_map = _build_weight_map(model_name_or_path)
+    layers_path = tuple(spec["layers_path"])
+    layers_fallbacks = tuple(spec.get("layers_path_fallbacks", ()))
+
+    post_attn: list[np.ndarray] = []
+    post_ff: list[np.ndarray] = []
+    for layer_idx in range(n_layers):
+        attn_w, _ = _load_first_matching_weight(
+            weight_map,
+            _post_attn_norm_key_candidates(layers_path, layers_fallbacks, layer_idx),
+            label=f"post_attention_layernorm layer {layer_idx}",
+        )
+        ff_w, _ = _load_first_matching_weight(
+            weight_map,
+            _post_ff_norm_key_candidates(layers_path, layers_fallbacks, layer_idx),
+            label=f"post_feedforward_layernorm layer {layer_idx}",
+        )
+        if attn_w.ndim != 1 or int(attn_w.shape[0]) != hidden_size:
+            raise ValueError(
+                f"post_attention_layernorm layer {layer_idx} shape {tuple(attn_w.shape)} "
+                f"!= [{hidden_size}]"
+            )
+        if ff_w.ndim != 1 or int(ff_w.shape[0]) != hidden_size:
+            raise ValueError(
+                f"post_feedforward_layernorm layer {layer_idx} shape {tuple(ff_w.shape)} "
+                f"!= [{hidden_size}]"
+            )
+        post_attn.append((1.0 + attn_w.numpy()).astype(np.float32, copy=False))
+        post_ff.append((1.0 + ff_w.numpy()).astype(np.float32, copy=False))
+    return post_attn, post_ff, eps
+
+
+def _apply_gemma_rmsnorm_np(
+    x: np.ndarray, gamma: np.ndarray, eps: float
+) -> np.ndarray:
+    """Gemma-style RMSNorm on a 1D vector: x * gamma / rms(x)."""
+    x32 = np.asarray(x, dtype=np.float32)
+    g32 = np.asarray(gamma, dtype=np.float32)
+    if x32.shape != g32.shape:
+        raise ValueError(
+            f"_apply_gemma_rmsnorm_np: x shape {x32.shape} != gamma shape {g32.shape}"
+        )
+    inv_rms = 1.0 / float(np.sqrt(np.mean(np.square(x32)) + eps))
+    return (x32 * g32 * np.float32(inv_rms)).astype(np.float32, copy=False)
+
+
+def _apply_legacy_gemma_post_block_norms(
+    arr: np.ndarray,
+    *,
+    component: str,
+    post_attn_gammas: Sequence[np.ndarray],
+    post_ff_gammas: Sequence[np.ndarray],
+    eps: float,
+) -> np.ndarray:
+    """Apply per-layer post-attn (attn) or post-FF (mlp) norms to [n_layers, H]."""
+    out = np.asarray(arr, dtype=np.float32).copy()
+    if out.ndim != 2:
+        raise ValueError(f"Expected [n_layers, H], got shape {out.shape}")
+    n_layers = out.shape[0]
+    if component == "attn":
+        if len(post_attn_gammas) != n_layers:
+            raise ValueError(
+                f"post_attn_gammas length {len(post_attn_gammas)} != n_layers {n_layers}"
+            )
+        for l in range(n_layers):
+            out[l] = _apply_gemma_rmsnorm_np(out[l], post_attn_gammas[l], eps)
+    elif component == "mlp":
+        if len(post_ff_gammas) != n_layers:
+            raise ValueError(
+                f"post_ff_gammas length {len(post_ff_gammas)} != n_layers {n_layers}"
+            )
+        for l in range(n_layers):
+            out[l] = _apply_gemma_rmsnorm_np(out[l], post_ff_gammas[l], eps)
+    else:
+        raise ValueError(f"Legacy post-block norms only apply to attn/mlp, got {component!r}")
+    return out
 
 
 def _apply_rmsnorm(hidden: torch.Tensor, norm_weight: torch.Tensor, norm_eps: float) -> torch.Tensor:
@@ -761,10 +890,13 @@ def _write_config_txt(
         f"include_embeddings: {','.join(args.include_embeddings)}",
         f"expected_guess_tokens: {args.expected_guess_tokens}",
         f"expected_probability_tokens: {args.expected_probability_tokens}",
+        f"extend_probability_span: {args.extend_probability_span}",
+        f"probability_token_budget: {args.expected_probability_tokens + (2 if args.extend_probability_span else 0)}",
         f"split_confidence_groups: {args.split_confidence_groups}",
         f"low_conf_threshold: {args.low_conf_threshold}",
         f"high_conf_threshold: {args.high_conf_threshold}",
         f"subblock_mode: {args.subblock_mode}",
+        f"legacy_gemma_pre_postnorm_h5: {args.legacy_gemma_pre_postnorm_h5}",
         f"Valid examples: {valid_examples}",
         f"Total token positions: {len(token_labels)}",
         f"Token labels: {', '.join(token_labels)}",
@@ -827,7 +959,25 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Embedding families to include. Default: all.",
     )
     parser.add_argument("--expected_guess_tokens", type=int, default=5)
-    parser.add_argument("--expected_probability_tokens", type=int, default=7)
+    parser.add_argument(
+        "--expected_probability_tokens",
+        type=int,
+        default=7,
+        help=(
+            "Expected Probability: span length as written at process time "
+            "(before optional +2 from --extend_probability_span)."
+        ),
+    )
+    parser.add_argument(
+        "--extend_probability_span",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If true, treat stored probability span length as "
+            "expected_probability_tokens + 2 (for H5s processed with "
+            "--extend_probability_span)."
+        ),
+    )
     parser.add_argument(
         "--split_confidence_groups",
         action=argparse.BooleanOptionalAction,
@@ -839,6 +989,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--subblock_mode",
         action=argparse.BooleanOptionalAction,
         default=False,
+    )
+    parser.add_argument(
+        "--legacy_gemma_pre_postnorm_h5",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Gemma subblock-only: treat H5 attn/mlp as pre–post-block-norm and apply "
+            "post_attention_layernorm / post_feedforward_layernorm before logit lens "
+            "(default: False; use for older Gemma H5s)."
+        ),
     )
     return parser
 
@@ -854,6 +1014,18 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--expected_probability_tokens must be >= 1")
     if args.low_conf_threshold > args.high_conf_threshold:
         raise ValueError("--low_conf_threshold must be <= --high_conf_threshold")
+    if args.legacy_gemma_pre_postnorm_h5:
+        if args.model_name_or_path != "google/gemma-3-12b-it":
+            raise ValueError(
+                "--legacy_gemma_pre_postnorm_h5 is only valid with "
+                "--model_name_or_path=google/gemma-3-12b-it "
+                f"(got {args.model_name_or_path!r})."
+            )
+        if not args.subblock_mode:
+            raise ValueError(
+                "--legacy_gemma_pre_postnorm_h5 requires --subblock_mode "
+                "(residual embeddings do not need post-block norms)."
+            )
 
 
 def _iter_example_ids(examples_group: h5py.Group) -> Iterable[str]:
@@ -868,10 +1040,13 @@ def main():
     _validate_args(args)
 
     include_set = set(args.include_embeddings)
+    probability_token_budget = args.expected_probability_tokens + (
+        2 if args.extend_probability_span else 0
+    )
     token_labels = _canonical_token_labels(
         include_set,
         expected_guess_tokens=args.expected_guess_tokens,
-        expected_probability_tokens=args.expected_probability_tokens,
+        expected_probability_tokens=probability_token_budget,
     )
     if not token_labels:
         raise ValueError("No token positions selected; include at least one embedding family.")
@@ -880,6 +1055,17 @@ def main():
     tokenizer, w_u, b_u, norm_weight, norm_eps, softcap = _load_unembedding(
         args.model_name_or_path, device
     )
+
+    post_attn_gammas: list[np.ndarray] | None = None
+    post_ff_gammas: list[np.ndarray] | None = None
+    legacy_block_norm_eps: float | None = None
+    if args.legacy_gemma_pre_postnorm_h5:
+        print(
+            "Legacy Gemma H5 mode: applying post-attn/post-FF norms to cached attn/mlp."
+        )
+        post_attn_gammas, post_ff_gammas, legacy_block_norm_eps = (
+            _load_gemma_post_block_norm_gammas(args.model_name_or_path)
+        )
 
     results_dir = Path(args.output_dir) if args.output_dir else SCRIPT_DIR / "results"
     run_base = _get_run_base_dir(results_dir)
@@ -941,7 +1127,7 @@ def main():
                         include_set,
                         comp,
                         expected_guess_tokens=args.expected_guess_tokens,
-                        expected_probability_tokens=args.expected_probability_tokens,
+                        expected_probability_tokens=probability_token_budget,
                         subblock_mode=args.subblock_mode,
                     )
                     row_labels = [label for label, _ in rows]
@@ -977,6 +1163,17 @@ def main():
                 ex_store[comp] = {}
                 for label, arr in example_rows_by_component[comp]:
                     arr_f32 = np.asarray(arr, dtype=np.float32)
+                    if args.legacy_gemma_pre_postnorm_h5:
+                        assert post_attn_gammas is not None
+                        assert post_ff_gammas is not None
+                        assert legacy_block_norm_eps is not None
+                        arr_f32 = _apply_legacy_gemma_post_block_norms(
+                            arr_f32,
+                            component=comp,
+                            post_attn_gammas=post_attn_gammas,
+                            post_ff_gammas=post_ff_gammas,
+                            eps=legacy_block_norm_eps,
+                        )
                     ex_store[comp][label] = arr_f32
                     sums_overall.setdefault(comp, {}).setdefault(
                         label,
