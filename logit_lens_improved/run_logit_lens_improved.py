@@ -12,8 +12,9 @@ Supports:
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import datetime
+import json
 from pathlib import Path
 import time
 
@@ -21,7 +22,9 @@ import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from huggingface_hub import hf_hub_download
+from safetensors import safe_open
+from transformers import AutoConfig, AutoTokenizer
 from tqdm import tqdm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -34,6 +37,7 @@ EMBEDDING_CHOICES = (
     "mean_prob_val",
 )
 EPS = 1e-12
+WEIGHT_LOAD_METHOD = "safetensors_selective_cpu"
 
 SUPPORTED_MODEL_NAMES = (
     "mistralai/Mistral-7B-Instruct-v0.1",
@@ -41,32 +45,61 @@ SUPPORTED_MODEL_NAMES = (
     "Qwen/Qwen2.5-32B-Instruct",
 )
 
-# Hardcoded logit-lens extraction specs (no runtime path discovery).
+# Hardcoded logit-lens extraction specs (selective safetensors; no full-model load).
 LOGIT_LENS_SPECS: dict[str, dict] = {
     "mistralai/Mistral-7B-Instruct-v0.1": {
         "trust_remote_code": False,
-        "load_dtype": torch.float32,
+        "rmsnorm_gain": "plain_weight",
         "norm_path": ("model", "norm"),
+        "norm_path_fallbacks": (),
+        "embed_path": ("model", "embed_tokens"),
+        "embed_path_fallbacks": (),
         "lm_head_path": ("lm_head",),
+        "lm_head_path_fallbacks": (),
         "softcap": None,
         "rms_norm_eps": 1e-5,
+        "config_root": None,
     },
     "Qwen/Qwen2.5-32B-Instruct": {
         "trust_remote_code": True,
-        "load_dtype": torch.bfloat16,
+        "rmsnorm_gain": "plain_weight",
         "norm_path": ("model", "norm"),
+        "norm_path_fallbacks": (),
+        "embed_path": ("model", "embed_tokens"),
+        "embed_path_fallbacks": (),
         "lm_head_path": ("lm_head",),
+        "lm_head_path_fallbacks": (),
         "softcap": None,
         "rms_norm_eps": 1e-6,
+        "config_root": None,
     },
     "google/gemma-3-12b-it": {
         "trust_remote_code": True,
-        "load_dtype": torch.bfloat16,
-        # Gemma3ForConditionalGeneration: text RMSNorm under model.language_model
-        "norm_path": ("model", "language_model", "norm"),
+        # HF Gemma3 multimodal checkpoints store text weights under
+        # language_model.model.* (no leading "model." prefix in safetensors).
+        "rmsnorm_gain": "one_plus_weight",
+        "norm_path": ("language_model", "model", "norm"),
+        "norm_path_fallbacks": (
+            ("language_model", "norm"),
+            ("model", "language_model", "model", "norm"),
+            ("model", "language_model", "norm"),
+        ),
+        "embed_path": ("language_model", "model", "embed_tokens"),
+        "embed_path_fallbacks": (
+            ("language_model", "embed_tokens"),
+            ("model", "language_model", "model", "embed_tokens"),
+            ("model", "language_model", "embed_tokens"),
+        ),
+        # Gemma3-IT ties embeddings; no standalone lm_head in the shard map.
         "lm_head_path": ("lm_head",),
+        "lm_head_path_fallbacks": (
+            ("language_model", "lm_head"),
+            ("model", "lm_head"),
+            ("model", "language_model", "lm_head"),
+        ),
         "softcap": None,
         "rms_norm_eps": 1e-6,
+        "config_root": "text_config",
     },
 }
 
@@ -74,7 +107,7 @@ LOGIT_LENS_SPECS: dict[str, dict] = {
 def _resolve_device(device_arg: str | None) -> torch.device:
     if device_arg:
         return torch.device(device_arg)
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device("cpu")
 
 
 def _tensor_to_numpy(obj):
@@ -123,15 +156,136 @@ def _h5_list_length(group_obj: h5py.Group) -> int:
     return int(group_obj.attrs.get("__len__", len(group_obj.keys())))
 
 
-def _resolve_attr_path(root, path: tuple[str, ...]):
-    obj = root
-    for attr in path:
-        obj = getattr(obj, attr)
-    return obj
+def _path_to_weight_key(path: tuple[str, ...]) -> str:
+    return ".".join(path) + ".weight"
+
+
+def _weight_key_candidates(
+    primary: tuple[str, ...], fallbacks: tuple[tuple[str, ...], ...] = ()
+) -> list[str]:
+    keys = [_path_to_weight_key(primary)]
+    for fb in fallbacks:
+        key = _path_to_weight_key(fb)
+        if key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _bias_key_candidates(weight_keys: Sequence[str]) -> list[str]:
+    keys: list[str] = []
+    for weight_key in weight_keys:
+        if not weight_key.endswith(".weight"):
+            continue
+        bias_key = weight_key[: -len(".weight")] + ".bias"
+        if bias_key not in keys:
+            keys.append(bias_key)
+    return keys
+
+
+def _select_text_config(config, *, config_root: str | None):
+    if config_root == "text_config":
+        text_cfg = getattr(config, "text_config", None)
+        if text_cfg is None:
+            raise ValueError(
+                f"config_root=text_config but {type(config).__name__} has no text_config."
+            )
+        return text_cfg
+    return config
+
+
+def _tie_word_embeddings(model_name_or_path: str, spec: dict) -> bool:
+    trust_remote_code = bool(spec["trust_remote_code"])
+    config = AutoConfig.from_pretrained(
+        model_name_or_path, trust_remote_code=trust_remote_code
+    )
+    cfg = _select_text_config(config, config_root=spec.get("config_root"))
+    tie = bool(getattr(config, "tie_word_embeddings", False))
+    if not tie:
+        tie = bool(getattr(cfg, "tie_word_embeddings", False))
+    return tie
+
+
+def _build_weight_map(model_name: str) -> dict[str, str]:
+    """Map state-dict key -> absolute path of the safetensors shard containing it.
+
+    Only downloads the index (or single-file checkpoint). Individual shards are
+    resolved lazily via ``_resolve_shard_path`` when a key is actually loaded.
+    """
+    try:
+        index_path = hf_hub_download(model_name, "model.safetensors.index.json")
+    except Exception:
+        index_path = None
+
+    if index_path is not None:
+        with open(index_path, encoding="utf-8") as f:
+            index = json.load(f)
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise RuntimeError(
+                f"{model_name}: model.safetensors.index.json has empty/missing weight_map."
+            )
+        # Store "model_name::shard_name" so we can download only needed shards later.
+        return {
+            key: f"{model_name}::{shard}"
+            for key, shard in weight_map.items()
+        }
+
+    # Single-file checkpoint.
+    try:
+        single_path = hf_hub_download(model_name, "model.safetensors")
+    except Exception as exc:
+        raise RuntimeError(
+            f"{model_name}: could not find model.safetensors.index.json or "
+            f"model.safetensors in the Hugging Face cache/hub ({exc})."
+        ) from exc
+    with safe_open(single_path, framework="pt", device="cpu") as f:
+        keys = list(f.keys())
+    if not keys:
+        raise RuntimeError(f"{model_name}: {single_path} contains no tensors.")
+    return {key: single_path for key in keys}
+
+
+def _resolve_shard_path(shard_ref: str) -> str:
+    """Resolve a weight-map entry to a local safetensors path."""
+    if "::" in shard_ref:
+        model_name, shard_name = shard_ref.split("::", 1)
+        return hf_hub_download(model_name, shard_name)
+    return shard_ref
+
+
+def _load_torch_tensor(shard_path: str, key: str) -> torch.Tensor:
+    # Use PyTorch backend: many checkpoints store bfloat16, which NumPy cannot decode.
+    resolved = _resolve_shard_path(shard_path)
+    with safe_open(resolved, framework="pt", device="cpu") as f:
+        if key not in f.keys():
+            raise KeyError(f"Key {key!r} not in shard {resolved}")
+        tensor = f.get_tensor(key)
+    return tensor.detach().to(dtype=torch.float32).contiguous()
+
+
+def _load_first_matching_weight(
+    weight_map: dict[str, str], candidates: Sequence[str], *, label: str
+) -> tuple[torch.Tensor, str]:
+    tried: list[str] = []
+    for key in candidates:
+        tried.append(key)
+        shard = weight_map.get(key)
+        if shard is None:
+            continue
+        tensor = _load_torch_tensor(shard, key)
+        print(f"Loaded {label} from key {key} (shape={tuple(tensor.shape)})")
+        return tensor, key
+    present_sample = sorted(weight_map.keys())[:20]
+    raise RuntimeError(
+        f"Could not load {label}. Tried keys:\n  "
+        + "\n  ".join(tried)
+        + f"\nNone were present in the checkpoint weight map "
+        f"({len(weight_map)} keys). Sample keys: {present_sample}"
+    )
 
 
 def _load_unembedding(model_name_or_path: str, device: torch.device) -> tuple:
-    """Load tokenizer + final RMSNorm / lm_head tensors using hardcoded model specs."""
+    """Load tokenizer + final RMSNorm / W_U via selective safetensors on CPU."""
     if model_name_or_path not in LOGIT_LENS_SPECS:
         raise ValueError(
             f"Unsupported model_name_or_path={model_name_or_path!r}. "
@@ -139,7 +293,6 @@ def _load_unembedding(model_name_or_path: str, device: torch.device) -> tuple:
         )
     spec = LOGIT_LENS_SPECS[model_name_or_path]
     trust_remote_code = bool(spec["trust_remote_code"])
-    load_dtype = spec["load_dtype"]
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -156,47 +309,69 @@ def _load_unembedding(model_name_or_path: str, device: torch.device) -> tuple:
             use_fast=False,
         )
 
-    # Large models (Qwen-32B / Gemma-3-12B): load in bf16; extract lens tensors as fp32.
-    # Mistral-7B: load fully in fp32 on the target device.
-    load_kwargs: dict = {
-        "torch_dtype": load_dtype,
-        "low_cpu_mem_usage": True,
-        "trust_remote_code": trust_remote_code,
-    }
-    if load_dtype != torch.float32:
-        load_kwargs["device_map"] = "auto"
-    model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **load_kwargs)
-    if load_dtype == torch.float32:
-        model.to(device)
-    model.eval()
+    print(
+        f"Loading logit-lens weights for {model_name_or_path} via "
+        f"{WEIGHT_LOAD_METHOD} (device={device})."
+    )
+    weight_map = _build_weight_map(model_name_or_path)
 
-    final_norm = _resolve_attr_path(model, tuple(spec["norm_path"]))
-    lm_head = _resolve_attr_path(model, tuple(spec["lm_head_path"]))
-    if not hasattr(final_norm, "weight"):
+    norm_candidates = _weight_key_candidates(
+        tuple(spec["norm_path"]), tuple(spec.get("norm_path_fallbacks", ()))
+    )
+    norm_raw, _norm_key = _load_first_matching_weight(
+        weight_map, norm_candidates, label="final_norm.weight"
+    )
+    rmsnorm_gain = str(spec["rmsnorm_gain"])
+    if rmsnorm_gain == "one_plus_weight":
+        norm_weight = (1.0 + norm_raw).to(dtype=torch.float32)
+    elif rmsnorm_gain == "plain_weight":
+        norm_weight = norm_raw.to(dtype=torch.float32)
+    else:
+        raise ValueError(f"Unknown rmsnorm_gain={rmsnorm_gain!r}")
+
+    tie = _tie_word_embeddings(model_name_or_path, spec)
+    embed_candidates = _weight_key_candidates(
+        tuple(spec["embed_path"]), tuple(spec.get("embed_path_fallbacks", ()))
+    )
+    lm_head_candidates = _weight_key_candidates(
+        tuple(spec["lm_head_path"]), tuple(spec.get("lm_head_path_fallbacks", ()))
+    )
+    if tie:
+        w_u_candidates = embed_candidates + [
+            k for k in lm_head_candidates if k not in embed_candidates
+        ]
+        w_u_label = "tied_embeddings / W_U"
+    else:
+        w_u_candidates = lm_head_candidates + [
+            k for k in embed_candidates if k not in lm_head_candidates
+        ]
+        w_u_label = "lm_head / W_U"
+    unembed_w, w_u_key = _load_first_matching_weight(
+        weight_map, w_u_candidates, label=w_u_label
+    )
+    if unembed_w.ndim != 2:
         raise ValueError(
-            f"Hardcoded norm path {spec['norm_path']} for {model_name_or_path} "
-            "has no .weight attribute."
-        )
-    if not hasattr(lm_head, "weight"):
-        raise ValueError(
-            f"Hardcoded lm_head path {spec['lm_head_path']} for {model_name_or_path} "
-            "has no .weight attribute."
+            f"W_U source {w_u_key!r} has shape {tuple(unembed_w.shape)}, expected 2D."
         )
 
-    unembed_w = lm_head.weight.detach().to(device=device, dtype=torch.float32)
-    unembed_b = getattr(lm_head, "bias", None)
+    unembed_b: torch.Tensor | None = None
+    for bias_key in _bias_key_candidates(w_u_candidates):
+        shard = weight_map.get(bias_key)
+        if shard is None:
+            continue
+        unembed_b = _load_torch_tensor(shard, bias_key)
+        print(f"Loaded lm_head bias from key {bias_key} (shape={tuple(unembed_b.shape)})")
+        break
+
+    # Materialize on CPU first, then move only the lens tensors to the target device.
+    unembed_w = unembed_w.to(device=device, dtype=torch.float32)
     if unembed_b is not None:
-        unembed_b = unembed_b.detach().to(device=device, dtype=torch.float32)
-    norm_weight = final_norm.weight.detach().to(device=device, dtype=torch.float32)
-    # Prefer hardcoded eps; fall back to module attrs if present.
+        unembed_b = unembed_b.to(device=device, dtype=torch.float32)
+    norm_weight = norm_weight.to(device=device, dtype=torch.float32)
+
     norm_eps = float(spec["rms_norm_eps"])
     softcap = spec["softcap"]
     softcap = float(softcap) if softcap is not None else None
-
-    # Free the full model; keep only lens tensors on device.
-    del model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
     return tokenizer, unembed_w, unembed_b, norm_weight, norm_eps, softcap
 
@@ -635,7 +810,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         choices=list(SUPPORTED_MODEL_NAMES),
         help="Supported: Mistral-7B-Instruct-v0.1, gemma-3-12b-it, Qwen2.5-32B-Instruct.",
     )
-    parser.add_argument("--device", type=str, default=None, help="Optional torch device, e.g. cuda:0 or cpu")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cpu",
+        help=(
+            "Torch device for logit-lens math (e.g. cpu or cuda:0). "
+            "Weight I/O is always selective safetensors on CPU. Default: cpu."
+        ),
+    )
     parser.add_argument(
         "--include_embeddings",
         nargs="+",
