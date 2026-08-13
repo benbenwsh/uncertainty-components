@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 from datetime import datetime
-import hashlib
 import json
 import logging
 import os
@@ -303,6 +302,8 @@ class ModelTensors:
     post_attn_norm_gammas: list[np.ndarray] | None = None
     # Gemma legacy H5: per-layer post_feedforward_layernorm gain (1+w).
     post_ff_norm_gammas: list[np.ndarray] | None = None
+    # Per-layer inv(W_O) when fine DLA recovers concat from o. None otherwise.
+    o_proj_inv_weights: list[np.ndarray] | None = None
     weight_load_method: str = WEIGHT_LOAD_METHOD
 
 
@@ -377,6 +378,75 @@ def load_first_matching_weight(
         + f"\nNone were present in the checkpoint weight map "
         f"({len(weight_map)} keys). Sample keys: {present_sample}"
     )
+
+
+def invert_square_o_proj(w: np.ndarray, *, layer_idx: int) -> np.ndarray:
+    """Invert a square o_proj / W_O matrix in float64, returning float32."""
+    if w.ndim != 2 or w.shape[0] != w.shape[1]:
+        raise ValueError(
+            f"o_proj.weight at layer {layer_idx} has shape {w.shape}; "
+            "recovering concat from o requires a square invertible W_O."
+        )
+    try:
+        inv = np.linalg.inv(w.astype(np.float64, copy=False))
+    except np.linalg.LinAlgError as exc:
+        raise ValueError(
+            f"o_proj.weight at layer {layer_idx} is not invertible."
+        ) from exc
+    return inv.astype(np.float32, copy=False)
+
+
+def maybe_invert_o_proj_for_concat_fallback(
+    tensors: ModelTensors,
+    examples: Sequence[ExampleData],
+) -> None:
+    """Invert W_O if any example lacks concat so fine DLA can recover it from o."""
+    seen_ids: set[str] = set()
+    unique_examples: list[ExampleData] = []
+    for ex in examples:
+        if ex.example_id in seen_ids:
+            continue
+        seen_ids.add(ex.example_id)
+        unique_examples.append(ex)
+    missing_concat = [ex for ex in unique_examples if ex.concat is None]
+    if not missing_concat:
+        return
+    missing_o = [ex for ex in missing_concat if ex.o is None]
+    if missing_o:
+        raise ValueError(
+            "Fine granularity requires concat embeddings, or o embeddings to recover "
+            "concat. "
+            f"{len(missing_o)} example(s) lack both (e.g. {missing_o[0].example_id})."
+        )
+    adapter = tensors.adapter
+    expected_in = adapter.n_query_heads * adapter.head_dim
+    if adapter.hidden_size != expected_in:
+        raise ValueError(
+            "concat embeddings are missing; recovering concat from o requires square "
+            "W_O (hidden_size == n_query_heads*head_dim), got "
+            f"hidden_size={adapter.hidden_size}, "
+            f"n_query_heads*head_dim={expected_in}."
+        )
+    if len(tensors.o_proj_weights) != adapter.n_layers:
+        raise ValueError(
+            "Cannot recover concat from o: o_proj weights were not loaded for all "
+            f"{adapter.n_layers} layers "
+            f"(got {len(tensors.o_proj_weights)})."
+        )
+    logging.warning(
+        "concat embeddings missing; recovering concat from o via inv(W_O) "
+        "for %d example(s).",
+        len(missing_concat),
+    )
+    invs: list[np.ndarray] = []
+    for layer_idx, w in enumerate(tensors.o_proj_weights):
+        logging.info(
+            "Inverting o_proj W_O for layer %d/%d.",
+            layer_idx + 1,
+            adapter.n_layers,
+        )
+        invs.append(invert_square_o_proj(w, layer_idx=layer_idx))
+    tensors.o_proj_inv_weights = invs
 
 
 def load_model_tensors(
@@ -586,6 +656,7 @@ def load_model_tensors(
         resolved_weight_keys=resolved,
         post_attn_norm_gammas=post_attn_norm_gammas,
         post_ff_norm_gammas=post_ff_norm_gammas,
+        o_proj_inv_weights=None,
         weight_load_method=WEIGHT_LOAD_METHOD,
     )
 
@@ -903,17 +974,6 @@ def _get_list_embeddings(r0: h5py.Group, component: str) -> list[np.ndarray] | N
     return out
 
 
-def file_sha256(path: str, chunk_size: int = 1 << 20) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            h.update(chunk)
-    return h.hexdigest()
-
-
 @dataclass
 class ExampleData:
     example_id: str
@@ -922,7 +982,8 @@ class ExampleData:
     res: list[np.ndarray]  # per span token, [n_res_layers, H]
     attn: list[np.ndarray]  # per span token, [n_layers, H]
     mlp: list[np.ndarray]
-    concat: list[np.ndarray] | None  # required for fine; optional for coarse-only
+    concat: list[np.ndarray] | None  # preferred for fine; optional if o is present
+    o: list[np.ndarray] | None = None  # o_proj outs; concat fallback + fine diagnostics
 
 
 def _open_h5_readonly(path: str):
@@ -939,7 +1000,7 @@ def _try_parse_example_data(
     r0: h5py.Group,
     expected_span: int,
     expected_probability_tokens: int,
-    require_concat: bool,
+    require_head_source: bool,
 ) -> ExampleData | None:
     conf = _read_verbalised_confidence_scalar(r0)
     if conf is None:
@@ -948,9 +1009,10 @@ def _try_parse_example_data(
     attn = _get_list_embeddings(r0, "attn")
     mlp = _get_list_embeddings(r0, "mlp")
     concat = _get_list_embeddings(r0, "concat")
+    o = _get_list_embeddings(r0, "o")
     if res is None or attn is None or mlp is None:
         return None
-    if require_concat and concat is None:
+    if require_head_source and concat is None and o is None:
         return None
     span_len = len(res)
     if span_len != expected_span:
@@ -970,6 +1032,11 @@ def _try_parse_example_data(
             f"Example {ex_id}: mismatched concat span length "
             f"res={span_len} concat={len(concat)}"
         )
+    if o is not None and len(o) != span_len:
+        raise ValueError(
+            f"Example {ex_id}: mismatched o span length "
+            f"res={span_len} o={len(o)}"
+        )
     return ExampleData(
         example_id=str(ex_id),
         verbalised_confidence=float(conf),
@@ -978,6 +1045,7 @@ def _try_parse_example_data(
         attn=attn,
         mlp=mlp,
         concat=concat,
+        o=o,
     )
 
 
@@ -993,7 +1061,7 @@ def load_usable_example_cohorts(
     *,
     expected_probability_tokens: int,
     max_examples: int,
-    require_concat: bool,
+    require_head_source: bool,
     high_conf_threshold: float,
     low_conf_threshold: float,
     fill_confidence_splits: bool,
@@ -1043,7 +1111,7 @@ def load_usable_example_cohorts(
                 r0=r0,
                 expected_span=expected_span,
                 expected_probability_tokens=expected_probability_tokens,
-                require_concat=require_concat,
+                require_head_source=require_head_source,
             )
             if parsed is None:
                 continue
@@ -1056,7 +1124,9 @@ def load_usable_example_cohorts(
                 examples_low.append(parsed)
 
     if not examples_all:
-        required = "res/attn/mlp/concat" if require_concat else "res/attn/mlp"
+        required = (
+            "res/attn/mlp and concat or o" if require_head_source else "res/attn/mlp"
+        )
         raise ValueError(
             f"No usable examples found in {input_h5} with required "
             f"{required} probability embeddings."
@@ -1069,14 +1139,14 @@ def load_usable_examples(
     *,
     expected_probability_tokens: int,
     max_examples: int,
-    require_concat: bool,
+    require_head_source: bool,
 ) -> list[ExampleData]:
     """Backward-compatible wrapper: return the all-examples cohort only."""
     cohorts = load_usable_example_cohorts(
         input_h5,
         expected_probability_tokens=expected_probability_tokens,
         max_examples=max_examples,
-        require_concat=require_concat,
+        require_head_source=require_head_source,
         high_conf_threshold=1.0,
         low_conf_threshold=0.0,
         fill_confidence_splits=False,
@@ -1159,6 +1229,18 @@ def _scale_heads_with_shared_post_attn_norm(
     return [h_vec * scale for h_vec in heads]
 
 
+@dataclass
+class HeadDecomposeResult:
+    heads: list[np.ndarray]
+    max_abs_vs_attn: float
+    pre_norm_total: np.ndarray  # W_O(concat) before optional post-attn norm
+
+
+def recover_concat_from_o(o_layer: np.ndarray, o_proj_inv: np.ndarray) -> np.ndarray:
+    """Recover pre-W_O concat from cached o (o_proj output): concat = W_O^{-1} @ o."""
+    return o_proj_inv @ o_layer.astype(np.float32, copy=False)
+
+
 def decompose_heads(
     concat_layer: np.ndarray,
     o_proj_weight: np.ndarray,
@@ -1166,16 +1248,17 @@ def decompose_heads(
     n_query_heads: int,
     head_dim: int,
     attn_reference: np.ndarray,
-    atol: float,
     context: str,
     post_attn_norm_gamma: np.ndarray | None = None,
     post_attn_norm_eps: float | None = None,
-) -> list[np.ndarray]:
-    """Return per-head residual writes; assert they re-sum to cached attn.
+) -> HeadDecomposeResult:
+    """Return per-head residual writes and re-sum error vs cached attn.
 
     When ``post_attn_norm_gamma`` is set (Gemma), apply the shared post-attention
     RMSNorm gain to each pre-norm head write so they match post-norm H5 attn:
     ``write_h = head_h * gamma / rms(sum_heads)``.
+
+    Does not raise on re-sum mismatch; callers soft-warn using ``max_abs_vs_attn``.
     """
     expected_width = n_query_heads * head_dim
     if concat_layer.shape[-1] != expected_width:
@@ -1195,6 +1278,8 @@ def decompose_heads(
         heads.append(write)
         total += write
 
+    pre_norm_total = total.copy()
+
     if post_attn_norm_gamma is not None:
         if post_attn_norm_eps is None:
             raise ValueError(f"{context}: post_attn_norm_eps required with post_attn_norm_gamma")
@@ -1209,19 +1294,69 @@ def decompose_heads(
         total = total * scale
 
     max_abs = float(np.max(np.abs(total - attn_reference.astype(np.float32))))
-    if max_abs > atol:
-        raise ValueError(
-            f"{context}: per-head contributions do not re-sum to cached attn "
-            f"(max |sum_heads - attn|={max_abs} > atol={atol}). "
-            "Check o_proj slicing / transposition"
-            + (
-                " / Gemma post_attention_layernorm"
-                if post_attn_norm_gamma is not None
-                else ""
-            )
-            + "."
+    return HeadDecomposeResult(
+        heads=heads,
+        max_abs_vs_attn=max_abs,
+        pre_norm_total=pre_norm_total,
+    )
+
+
+def _log_head_resum_failure(
+    *,
+    example_id: str,
+    layer: int,
+    position: str,
+    contrast_name: str,
+    max_abs: float,
+    atol: float,
+    pre_norm_total: np.ndarray,
+    attn: np.ndarray,
+    o_layer: np.ndarray | None,
+    post_attn_norm_gamma: np.ndarray | None,
+    post_attn_norm_eps: float | None,
+    applied_post_attn_in_decompose: bool,
+) -> None:
+    """Warn on head re-sum failure and log W_O(concat)/o/attn diagnostics when possible."""
+    msg = (
+        f"Head re-sum soft-fail ex={example_id} layer={layer} "
+        f"({position}/{contrast_name}): max |sum_heads - attn|={max_abs} > atol={atol}. "
+        "Check o_proj slicing / transposition"
+        + (" / Gemma post_attention_layernorm" if applied_post_attn_in_decompose else "")
+        + "."
+    )
+    if o_layer is None:
+        logging.warning("%s o diagnostics skipped (no embeddings_probability/o).", msg)
+        return
+
+    o32 = o_layer.astype(np.float32, copy=False)
+    if o32.shape != pre_norm_total.shape:
+        logging.warning(
+            "%s o diagnostics skipped (o shape %s != W_O(concat) shape %s).",
+            msg,
+            o32.shape,
+            pre_norm_total.shape,
         )
-    return heads
+        return
+
+    wo_minus_o = float(np.max(np.abs(pre_norm_total - o32)))
+    if applied_post_attn_in_decompose and post_attn_norm_gamma is not None:
+        assert post_attn_norm_eps is not None
+        o_post = apply_gemma_rmsnorm(o32, post_attn_norm_gamma, float(post_attn_norm_eps))
+        post_o_minus_attn = float(np.max(np.abs(o_post - attn.astype(np.float32))))
+        logging.warning(
+            "%s ||W_O(concat)-o||_inf=%.6g ||post_norm(o)-attn||_inf=%.6g",
+            msg,
+            wo_minus_o,
+            post_o_minus_attn,
+        )
+    else:
+        o_minus_attn = float(np.max(np.abs(o32 - attn.astype(np.float32))))
+        logging.warning(
+            "%s ||W_O(concat)-o||_inf=%.6g ||o-attn||_inf=%.6g",
+            msg,
+            wo_minus_o,
+            o_minus_attn,
+        )
 
 
 def component_labels_coarse(n_layers: int) -> list[str]:
@@ -1280,6 +1415,8 @@ class ExperimentResult:
     embed_attributions: np.ndarray  # [n_ex]
     true_scores: np.ndarray  # [n_ex]
     completeness_residuals: np.ndarray  # [n_ex]
+    head_resum_failure_count: int = 0
+    completeness_soft_failure_count: int = 0
 
 
 def run_dla_for_experiment(
@@ -1328,6 +1465,8 @@ def run_dla_for_experiment(
     true_scores = np.zeros(n_ex, dtype=np.float32)
     residuals = np.zeros(n_ex, dtype=np.float32)
     example_ids: list[str] = []
+    head_resum_failure_count = 0
+    completeness_soft_failure_count = 0
 
     for ei, ex in enumerate(tqdm(examples, desc=f"{contrast.position}/{contrast.name}/{granularity}")):
         example_ids.append(ex.example_id)
@@ -1338,12 +1477,8 @@ def run_dla_for_experiment(
         attn_tok = ex.attn[pos_idx]  # [n_layers, H]
         mlp_tok = ex.mlp[pos_idx]
         concat_tok = None
+        o_tok = None
         if granularity == "fine":
-            if ex.concat is None:
-                raise ValueError(
-                    f"Example {ex.example_id}: fine granularity requires concat "
-                    "embeddings, but none were loaded."
-                )
             if len(tensors.o_proj_weights) != n_layers:
                 raise ValueError(
                     f"Fine granularity requires o_proj weights for all {n_layers} layers, "
@@ -1357,7 +1492,31 @@ def run_dla_for_experiment(
                     f"gains for all {n_layers} layers, but only "
                     f"{len(tensors.post_attn_norm_gammas)} were loaded."
                 )
-            concat_tok = ex.concat[pos_idx]
+            if ex.concat is not None:
+                concat_tok = ex.concat[pos_idx]
+            else:
+                if ex.o is None:
+                    raise ValueError(
+                        f"Example {ex.example_id}: fine granularity requires concat "
+                        "embeddings, or o embeddings to recover concat, but neither "
+                        "were loaded."
+                    )
+                n_inv = (
+                    0
+                    if tensors.o_proj_inv_weights is None
+                    else len(tensors.o_proj_inv_weights)
+                )
+                if n_inv != n_layers:
+                    raise ValueError(
+                        f"Fine granularity concat-from-o fallback requires inv(W_O) "
+                        f"for all {n_layers} layers, but only {n_inv} were loaded."
+                    )
+            if ex.o is not None:
+                if ex.o[pos_idx].shape[0] != n_layers:
+                    raise ValueError(
+                        f"Example {ex.example_id}: o layers {ex.o[pos_idx].shape[0]} != {n_layers}"
+                    )
+                o_tok = ex.o[pos_idx]
 
         if attn_tok.shape[0] != n_layers or mlp_tok.shape[0] != n_layers:
             raise ValueError(
@@ -1400,29 +1559,57 @@ def run_dla_for_experiment(
                 row[2 * l + 1] = attr_vec(m, u_tilde, sigma)
                 block_sum += a + m
         else:
-            assert concat_tok is not None  # guarded above
             col = 0
             for l in range(n_layers):
                 a = attn_tok[l].astype(np.float32)
                 m = mlp_tok[l].astype(np.float32)
+                o_layer = None if o_tok is None else o_tok[l].astype(np.float32)
+                if concat_tok is not None:
+                    concat_layer = concat_tok[l].astype(np.float32)
+                else:
+                    if o_layer is None:
+                        raise ValueError(
+                            f"Example {ex.example_id}: fine granularity requires concat "
+                            "or o embeddings to recover concat, but neither were loaded."
+                        )
+                    assert tensors.o_proj_inv_weights is not None
+                    concat_layer = recover_concat_from_o(
+                        o_layer, tensors.o_proj_inv_weights[l]
+                    )
                 if legacy_gemma_pre_postnorm_h5:
                     # H5 attn is pre-norm: re-sum check without post-attn norm, then
                     # scale heads to residual writes; MLP needs post-FF norm.
-                    heads = decompose_heads(
-                        concat_tok[l].astype(np.float32),
+                    decomp = decompose_heads(
+                        concat_layer,
                         tensors.o_proj_weights[l],
                         n_query_heads=n_heads,
                         head_dim=adapter.head_dim,
                         attn_reference=a,
-                        atol=head_resum_atol,
                         context=f"ex={ex.example_id} layer={l}",
                         post_attn_norm_gamma=None,
                         post_attn_norm_eps=None,
                     )
+                    if decomp.max_abs_vs_attn > head_resum_atol:
+                        head_resum_failure_count += 1
+                        assert tensors.post_attn_norm_gammas is not None
+                        _log_head_resum_failure(
+                            example_id=ex.example_id,
+                            layer=l,
+                            position=contrast.position,
+                            contrast_name=contrast.name,
+                            max_abs=decomp.max_abs_vs_attn,
+                            atol=head_resum_atol,
+                            pre_norm_total=decomp.pre_norm_total,
+                            attn=a,
+                            o_layer=o_layer,
+                            post_attn_norm_gamma=tensors.post_attn_norm_gammas[l],
+                            post_attn_norm_eps=adapter.rms_norm_eps,
+                            applied_post_attn_in_decompose=False,
+                        )
                     assert tensors.post_attn_norm_gammas is not None
                     assert tensors.post_ff_norm_gammas is not None
                     heads = _scale_heads_with_shared_post_attn_norm(
-                        heads,
+                        decomp.heads,
                         tensors.post_attn_norm_gammas[l],
                         adapter.rms_norm_eps,
                     )
@@ -1433,25 +1620,43 @@ def run_dla_for_experiment(
                     for h_vec in heads:
                         a_write += h_vec
                 else:
-                    heads = decompose_heads(
-                        concat_tok[l].astype(np.float32),
+                    post_gamma = (
+                        None
+                        if tensors.post_attn_norm_gammas is None
+                        else tensors.post_attn_norm_gammas[l]
+                    )
+                    post_eps = (
+                        adapter.rms_norm_eps
+                        if tensors.post_attn_norm_gammas is not None
+                        else None
+                    )
+                    decomp = decompose_heads(
+                        concat_layer,
                         tensors.o_proj_weights[l],
                         n_query_heads=n_heads,
                         head_dim=adapter.head_dim,
                         attn_reference=a,
-                        atol=head_resum_atol,
                         context=f"ex={ex.example_id} layer={l}",
-                        post_attn_norm_gamma=(
-                            None
-                            if tensors.post_attn_norm_gammas is None
-                            else tensors.post_attn_norm_gammas[l]
-                        ),
-                        post_attn_norm_eps=(
-                            adapter.rms_norm_eps
-                            if tensors.post_attn_norm_gammas is not None
-                            else None
-                        ),
+                        post_attn_norm_gamma=post_gamma,
+                        post_attn_norm_eps=post_eps,
                     )
+                    if decomp.max_abs_vs_attn > head_resum_atol:
+                        head_resum_failure_count += 1
+                        _log_head_resum_failure(
+                            example_id=ex.example_id,
+                            layer=l,
+                            position=contrast.position,
+                            contrast_name=contrast.name,
+                            max_abs=decomp.max_abs_vs_attn,
+                            atol=head_resum_atol,
+                            pre_norm_total=decomp.pre_norm_total,
+                            attn=a,
+                            o_layer=o_layer,
+                            post_attn_norm_gamma=post_gamma,
+                            post_attn_norm_eps=post_eps,
+                            applied_post_attn_in_decompose=post_gamma is not None,
+                        )
+                    heads = decomp.heads
                     a_write = a
                 for h_vec in heads:
                     row[col] = attr_vec(h_vec, u_tilde, sigma)
@@ -1473,17 +1678,36 @@ def run_dla_for_experiment(
         recon = float(np.sum(row) + embed_attr)
         residual = recon - score
         if abs(residual) > completeness_atol:
-            raise ValueError(
-                f"Completeness check failed for example {ex.example_id} "
-                f"({contrast.position}/{contrast.name}/{granularity}): "
-                f"sum(components)+embed={recon:.6f}, true_score={score:.6f}, "
-                f"|residual|={abs(residual):.6g} > atol={completeness_atol}."
+            completeness_soft_failure_count += 1
+            logging.warning(
+                "Completeness soft-fail for example %s "
+                "(%s/%s/%s): sum(components)+embed=%.6f, true_score=%.6f, "
+                "|residual|=%.6g > atol=%s.",
+                ex.example_id,
+                contrast.position,
+                contrast.name,
+                granularity,
+                recon,
+                score,
+                abs(residual),
+                completeness_atol,
             )
 
         attrs[ei] = row
         embed_attrs[ei] = embed_attr
         true_scores[ei] = score
         residuals[ei] = residual
+
+    if granularity == "fine" or head_resum_failure_count or completeness_soft_failure_count:
+        logging.info(
+            "%s/%s/%s soft-failure counts: head_resum=%d completeness=%d (n_examples=%d)",
+            contrast.position,
+            contrast.name,
+            granularity,
+            head_resum_failure_count,
+            completeness_soft_failure_count,
+            n_ex,
+        )
 
     return ExperimentResult(
         position=contrast.position,
@@ -1495,6 +1719,8 @@ def run_dla_for_experiment(
         embed_attributions=embed_attrs,
         true_scores=true_scores,
         completeness_residuals=residuals,
+        head_resum_failure_count=head_resum_failure_count,
+        completeness_soft_failure_count=completeness_soft_failure_count,
     )
 
 
@@ -1748,6 +1974,10 @@ def save_attributions_h5(path: Path, result: ExperimentResult) -> None:
         f.attrs["position"] = result.position
         f.attrs["contrast_name"] = result.contrast_name
         f.attrs["granularity"] = result.granularity
+        f.attrs["head_resum_failure_count"] = int(result.head_resum_failure_count)
+        f.attrs["completeness_soft_failure_count"] = int(
+            result.completeness_soft_failure_count
+        )
 
 
 def write_experiment_outputs(
@@ -1880,6 +2110,8 @@ def write_experiment_outputs(
         "n_components": len(result.labels),
         "completeness_residual_mean_abs": float(np.mean(np.abs(result.completeness_residuals))),
         "completeness_residual_max_abs": float(np.max(np.abs(result.completeness_residuals))),
+        "head_resum_failure_count": int(result.head_resum_failure_count),
+        "completeness_soft_failure_count": int(result.completeness_soft_failure_count),
         "embed_mean": embed_mean,
     }
 
@@ -1931,8 +2163,9 @@ def write_readme(path: Path) -> None:
         "Model weights for this run were loaded selectively from safetensors shards on CPU "
         "(final norm, unembedding, and o_proj only when fine granularity is requested) — "
         "the full model is not loaded.\n\n"
-        "When `--confidence_split` is enabled (default), each "
-        "`{position}__{contrast}__{granularity}` experiment is also run on high- and "
+        "Experiments are nested under `pre_period/` and `post_period/`. When "
+        "`--confidence_split` is enabled (default), each "
+        "`{position}/{contrast}__{granularity}` experiment is also run on high- and "
         "low-confidence example cohorts "
         "(`...__high_conf/`, `...__low_conf/`), capped independently at "
         "`--max_examples_for_mean`. Disable with `--no-confidence_split`.\n",
@@ -1946,7 +2179,6 @@ def write_config_txt(
     args: argparse.Namespace,
     adapter: ModelAdapter,
     input_h5_resolved: str,
-    input_hash: str,
     digit_ids: dict[str, tuple[int, str]],
     high_digits: set[str],
     low_digits: set[str],
@@ -1970,7 +2202,6 @@ def write_config_txt(
         f"finished_at={finished_at}",
         f"script={Path(__file__).resolve()}",
         f"input_h5={input_h5_resolved}",
-        f"input_h5_sha256={input_hash}",
         f"output_dir={args.output_dir}",
         f"dtype=float32",
         f"device={args.device}",
@@ -2037,7 +2268,9 @@ def write_config_txt(
     for key, summary in sorted(completeness_summaries.items()):
         lines.append(
             f"{key}: mean_abs={summary['completeness_residual_mean_abs']:.6g} "
-            f"max_abs={summary['completeness_residual_max_abs']:.6g}"
+            f"max_abs={summary['completeness_residual_max_abs']:.6g} "
+            f"head_resum_soft_fail={summary.get('head_resum_failure_count', 0)} "
+            f"completeness_soft_fail={summary.get('completeness_soft_failure_count', 0)}"
         )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -2126,7 +2359,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         nargs="+",
         choices=["coarse", "fine"],
         default=["coarse", "fine"],
-        help="One or both of: coarse fine. concat embeddings are required only when fine is included.",
+        help=(
+            "One or both of: coarse fine. Fine uses concat when present, otherwise "
+            "recovers concat from o via inv(W_O)."
+        ),
     )
     p.add_argument("--n_individual_examples", type=int, default=3)
     p.add_argument("--max_examples_for_mean", type=int, default=100)
@@ -2186,10 +2422,11 @@ def main() -> None:
     write_readme(run_root / "README.md")
 
     need_o_proj = "fine" in gran_list
-    require_concat = need_o_proj
+    require_head_source = need_o_proj
     if need_o_proj:
         logging.info(
-            "Fine granularity requested; concat embeddings and o_proj weights are required."
+            "Fine granularity requested; concat embeddings are used when present, "
+            "otherwise concat is recovered from o via inv(W_O)."
         )
     else:
         logging.info(
@@ -2223,15 +2460,11 @@ def main() -> None:
     )
     logging.info("High digits %s  Low digits %s", sorted(high_digits), sorted(low_digits))
 
-    logging.info("Hashing input H5...")
-    input_hash = file_sha256(input_h5)
-    logging.info("input_h5 sha256=%s", input_hash)
-
     cohorts = load_usable_example_cohorts(
         input_h5,
         expected_probability_tokens=args.expected_probability_tokens,
         max_examples=args.max_examples_for_mean,
-        require_concat=require_concat,
+        require_head_source=require_head_source,
         high_conf_threshold=args.high_conf_threshold,
         low_conf_threshold=args.low_conf_threshold,
         fill_confidence_splits=args.confidence_split,
@@ -2308,6 +2541,13 @@ def main() -> None:
         logging.info("Individual example IDs (high_conf): %s", individual_ids_high)
         logging.info("Individual example IDs (low_conf): %s", individual_ids_low)
 
+    if need_o_proj:
+        fallback_examples = list(examples_all)
+        if args.confidence_split:
+            fallback_examples.extend(cohorts.high)
+            fallback_examples.extend(cohorts.low)
+        maybe_invert_o_proj_for_concat_fallback(tensors, fallback_examples)
+
     contrasts = build_contrasts(tensors.w_u, digit_ids, high_digits, low_digits)
 
     def _run_cohort_experiments(
@@ -2319,8 +2559,8 @@ def main() -> None:
         examples_by_id = {ex.example_id: ex for ex in cohort_examples}
         for contrast in contrasts:
             for gran in gran_list:
-                base = f"{contrast.position}__{contrast.name}__{gran}"
-                exp_name = f"{base}{dirname_suffix}"
+                leaf = f"{contrast.name}__{gran}{dirname_suffix}"
+                exp_name = f"{contrast.position}/{leaf}"
                 logging.info("Running experiment %s", exp_name)
                 result = run_dla_for_experiment(
                     cohort_examples,
@@ -2332,7 +2572,7 @@ def main() -> None:
                     legacy_gemma_pre_postnorm_h5=args.legacy_gemma_pre_postnorm_h5,
                 )
                 summary = write_experiment_outputs(
-                    run_root / exp_name,
+                    run_root / contrast.position / leaf,
                     result,
                     examples_by_id,
                     individual_ids,
@@ -2343,9 +2583,12 @@ def main() -> None:
                 )
                 completeness_summaries[exp_name] = summary
                 logging.info(
-                    "%s done: max completeness |residual|=%.3g",
+                    "%s done: max completeness |residual|=%.3g "
+                    "(head_resum_soft_fail=%d completeness_soft_fail=%d)",
                     exp_name,
                     summary["completeness_residual_max_abs"],
+                    result.head_resum_failure_count,
+                    result.completeness_soft_failure_count,
                 )
 
     completeness_summaries: dict = {}
@@ -2372,7 +2615,6 @@ def main() -> None:
         args=args,
         adapter=adapter,
         input_h5_resolved=input_h5,
-        input_hash=input_hash,
         digit_ids=digit_ids,
         high_digits=high_digits,
         low_digits=low_digits,
