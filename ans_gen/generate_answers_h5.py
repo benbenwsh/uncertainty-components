@@ -7,6 +7,7 @@ import gc
 import logging
 import os
 import random
+import re
 import sys
 import time
 from urllib.parse import quote
@@ -26,6 +27,58 @@ if _SEM_UNC_ROOT not in sys.path:
     sys.path.insert(0, _SEM_UNC_ROOT)
 
 CONFIDENCE_PROMPT = "Provide your best guess and the probability that it is correct (0.0 to 1.0) for the following question. Give ONLY the guess and probability, no other words or explanation. For example:\n\nGuess: <most likely guess, as short as possible; not a complete sentence, just the guess!>\n Probability: <the probability between 0.0 and 1.0 that your guess is correct, without any extra commentary whatsoever; just the probability!>\n\nThe question is: "
+
+CONFIDENCE_PROMPT_LINGUISTIC = (
+    "Provide your best guess for the following question, and describe how likely it is that your guess is correct "
+    "as one of the following expressions: Almost No Chance, Highly Unlikely, Chances are Slight, Little Chance, "
+    "Unlikely, Probably Not, About Even, Better than Even, Likely, Probably, Very Good Chance, Highly Likely, "
+    "Almost Certain"
+    ". Give ONLY the guess and your confidence, no other words or explanation. For example:\n\n"
+    "Guess: <most likely guess, as short as possible; not a complete sentence, just the guess!>\n"
+    "Confidence: <description of confidence, without any extra commentary whatsoever; just a short phrase!>\n\n"
+    "The question is: "
+)
+
+LINGUISTIC_TO_PROBABILITY: dict[str, float] = {
+    "Almost Certain": 0.95,
+    "Highly Likely": 0.90,
+    "Very Good Chance": 0.80,
+    "We Believe": 0.75,
+    "Probably": 0.70,
+    "Probable": 0.70,
+    "Likely": 0.70,
+    "Better than Even": 0.60,
+    "About Even": 0.50,
+    "We Doubt": 0.20,
+    "Unlikely": 0.20,
+    "Probably Not": 0.25,
+    "Little Chance": 0.10,
+    "Chances are Slight": 0.10,
+    "Improbable": 0.10,
+    "Highly Unlikely": 0.05,
+    "Almost No Chance": 0.02,
+}
+
+_LINGUISTIC_PHRASES_BY_LENGTH: tuple[tuple[str, float], ...] = tuple(
+    sorted(LINGUISTIC_TO_PROBABILITY.items(), key=lambda kv: len(kv[0]), reverse=True)
+)
+
+
+def parse_linguistic_confidence_from_response(response_str: str) -> float | None:
+    if not response_str or not isinstance(response_str, str):
+        return None
+    matches = list(re.finditer(r"confidence\s*:\s*(.+)", response_str, re.IGNORECASE | re.DOTALL))
+    if not matches:
+        return None
+    tail = matches[0].group(1)
+    tail = tail.split("\n")[0].strip()
+    tail_collapsed = " ".join(tail.split())
+    lowered = tail_collapsed.casefold()
+    for phrase, prob in _LINGUISTIC_PHRASES_BY_LENGTH:
+        if phrase.casefold() in lowered:
+            return float(prob)
+    return None
+
 
 STOP_SEQUENCES = ["\n\n\n\n", "\n\n\n", "<end_of_turn>"]
 WRITE_LOG_EVERY = 1
@@ -749,6 +802,9 @@ def main(args):
 
         with h5py.File(generations_filepath, "w") as h5_file:
             h5_file.attrs["format"] = "native_examples_v1"
+            h5_file.attrs["linguistic_confidence_prompt"] = bool(
+                args.linguistic_confidence_prompt
+            )
             examples_group = h5_file.require_group("examples")
 
             for index in tqdm(indices, desc=dataset_split):
@@ -764,7 +820,12 @@ def main(args):
                 correct_answer = example["answers"]["text"]
                 if args.dataset == "svamp" and context:
                     question = context + " " + question
-                local_prompt = CONFIDENCE_PROMPT + question
+                prompt = (
+                    CONFIDENCE_PROMPT_LINGUISTIC
+                    if args.linguistic_confidence_prompt
+                    else CONFIDENCE_PROMPT
+                )
+                local_prompt = prompt + question
 
                 (
                     predicted_answer,
@@ -885,6 +946,15 @@ def build_parser():
         help=(
             "Collect concatenated attention-head activations immediately before o_proj/W_O "
             "as all_concat_embeddings."
+        ),
+    )
+    parser.add_argument(
+        "--linguistic_confidence_prompt",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "If true, use the natural-language Confidence: prompt; "
+            "if false (default), use the numeric Probability: prompt."
         ),
     )
     parser.add_argument(
