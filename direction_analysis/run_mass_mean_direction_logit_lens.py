@@ -31,6 +31,7 @@ from mass_mean_probe.run_mass_mean_probe import (
 )
 from direction_analysis.h5_probability_directions import (
     compute_probability_mass_mean_direction_streaming,
+    compute_probability_subblock_mass_mean_directions_streaming,
 )
 from logit_lens_improved.run_logit_lens_improved import (
     SUPPORTED_MODEL_NAMES,
@@ -38,6 +39,7 @@ from logit_lens_improved.run_logit_lens_improved import (
     _load_unembedding,
     _resolve_device,
     _save_topk_table_png,
+    _save_topk_table_png_subblocks,
 )
 
 
@@ -117,6 +119,7 @@ def write_config_txt(
         f"top_k={args.top_k}",
         f"softcap={softcap}",
         f"n_layers={n_layers}",
+        f"subblock_mode={args.subblock_mode}",
         f"direction_probability_shape={direction_probability_shape}",
         f"vocab_size={vocab_size}",
         "",
@@ -193,6 +196,15 @@ def main() -> None:
         help="If true, use Confidence: span budget; if false, use Probability: span budget.",
     )
     parser.add_argument("--top_k", type=int, default=3)
+    parser.add_argument(
+        "--subblock_mode",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If true, compute mass-mean directions at attn-out and mlp-out and emit "
+            "red-attn / blue-mlp top-k tables. Requires --new_h5_format."
+        ),
+    )
     parser.add_argument("--device", type=str, default=None, help="Optional torch device, e.g. cuda:0 or cpu")
     parser.add_argument(
         "--output_dir",
@@ -206,6 +218,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.top_k <= 0:
         raise ValueError("--top_k must be >= 1")
+    if args.subblock_mode and not args.new_h5_format:
+        raise ValueError("--subblock_mode requires --new_h5_format (attn/mlp H5 fields).")
     configure_prefix_tokens_for_model(args.model_name)
 
     logging.basicConfig(
@@ -230,23 +244,51 @@ def main() -> None:
     )
 
     logging.info("Computing probability mass-mean directions (streaming H5)...")
-    direction_probability, low_ids, high_ids, n_layers, h5_example_count = (
-        compute_probability_mass_mean_direction_streaming(
-            args.input_h5,
-            expected_probability_tokens=direction_prob_token_budget,
-            low_conf_threshold=args.low_conf_threshold,
-            high_conf_threshold=args.high_conf_threshold,
-            new_h5_format=args.new_h5_format,
+    direction_attn: Optional[np.ndarray] = None
+    direction_mlp: Optional[np.ndarray] = None
+    if args.subblock_mode:
+        direction_by_component, low_ids, high_ids, n_layers, h5_example_count = (
+            compute_probability_subblock_mass_mean_directions_streaming(
+                args.input_h5,
+                expected_probability_tokens=direction_prob_token_budget,
+                low_conf_threshold=args.low_conf_threshold,
+                high_conf_threshold=args.high_conf_threshold,
+            )
         )
-    )
-    logging.info(
-        "Direction shape=%s | n_layers=%d | low=%d high=%d examples=%d",
-        tuple(direction_probability.shape),
-        n_layers,
-        len(low_ids),
-        len(high_ids),
-        h5_example_count,
-    )
+        direction_attn = np.asarray(direction_by_component["attn"], dtype=np.float32)
+        direction_mlp = np.asarray(direction_by_component["mlp"], dtype=np.float32)
+        if direction_attn.shape != direction_mlp.shape:
+            raise ValueError(
+                f"attn/mlp direction shapes must match, got {direction_attn.shape} vs "
+                f"{direction_mlp.shape}."
+            )
+        direction_probability = direction_attn
+        logging.info(
+            "Subblock direction shape=%s | n_layers=%d | low=%d high=%d examples=%d",
+            tuple(direction_probability.shape),
+            n_layers,
+            len(low_ids),
+            len(high_ids),
+            h5_example_count,
+        )
+    else:
+        direction_probability, low_ids, high_ids, n_layers, h5_example_count = (
+            compute_probability_mass_mean_direction_streaming(
+                args.input_h5,
+                expected_probability_tokens=direction_prob_token_budget,
+                low_conf_threshold=args.low_conf_threshold,
+                high_conf_threshold=args.high_conf_threshold,
+                new_h5_format=args.new_h5_format,
+            )
+        )
+        logging.info(
+            "Direction shape=%s | n_layers=%d | low=%d high=%d examples=%d",
+            tuple(direction_probability.shape),
+            n_layers,
+            len(low_ids),
+            len(high_ids),
+            h5_example_count,
+        )
     if direction_probability.ndim != 3:
         raise ValueError(
             f"Expected direction shape (layers, tokens, d_model), "
@@ -279,33 +321,73 @@ def main() -> None:
     tables_dir = Path(run_root) / "tables"
     tables_dir.mkdir(parents=True, exist_ok=True)
     table_paths: List[str] = []
-    logging.info("Writing %d unshaded top-k tables (top_k=%d)", n_tokens, args.top_k)
-    for tok_idx in range(n_tokens):
-        hidden = direction_probability[:, tok_idx, :]
-        top_ids, top_vals = _compute_topk(
-            hidden,
-            top_k=args.top_k,
-            device=device,
-            w_u=w_u,
-            b_u=b_u,
-            norm_weight=norm_weight,
-            norm_eps=norm_eps,
-            softcap=softcap,
-        )
-        out_path = tables_dir / f"probability_token_{tok_idx}.png"
-        _save_topk_table_png(
-            out_path,
-            tokenizer=tokenizer,
-            top_ids=top_ids,
-            top_vals=top_vals,
-            shade_body=False,
-        )
-        table_paths.append(str(out_path))
-        logging.info(
-            "Wrote %s (token_label=%r)",
-            out_path,
-            token_labels[tok_idx] if tok_idx < len(token_labels) else f"pos_{tok_idx}",
-        )
+    if args.subblock_mode:
+        logging.info("Writing %d subblock top-k tables (top_k=%d)", n_tokens, args.top_k)
+        assert direction_attn is not None and direction_mlp is not None
+        for tok_idx in range(n_tokens):
+            top_ids_attn, top_vals_attn = _compute_topk(
+                direction_attn[:, tok_idx, :],
+                top_k=args.top_k,
+                device=device,
+                w_u=w_u,
+                b_u=b_u,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+                softcap=softcap,
+            )
+            top_ids_mlp, top_vals_mlp = _compute_topk(
+                direction_mlp[:, tok_idx, :],
+                top_k=args.top_k,
+                device=device,
+                w_u=w_u,
+                b_u=b_u,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+                softcap=softcap,
+            )
+            out_path = tables_dir / f"probability_token_{tok_idx}.png"
+            _save_topk_table_png_subblocks(
+                out_path,
+                tokenizer=tokenizer,
+                top_ids_attn=top_ids_attn,
+                top_vals_attn=top_vals_attn,
+                top_ids_mlp=top_ids_mlp,
+                top_vals_mlp=top_vals_mlp,
+            )
+            table_paths.append(str(out_path))
+            logging.info(
+                "Wrote %s (token_label=%r)",
+                out_path,
+                token_labels[tok_idx] if tok_idx < len(token_labels) else f"pos_{tok_idx}",
+            )
+    else:
+        logging.info("Writing %d unshaded top-k tables (top_k=%d)", n_tokens, args.top_k)
+        for tok_idx in range(n_tokens):
+            hidden = direction_probability[:, tok_idx, :]
+            top_ids, top_vals = _compute_topk(
+                hidden,
+                top_k=args.top_k,
+                device=device,
+                w_u=w_u,
+                b_u=b_u,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+                softcap=softcap,
+            )
+            out_path = tables_dir / f"probability_token_{tok_idx}.png"
+            _save_topk_table_png(
+                out_path,
+                tokenizer=tokenizer,
+                top_ids=top_ids,
+                top_vals=top_vals,
+                shade_body=False,
+            )
+            table_paths.append(str(out_path))
+            logging.info(
+                "Wrote %s (token_label=%r)",
+                out_path,
+                token_labels[tok_idx] if tok_idx < len(token_labels) else f"pos_{tok_idx}",
+            )
 
     finished_at = datetime.now().isoformat(timespec="seconds")
     write_config_txt(
@@ -327,6 +409,7 @@ def main() -> None:
         "input_h5": args.input_h5,
         "model_name": args.model_name,
         "new_h5_format": args.new_h5_format,
+        "subblock_mode": args.subblock_mode,
         "device": str(device),
         "top_k": args.top_k,
         "softcap": softcap,
