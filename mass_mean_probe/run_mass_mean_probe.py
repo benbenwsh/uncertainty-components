@@ -44,6 +44,24 @@ from transformers import AutoTokenizer
 from transformer_lens import HookedTransformer
 from transformer_lens.weight_processing import ProcessWeights
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+_PROCESS_GEN_DIR = _REPO_ROOT / "process_generations"
+if str(_PROCESS_GEN_DIR) not in sys.path:
+    sys.path.insert(0, str(_PROCESS_GEN_DIR))
+
+from ans_gen.generate_answers_h5 import (  # noqa: E402
+    CONFIDENCE_PROMPT_LINGUISTIC,
+    LINGUISTIC_TO_PROBABILITY,
+    parse_linguistic_confidence_from_response,
+)
+from process_generations_more_embs_from_h5 import (  # noqa: E402
+    GEMMA_CONFIDENCE_PREFIX_TOKENS,
+    MISTRAL_CONFIDENCE_PREFIX_TOKENS,
+    QWEN_CONFIDENCE_PREFIX_TOKENS,
+)
+
 CONFIDENCE_PROMPT_NUMERIC = (
     "Provide your best guess and the probability that it is correct (0.0 to 1.0) "
     "for the following question. Give ONLY the guess and probability, no other words "
@@ -52,41 +70,6 @@ CONFIDENCE_PROMPT_NUMERIC = (
     "Probability: <the probability between 0.0 and 1.0 that your guess is correct, without any "
     "extra commentary whatsoever; just the probability!>\n\n"
     "The question is: "
-)
-
-CONFIDENCE_PROMPT_LINGUISTIC = (
-    "Provide your best guess for the following question, and describe how likely it is that your guess is correct "
-    "as one of the following expressions: Almost No Chance, Highly Unlikely, Chances are Slight, Little Chance, "
-    "Unlikely, Probably Not, About Even, Better than Even, Likely, Probably, Very Good Chance, Highly Likely, "
-    "Almost Certain"
-    ". Give ONLY the guess and your confidence, no other words or explanation. For example:\n\n"
-    "Guess: <most likely guess, as short as possible; not a complete sentence, just the guess!>\n"
-    "Confidence: <description of confidence, without any extra commentary whatsoever; just a short phrase!>\n\n"
-    "The question is: "
-)
-
-LINGUISTIC_TO_PROBABILITY: dict[str, float] = {
-    "Almost Certain": 0.95,
-    "Highly Likely": 0.90,
-    "Very Good Chance": 0.80,
-    "We Believe": 0.75,
-    "Probably": 0.70,
-    "Probable": 0.70,
-    "Likely": 0.70,
-    "Better than Even": 0.60,
-    "About Even": 0.50,
-    "We Doubt": 0.20,
-    "Unlikely": 0.20,
-    "Probably Not": 0.25,
-    "Little Chance": 0.10,
-    "Chances are Slight": 0.10,
-    "Improbable": 0.10,
-    "Highly Unlikely": 0.05,
-    "Almost No Chance": 0.02,
-}
-
-_LINGUISTIC_PHRASES_BY_LENGTH: tuple[tuple[str, float], ...] = tuple(
-    sorted(LINGUISTIC_TO_PROBABILITY.items(), key=lambda kv: len(kv[0]), reverse=True)
 )
 
 BRIEF_PROMPTS = {
@@ -108,11 +91,6 @@ GEMMA_PROBABILITY_PREFIX_TOKENS = [
     [":"],
     [" "],
 ]
-GEMMA_CONFIDENCE_PREFIX_TOKENS = [
-    ["\n"],
-    ["Confidence", " Confidence"],
-    [":"],
-]
 
 # Qwen2.5 token alternatives (from ans_gen/generated_answers/3_32B_200 decoded tokens)
 QWEN_GUESS_PREFIX_TOKENS = [
@@ -124,11 +102,6 @@ QWEN_PROBABILITY_PREFIX_TOKENS = [
     [" Probability"],
     [":"],
     [" "],
-]
-QWEN_CONFIDENCE_PREFIX_TOKENS = [
-    ["\n"],
-    [" Confidence", "Confidence"],
-    [":"],
 ]
 
 # Mistral-7B-Instruct-v0.1 (from ans_gen/generated_answers/1_svamp_mistral)
@@ -146,12 +119,6 @@ MISTRAL_PROBABILITY_PREFIX_TOKENS = [
     ["ability"],
     [":"],
     [""],  # space before number decodes as empty string
-]
-MISTRAL_CONFIDENCE_PREFIX_TOKENS = [
-    ["\n"],
-    ["Con"],
-    ["fidence"],
-    [":"],
 ]
 
 # Active tables; set via configure_prefix_tokens_for_model(model_name).
@@ -408,22 +375,6 @@ def parse_probability_from_response(response_str: str) -> float | None:
     if value < 0 or value > 1:
         return None
     return value
-
-
-def parse_linguistic_confidence_from_response(response_str: str) -> float | None:
-    if not response_str or not isinstance(response_str, str):
-        return None
-    matches = list(re.finditer(r"confidence\s*:\s*(.+)", response_str, re.IGNORECASE | re.DOTALL))
-    if not matches:
-        return None
-    tail = matches[0].group(1)
-    tail = tail.split("\n")[0].strip()
-    tail_collapsed = " ".join(tail.split())
-    lowered = tail_collapsed.casefold()
-    for phrase, prob in _LINGUISTIC_PHRASES_BY_LENGTH:
-        if phrase.casefold() in lowered:
-            return float(prob)
-    return None
 
 
 def parse_mode_confidence_from_response(response: str, *, linguistic_prompt: bool) -> Optional[float]:
@@ -2250,6 +2201,12 @@ def main() -> None:
     )
     args = parser.parse_args()
     configure_prefix_tokens_for_model(args.model_name)
+    if args.linguistic_confidence_prompt and not CONFIDENCE_PREFIX_TOKENS:
+        raise ValueError(
+            "--linguistic_confidence_prompt requires a non-empty Confidence: prefix table "
+            f"for --model_name={args.model_name!r}. Fill GEMMA/QWEN_CONFIDENCE_PREFIX_TOKENS "
+            "in process_generations_more_embs_from_h5.py or use Mistral."
+        )
 
     if len(set(args.ablation_mode)) != len(args.ablation_mode):
         raise ValueError(f"Duplicate ablation modes are not allowed: {args.ablation_mode}")
