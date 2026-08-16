@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""Direct Logit Attribution (DLA) on verbalised-confidence digit tokens.
+"""Direct Logit Attribution (DLA) on verbalised-confidence tokens.
 
-Reads processed H5 embeddings (must be generated with extend_probability_span)
-and attributes logit contrasts for the pre-period and post-period digits to
-attention/MLP residual writes (coarse) and individual attention heads (fine).
+Numeric Probability: runs read processed H5 embeddings generated with
+extend_probability_span and attribute logit contrasts for the pre-period and
+post-period digits to attention/MLP residual writes (coarse) and individual
+attention heads (fine).
+
+Linguistic Confidence: runs (`--linguistic_confidence_prompt`) assume the input
+H5 used a variable-length `--extend_probability_span` (phrase-dependent). They
+attribute `confidence_token_vs_rest` at the first phrase token and, for Mistral,
+also `L_vs_Un` at span index 6, keeping only examples whose decoded token there
+is `L` or `Un`. Other models raise until those experiments are added.
 """
 
 from __future__ import annotations
@@ -15,6 +22,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import sys
 from typing import Optional, Sequence
 
@@ -32,15 +40,42 @@ REPO_ROOT = SCRIPT_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from process_generations.process_generations_more_embs_from_h5 import (
+    configure_prefix_tokens_for_model,
+    parse_guess_and_probability_indices,
+)
+
 SUPPORTED_MODEL_NAMES = (
     "mistralai/Mistral-7B-Instruct-v0.1",
     "google/gemma-3-12b-it",
     "Qwen/Qwen2.5-32B-Instruct",
 )
 
+# First subword of each allowed Confidence: phrase, keyed by --model_name.
+# Gemma/Qwen lists are placeholders to fill in later.
+LINGUISTIC_FIRST_TOKENS: dict[str, tuple[str, ...]] = {
+    "mistralai/Mistral-7B-Instruct-v0.1": (
+        "Almost",
+        "High",
+        "Ch",
+        "Little",
+        "Un",
+        "Probably",
+        "About",
+        "Better",
+        "L",
+        "Very",
+    ),
+    "google/gemma-3-12b-it": (),
+    "Qwen/Qwen2.5-32B-Instruct": (),
+}
+
 ANNOTATION_ROUNDING_DP = 2
 HEAD_RESUM_ATOL = 1e-2
 COMPLETENESS_ATOL = 1e-2
+CONFIDENCE_ONE_ATOL = 1e-9
+L_VS_UN_DECODED_WINDOW = 3
+L_VS_UN_RESPONSE_LOG_CHARS = 160
 POSITION_ALIGNMENT_ASSUMPTION = (
     "cached H5 embeddings_probability rows are already at the predicting residual "
     "for each span token (generation step i predicts decoded_tokens[i]); no -1 shift applied"
@@ -752,6 +787,108 @@ def resolve_all_digit_ids(tokenizer) -> dict[str, tuple[int, str]]:
     return out
 
 
+def _is_piece_token_decode(decoded: str, piece: str) -> bool:
+    """True if decoded token content is exactly ``piece``, optionally with surrounding whitespace."""
+    if decoded == piece:
+        return True
+    return decoded.strip() == piece and piece in decoded
+
+
+def resolve_single_piece_token_id(tokenizer, piece: str) -> tuple[int, str]:
+    """Resolve a linguistic first-token string to a single tokenizer ID.
+
+    Same leading-empty-piece handling as ``resolve_single_digit_token_id``:
+    Mistral often encodes ``\"High\"`` as ``[leading_empty_or_space, High]``.
+    """
+    if not piece:
+        raise ValueError("Linguistic first-token piece must be non-empty.")
+
+    errors: list[str] = []
+    candidates = [piece, f" {piece}", f"\n{piece}", f"\t{piece}"]
+
+    for cand in candidates:
+        ids = tokenizer.encode(cand, add_special_tokens=False)
+        if len(ids) == 1:
+            decoded = _token_decode(tokenizer, ids[0])
+            if _is_piece_token_decode(decoded, piece):
+                return int(ids[0]), cand
+            errors.append(
+                f"{cand!r} -> single id {ids[0]} but decode={decoded!r} is not piece {piece!r}"
+            )
+        else:
+            errors.append(f"{cand!r} -> {ids} ({len(ids)} tokens)")
+
+    unk = getattr(tokenizer, "unk_token_id", None)
+    for tok in (piece, f"▁{piece}", f"Ġ{piece}", f" {piece}"):
+        tid = tokenizer.convert_tokens_to_ids(tok)
+        if tid is None or (unk is not None and int(tid) == int(unk)):
+            continue
+        decoded = _token_decode(tokenizer, int(tid))
+        if _is_piece_token_decode(decoded, piece):
+            return int(tid), tok
+        errors.append(f"token {tok!r} id={tid} decode={decoded!r} is not piece {piece!r}")
+
+    for cand in candidates:
+        ids = tokenizer.encode(cand, add_special_tokens=False)
+        if len(ids) < 2:
+            continue
+        piece_ids: list[int] = []
+        other_ok = True
+        parts: list[str] = []
+        for tid in ids:
+            decoded = _token_decode(tokenizer, tid)
+            parts.append(decoded)
+            if _is_piece_token_decode(decoded, piece):
+                piece_ids.append(int(tid))
+            elif decoded.strip() != "":
+                other_ok = False
+        if other_ok and len(set(piece_ids)) == 1:
+            return piece_ids[0], f"{cand}#piece"
+        errors.append(
+            f"{cand!r} multi-token pieces={parts!r} piece_ids={piece_ids} other_ok={other_ok}"
+        )
+
+    raise ValueError(
+        f"Could not resolve linguistic first token {piece!r} to a single tokenizer token. Tried:\n  "
+        + "\n  ".join(errors)
+    )
+
+
+def linguistic_first_tokens_for_model(model_name: str) -> tuple[str, ...]:
+    if model_name not in LINGUISTIC_FIRST_TOKENS:
+        raise ValueError(
+            f"No LINGUISTIC_FIRST_TOKENS entry for --model_name={model_name!r}."
+        )
+    pieces = LINGUISTIC_FIRST_TOKENS[model_name]
+    if not pieces:
+        raise ValueError(
+            "--linguistic_confidence_prompt requires a non-empty first-token list "
+            f"for --model_name={model_name!r}. Fill LINGUISTIC_FIRST_TOKENS."
+        )
+    return pieces
+
+
+def resolve_linguistic_first_token_ids(
+    tokenizer, pieces: Sequence[str]
+) -> dict[str, tuple[int, str]]:
+    out: dict[str, tuple[int, str]] = {}
+    for piece in pieces:
+        out[piece] = resolve_single_piece_token_id(tokenizer, piece)
+    return out
+
+
+def validate_confidence_thresholds(
+    high_conf_threshold: float, low_conf_threshold: float
+) -> None:
+    if not (0.0 <= low_conf_threshold <= 1.0 and 0.0 <= high_conf_threshold <= 1.0):
+        raise ValueError("Confidence thresholds must be in [0, 1].")
+    if low_conf_threshold >= high_conf_threshold:
+        raise ValueError(
+            f"low_conf_threshold ({low_conf_threshold}) must be < "
+            f"high_conf_threshold ({high_conf_threshold})."
+        )
+
+
 def high_low_digit_sets(
     high_conf_threshold: float, low_conf_threshold: float
 ) -> tuple[set[str], set[str]]:
@@ -760,19 +897,12 @@ def high_low_digit_sets(
     Example cohort splits (``__high_conf`` / ``__low_conf``) still use the raw
     verbalised-confidence thresholds and are unaffected by this mapping.
 
-    Digit ``\"0\"`` is never included in the low set: with the default thresholds
-    this yields high={9}, low={1} rather than low={0,1}.
+    Digit ``\"0\"`` is included in the low set: with the default thresholds
+    this yields high={9}, low={0,1}.
     """
-    if not (0.0 <= low_conf_threshold <= 1.0 and 0.0 <= high_conf_threshold <= 1.0):
-        raise ValueError("Confidence thresholds must be in [0, 1].")
-    if low_conf_threshold >= high_conf_threshold:
-        raise ValueError(
-            f"low_conf_threshold ({low_conf_threshold}) must be < "
-            f"high_conf_threshold ({high_conf_threshold})."
-        )
+    validate_confidence_thresholds(high_conf_threshold, low_conf_threshold)
     high = {str(d) for d in range(int(high_conf_threshold * 10), 10)}
     low = {str(d) for d in range(0, int(low_conf_threshold * 10) + 1)}
-    low.discard("0")
     if not high:
         raise ValueError(
             f"high_conf_threshold={high_conf_threshold} produced empty high digit set."
@@ -780,7 +910,7 @@ def high_low_digit_sets(
     if not low:
         raise ValueError(
             f"low_conf_threshold={low_conf_threshold} produced empty low digit set "
-            "after excluding digit '0' from the high_vs_low direction."
+            "for the high_vs_low direction."
         )
     if high & low:
         raise ValueError(
@@ -823,11 +953,12 @@ def contrast_direction(
 
 @dataclass(frozen=True)
 class ContrastSpec:
-    position: str  # "pre_period" | "post_period"
-    name: str  # e.g. "digit_vs_rest"
+    position: str  # "pre_period" | "post_period" | "first_value" | "mistral_l_vs_un"
+    name: str  # e.g. "digit_vs_rest" | "confidence_token_vs_rest" | "L_vs_Un"
     u: np.ndarray  # [H]
     pos_token_ids: tuple[int, ...]
     neg_token_ids: tuple[int, ...] | None  # None => all others
+    span_index: int | None = None  # absolute embeddings_probability index when set
 
 
 def build_contrasts(
@@ -875,7 +1006,60 @@ def build_contrasts(
     ]
 
 
-def position_index(position: str, span_len: int) -> int:
+def build_linguistic_contrasts(
+    w_u: np.ndarray,
+    first_token_ids: Sequence[int],
+    *,
+    l_token_id: int,
+    un_token_id: int,
+    first_value_index: int,
+    l_vs_un_index: int = 6,
+) -> list[ContrastSpec]:
+    vocab_size = w_u.shape[1]
+    pos_ids = tuple(dict.fromkeys(int(i) for i in first_token_ids))
+    if not pos_ids:
+        raise ValueError("Linguistic first-token id list is empty after deduplication.")
+    if first_value_index < 0:
+        raise ValueError(f"first_value_index must be >= 0, got {first_value_index}")
+    if l_vs_un_index < 0:
+        raise ValueError(f"l_vs_un_index must be >= 0, got {l_vs_un_index}")
+    return [
+        ContrastSpec(
+            position="first_value",
+            name="confidence_token_vs_rest",
+            u=contrast_direction(w_u, pos_ids, None, vocab_size=vocab_size),
+            pos_token_ids=pos_ids,
+            neg_token_ids=None,
+            span_index=int(first_value_index),
+        ),
+        ContrastSpec(
+            position="mistral_l_vs_un",
+            name="L_vs_Un",
+            u=contrast_direction(
+                w_u, [int(l_token_id)], [int(un_token_id)], vocab_size=vocab_size
+            ),
+            pos_token_ids=(int(l_token_id),),
+            neg_token_ids=(int(un_token_id),),
+            span_index=int(l_vs_un_index),
+        ),
+    ]
+
+
+def position_index(position: str, span_len: int, *, span_index: int | None = None) -> int:
+    if span_index is not None:
+        if span_index < 0:
+            raise ValueError(f"span_index must be >= 0, got {span_index}")
+        if span_index >= span_len:
+            raise ValueError(
+                f"span_index {span_index} is out of range for span length {span_len}."
+            )
+        return int(span_index)
+    if position == "last_span":
+        if span_len < 1:
+            raise ValueError(
+                f"Confidence span length {span_len} < 1; cannot locate last token."
+            )
+        return span_len - 1
     if span_len < 3:
         raise ValueError(f"Probability span length {span_len} < 3; cannot locate digits.")
     if position == "pre_period":
@@ -923,6 +1107,10 @@ def _h5_list_length(group_obj: h5py.Group) -> int:
     return int(group_obj.attrs.get("__len__", len(group_obj.keys())))
 
 
+def _is_verbalised_confidence_one(conf: float) -> bool:
+    return float(conf) >= 1.0 - CONFIDENCE_ONE_ATOL
+
+
 def _read_verbalised_confidence_scalar(r0: h5py.Group) -> float | None:
     ds = r0.get("verbalised_confidence")
     if ds is None or not isinstance(ds, h5py.Dataset):
@@ -951,6 +1139,44 @@ def _read_response_string(r0: h5py.Group) -> str:
             return str(item)
         return str(data)
     return str(data)
+
+
+def _decode_h5_string(value) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    if isinstance(value, np.ndarray) and value.ndim == 0:
+        return _decode_h5_string(value.item())
+    return str(value)
+
+
+def _read_decoded_tokens(r0: h5py.Group) -> list[str] | None:
+    node = r0.get("decoded_tokens")
+    if node is None:
+        return None
+    if isinstance(node, h5py.Group):
+        if node.attrs.get("__type__") == "none":
+            return None
+        length = _h5_list_length(node)
+        if length <= 0:
+            return None
+        out: list[str] = []
+        for i in range(length):
+            item = node.get(str(i))
+            if item is None or not isinstance(item, h5py.Dataset):
+                return None
+            out.append(_decode_h5_string(item[()]))
+        return out
+    if not isinstance(node, h5py.Dataset):
+        return None
+    data = node[()]
+    if isinstance(data, np.ndarray):
+        if data.ndim == 0:
+            text = _decode_h5_string(data.item())
+            return [text] if text else None
+        tokens = [_decode_h5_string(x) for x in data.tolist()]
+        return tokens if tokens else None
+    text = _decode_h5_string(data)
+    return [text] if text else None
 
 
 def _get_list_embeddings(r0: h5py.Group, component: str) -> list[np.ndarray] | None:
@@ -984,6 +1210,70 @@ class ExampleData:
     mlp: list[np.ndarray]
     concat: list[np.ndarray] | None  # preferred for fine; optional if o is present
     o: list[np.ndarray] | None = None  # o_proj outs; concat fallback + fine diagnostics
+    decoded_tokens: list[str] | None = None
+
+
+def _decoded_token_window(
+    tokens: Sequence[str], index: int, *, radius: int = L_VS_UN_DECODED_WINDOW
+) -> list[str]:
+    start = max(0, int(index) - radius)
+    end = min(len(tokens), int(index) + radius + 1)
+    return list(tokens[start:end])
+
+
+def _l_vs_un_token_check(
+    ex: ExampleData, span_index: int
+) -> tuple[str | None, int | None, str | None]:
+    """Return (token, first_prob_token_index, skip_reason). skip_reason is None if keep."""
+    if not ex.decoded_tokens:
+        return None, None, "missing decoded_tokens"
+    parsed = parse_guess_and_probability_indices(
+        ex.decoded_tokens, linguistic_confidence_prompt=True
+    )
+    if parsed is None:
+        return None, None, "Confidence: prefix parse failed"
+    _last_guess, first_prob, _end_prob = parsed
+    abs_idx = int(first_prob) + int(span_index)
+    if abs_idx < 0 or abs_idx >= len(ex.decoded_tokens):
+        return (
+            None,
+            int(first_prob),
+            f"mapped index {abs_idx} out of range (len={len(ex.decoded_tokens)})",
+        )
+    token = ex.decoded_tokens[abs_idx]
+    if _is_piece_token_decode(token, "L") or _is_piece_token_decode(token, "Un"):
+        return token, int(first_prob), None
+    return token, int(first_prob), "token is not L or Un"
+
+
+def _log_l_vs_un_skip(
+    ex: ExampleData,
+    *,
+    span_index: int,
+    token: str | None,
+    first_prob_token_index: int | None,
+    reason: str,
+) -> None:
+    abs_idx = (
+        None
+        if first_prob_token_index is None
+        else int(first_prob_token_index) + int(span_index)
+    )
+    window: list[str] | None = None
+    if ex.decoded_tokens is not None and abs_idx is not None:
+        window = _decoded_token_window(ex.decoded_tokens, abs_idx)
+    response_preview = ex.response[:L_VS_UN_RESPONSE_LOG_CHARS]
+    logging.info(
+        "Skipping L_vs_Un example %s: %s; span_index=%d token=%r "
+        "first_prob_token_index=%s decoded_window=%r response=%r",
+        ex.example_id,
+        reason,
+        span_index,
+        token,
+        first_prob_token_index,
+        window,
+        response_preview,
+    )
 
 
 def _open_h5_readonly(path: str):
@@ -999,8 +1289,10 @@ def _try_parse_example_data(
     ex_id: str,
     r0: h5py.Group,
     expected_span: int,
-    expected_probability_tokens: int,
+    span_mismatch_detail: str,
     require_head_source: bool,
+    require_exact_span: bool = True,
+    require_decoded_tokens: bool = False,
 ) -> ExampleData | None:
     conf = _read_verbalised_confidence_scalar(r0)
     if conf is None:
@@ -1015,13 +1307,14 @@ def _try_parse_example_data(
     if require_head_source and concat is None and o is None:
         return None
     span_len = len(res)
-    if span_len != expected_span:
-        raise ValueError(
-            f"Example {ex_id}: embeddings_probability span length is {span_len}, "
-            f"but expected exactly expected_probability_tokens+2="
-            f"{expected_probability_tokens}+2={expected_span}. "
-            "Input H5 must have been generated with extend_probability_span."
-        )
+    if require_exact_span:
+        if span_len != expected_span:
+            raise ValueError(
+                f"Example {ex_id}: embeddings_probability span length is {span_len}, "
+                f"{span_mismatch_detail}"
+            )
+    elif span_len < expected_span:
+        return None
     if len(attn) != span_len or len(mlp) != span_len:
         raise ValueError(
             f"Example {ex_id}: mismatched span lengths "
@@ -1037,6 +1330,12 @@ def _try_parse_example_data(
             f"Example {ex_id}: mismatched o span length "
             f"res={span_len} o={len(o)}"
         )
+    decoded_tokens = _read_decoded_tokens(r0)
+    if require_decoded_tokens and not decoded_tokens:
+        raise ValueError(
+            f"Example {ex_id}: missing responses/0/decoded_tokens. Reprocess with "
+            "process_generations_more_embs_from_h5.py so decoded_tokens are stored."
+        )
     return ExampleData(
         example_id=str(ex_id),
         verbalised_confidence=float(conf),
@@ -1046,6 +1345,7 @@ def _try_parse_example_data(
         mlp=mlp,
         concat=concat,
         o=o,
+        decoded_tokens=decoded_tokens,
     )
 
 
@@ -1054,23 +1354,36 @@ class ExampleCohorts:
     all: list[ExampleData]
     high: list[ExampleData]
     low: list[ExampleData]
+    all_excl_one: list[ExampleData]
+    high_excl_one: list[ExampleData]
+    low_excl_one: list[ExampleData]
 
 
 def load_usable_example_cohorts(
     input_h5: str,
     *,
-    expected_probability_tokens: int,
+    expected_span: int,
+    span_mismatch_detail: str,
     max_examples: int,
     require_head_source: bool,
     high_conf_threshold: float,
     low_conf_threshold: float,
     fill_confidence_splits: bool,
+    require_exact_span: bool = True,
+    fill_post_period_excl_one: bool = False,
+    require_decoded_tokens: bool = False,
 ) -> ExampleCohorts:
-    """Scan H5 once; fill all/high/low cohorts with independent caps at ``max_examples``."""
-    expected_span = expected_probability_tokens + 2
+    """Scan H5 once; fill all/high/low cohorts with independent caps at ``max_examples``.
+
+    When ``fill_post_period_excl_one`` is true, also fill matching post-period
+    cohorts that skip verbalised_confidence == 1.0, still capped independently.
+    """
     examples_all: list[ExampleData] = []
     examples_high: list[ExampleData] = []
     examples_low: list[ExampleData] = []
+    examples_all_excl_one: list[ExampleData] = []
+    examples_high_excl_one: list[ExampleData] = []
+    examples_low_excl_one: list[ExampleData] = []
     with _open_h5_readonly(input_h5) as f:
         examples = f.get("examples")
         if examples is None or not isinstance(examples, h5py.Group):
@@ -1080,7 +1393,28 @@ def load_usable_example_cohorts(
             all_full = len(examples_all) >= max_examples
             high_full = (not fill_confidence_splits) or len(examples_high) >= max_examples
             low_full = (not fill_confidence_splits) or len(examples_low) >= max_examples
-            if all_full and high_full and low_full:
+            all_excl_full = (
+                (not fill_post_period_excl_one)
+                or len(examples_all_excl_one) >= max_examples
+            )
+            high_excl_full = (
+                (not fill_post_period_excl_one)
+                or (not fill_confidence_splits)
+                or len(examples_high_excl_one) >= max_examples
+            )
+            low_excl_full = (
+                (not fill_post_period_excl_one)
+                or (not fill_confidence_splits)
+                or len(examples_low_excl_one) >= max_examples
+            )
+            if (
+                all_full
+                and high_full
+                and low_full
+                and all_excl_full
+                and high_excl_full
+                and low_excl_full
+            ):
                 break
 
             ex_group = examples[ex_id]
@@ -1092,26 +1426,54 @@ def load_usable_example_cohorts(
             conf = _read_verbalised_confidence_scalar(r0)
             if conf is None:
                 continue
+            conf_f = float(conf)
+            is_one = _is_verbalised_confidence_one(conf_f)
             want_all = not all_full
             want_high = (
                 fill_confidence_splits
                 and (not high_full)
-                and float(conf) >= high_conf_threshold
+                and conf_f >= high_conf_threshold
             )
             want_low = (
                 fill_confidence_splits
                 and (not low_full)
-                and float(conf) <= low_conf_threshold
+                and conf_f <= low_conf_threshold
             )
-            if not (want_all or want_high or want_low):
+            want_all_excl = (
+                fill_post_period_excl_one and (not all_excl_full) and (not is_one)
+            )
+            want_high_excl = (
+                fill_post_period_excl_one
+                and fill_confidence_splits
+                and (not high_excl_full)
+                and (not is_one)
+                and conf_f >= high_conf_threshold
+            )
+            want_low_excl = (
+                fill_post_period_excl_one
+                and fill_confidence_splits
+                and (not low_excl_full)
+                and (not is_one)
+                and conf_f <= low_conf_threshold
+            )
+            if not (
+                want_all
+                or want_high
+                or want_low
+                or want_all_excl
+                or want_high_excl
+                or want_low_excl
+            ):
                 continue
 
             parsed = _try_parse_example_data(
                 ex_id=str(ex_id),
                 r0=r0,
                 expected_span=expected_span,
-                expected_probability_tokens=expected_probability_tokens,
+                span_mismatch_detail=span_mismatch_detail,
                 require_head_source=require_head_source,
+                require_exact_span=require_exact_span,
+                require_decoded_tokens=require_decoded_tokens,
             )
             if parsed is None:
                 continue
@@ -1122,6 +1484,12 @@ def load_usable_example_cohorts(
                 examples_high.append(parsed)
             if want_low:
                 examples_low.append(parsed)
+            if want_all_excl:
+                examples_all_excl_one.append(parsed)
+            if want_high_excl:
+                examples_high_excl_one.append(parsed)
+            if want_low_excl:
+                examples_low_excl_one.append(parsed)
 
     if not examples_all:
         required = (
@@ -1131,7 +1499,14 @@ def load_usable_example_cohorts(
             f"No usable examples found in {input_h5} with required "
             f"{required} probability embeddings."
         )
-    return ExampleCohorts(all=examples_all, high=examples_high, low=examples_low)
+    return ExampleCohorts(
+        all=examples_all,
+        high=examples_high,
+        low=examples_low,
+        all_excl_one=examples_all_excl_one,
+        high_excl_one=examples_high_excl_one,
+        low_excl_one=examples_low_excl_one,
+    )
 
 
 def load_usable_examples(
@@ -1142,9 +1517,15 @@ def load_usable_examples(
     require_head_source: bool,
 ) -> list[ExampleData]:
     """Backward-compatible wrapper: return the all-examples cohort only."""
+    expected_span = expected_probability_tokens + 2
     cohorts = load_usable_example_cohorts(
         input_h5,
-        expected_probability_tokens=expected_probability_tokens,
+        expected_span=expected_span,
+        span_mismatch_detail=(
+            f"but expected exactly expected_probability_tokens+2="
+            f"{expected_probability_tokens}+2={expected_span}. "
+            "Input H5 must have been generated with extend_probability_span."
+        ),
         max_examples=max_examples,
         require_head_source=require_head_source,
         high_conf_threshold=1.0,
@@ -1471,7 +1852,9 @@ def run_dla_for_experiment(
     for ei, ex in enumerate(tqdm(examples, desc=f"{contrast.position}/{contrast.name}/{granularity}")):
         example_ids.append(ex.example_id)
         span_len = len(ex.res)
-        pos_idx = position_index(contrast.position, span_len)
+        pos_idx = position_index(
+            contrast.position, span_len, span_index=contrast.span_index
+        )
 
         res_tok = ex.res[pos_idx]  # [n_res_layers, H]
         attn_tok = ex.attn[pos_idx]  # [n_layers, H]
@@ -1914,6 +2297,33 @@ def write_distribution_plot(
     plt.close(fig)
 
 
+_FINE_HEAD_LABEL_RE = re.compile(r"^L(\d+)_H(\d+)$")
+_FINE_MLP_LABEL_RE = re.compile(r"^L(\d+)_mlp_block$")
+
+
+def _dla_label_to_ablate_unit(label: str) -> Optional[str]:
+    """Map fine DLA labels to ablation-unit tokens (a<layer>.h<head> / m<layer>)."""
+    m = _FINE_HEAD_LABEL_RE.fullmatch(label)
+    if m:
+        return f"a{m.group(1)}.h{m.group(2)}"
+    m = _FINE_MLP_LABEL_RE.fullmatch(label)
+    if m:
+        return f"m{m.group(1)}"
+    return None
+
+
+def _ablate_summary_lines(labels: Sequence[str], *, k: int = 10) -> Optional[list[str]]:
+    """Return top_10/bottom_10 lines if every label is a fine DLA component."""
+    units = [_dla_label_to_ablate_unit(lab) for lab in labels]
+    if not units or any(u is None for u in units):
+        return None
+    n = min(k, len(units))
+    return [
+        f"top_10: {','.join(units[:n])}",
+        f"bottom_10: {','.join(units[-n:])}",
+    ]
+
+
 def write_ranked_mean_txt(
     path: Path,
     ranked: Sequence[ComponentStats],
@@ -1933,6 +2343,10 @@ def write_ranked_mean_txt(
             f"{s.label}\t{s.mean:.6g}\t{s.sem:.6g}\t{s.median:.6g}\t"
             f"{s.top10_fraction:.4f}\t{s.sign_consistency:.4f}"
         )
+    summary = _ablate_summary_lines([s.label for s in ranked])
+    if summary:
+        lines.append("")
+        lines.extend(summary)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -2163,12 +2577,21 @@ def write_readme(path: Path) -> None:
         "Model weights for this run were loaded selectively from safetensors shards on CPU "
         "(final norm, unembedding, and o_proj only when fine granularity is requested) — "
         "the full model is not loaded.\n\n"
-        "Experiments are nested under `pre_period/` and `post_period/`. When "
-        "`--confidence_split` is enabled (default), each "
-        "`{position}/{contrast}__{granularity}` experiment is also run on high- and "
-        "low-confidence example cohorts "
-        "(`...__high_conf/`, `...__low_conf/`), capped independently at "
-        "`--max_examples_for_mean`. Disable with `--no-confidence_split`.\n",
+        "Numeric Probability: runs nest experiments under `pre_period/` and `post_period/` "
+        "as `{position}/{contrast}__{granularity}`. Post-period experiments drop samples "
+        "whose verbalised_confidence is 1.0 and refill `--max_examples_for_mean` "
+        "independently. The post-period `high_vs_low` low digit set includes `0`.\n\n"
+        "Linguistic Confidence: runs (`--linguistic_confidence_prompt`) assume a "
+        "variable-length extended Confidence: span. They write experiments flat under "
+        "the run root as `{contrast}__{granularity}`. `confidence_token_vs_rest` is "
+        "attributed at the first phrase token (`expected_confidence_tokens - 1`). "
+        "Mistral additionally runs `L_vs_Un` at span index 6 (examples shorter than "
+        "7 span tokens, or whose decoded token there is not `L` or `Un`, are skipped "
+        "for that contrast). Other models are not yet supported for linguistic DLA.\n\n"
+        "When `--confidence_split` is enabled (default), each experiment is also run on "
+        "high- and low-confidence example cohorts (`...__high_conf/`, `...__low_conf/`), "
+        "capped independently at `--max_examples_for_mean`. Post-period high/low splits "
+        "also exclude verbalised_confidence 1.0. Disable with `--no-confidence_split`.\n",
         encoding="utf-8",
     )
 
@@ -2179,15 +2602,22 @@ def write_config_txt(
     args: argparse.Namespace,
     adapter: ModelAdapter,
     input_h5_resolved: str,
-    digit_ids: dict[str, tuple[int, str]],
-    high_digits: set[str],
-    low_digits: set[str],
+    digit_ids: dict[str, tuple[int, str]] | None,
+    high_digits: set[str] | None,
+    low_digits: set[str] | None,
+    first_token_ids: dict[str, tuple[int, str]] | None,
+    l_vs_un_token_ids: dict[str, tuple[int, str]] | None,
     individual_ids_all: Sequence[str],
     individual_ids_high: Sequence[str] | None,
     individual_ids_low: Sequence[str] | None,
     actual_n_examples_all: int,
     actual_n_examples_high: int | None,
     actual_n_examples_low: int | None,
+    post_period_exclude_confidence_one: bool,
+    actual_n_examples_all_post_period: int | None,
+    actual_n_examples_high_post_period: int | None,
+    actual_n_examples_low_post_period: int | None,
+    l_vs_un_skipped_not_l_or_un: int | None,
     completeness_summaries: dict,
     finished_at: str,
     weight_load_method: str,
@@ -2227,25 +2657,49 @@ def write_config_txt(
         f"position_alignment_assumption={POSITION_ALIGNMENT_ASSUMPTION}",
         "",
         "[CLI]",
+        f"linguistic_confidence_prompt={args.linguistic_confidence_prompt}",
         f"expected_probability_tokens={args.expected_probability_tokens}",
+        f"expected_confidence_tokens={args.expected_confidence_tokens}",
         f"high_conf_threshold={args.high_conf_threshold}",
         f"low_conf_threshold={args.low_conf_threshold}",
         f"confidence_split={args.confidence_split}",
+        f"post_period_exclude_confidence_one={post_period_exclude_confidence_one}",
         f"legacy_gemma_pre_postnorm_h5={args.legacy_gemma_pre_postnorm_h5}",
         f"granularity={args.granularity}",
         f"n_individual_examples={args.n_individual_examples}",
         f"max_examples_for_mean={args.max_examples_for_mean}",
         f"individual_example_indices={args.individual_example_indices}",
         f"bar_chart_top_k={args.bar_chart_top_k}",
-        "",
-        "[Digits]",
-        f"high_digits={sorted(high_digits)}",
-        f"low_digits={sorted(low_digits)}",
     ]
-    for d in "0123456789":
-        tid, form = digit_ids[d]
-        lines.append(f"digit_{d}_token_id={tid}")
-        lines.append(f"digit_{d}_resolved_form={form!r}")
+    if args.linguistic_confidence_prompt:
+        lines += ["", "[LinguisticFirstTokens]"]
+        if first_token_ids is None:
+            raise ValueError("linguistic run is missing resolved first_token_ids.")
+        for piece, (tid, form) in first_token_ids.items():
+            lines.append(f"piece={piece!r} token_id={tid} resolved_form={form!r}")
+        lines += ["", "[LinguisticLvsUn]"]
+        if l_vs_un_token_ids is None:
+            raise ValueError("linguistic run is missing resolved L_vs_Un token ids.")
+        for piece, (tid, form) in l_vs_un_token_ids.items():
+            lines.append(f"piece={piece!r} token_id={tid} resolved_form={form!r}")
+        lines.append("span_index=6")
+        skipped_n = (
+            0 if l_vs_un_skipped_not_l_or_un is None else int(l_vs_un_skipped_not_l_or_un)
+        )
+        lines.append(f"l_vs_un_skipped_not_l_or_un={skipped_n}")
+    else:
+        if digit_ids is None or high_digits is None or low_digits is None:
+            raise ValueError("numeric run is missing digit_ids/high_digits/low_digits.")
+        lines += [
+            "",
+            "[Digits]",
+            f"high_digits={sorted(high_digits)}",
+            f"low_digits={sorted(low_digits)}",
+        ]
+        for d in "0123456789":
+            tid, form = digit_ids[d]
+            lines.append(f"digit_{d}_token_id={tid}")
+            lines.append(f"digit_{d}_resolved_form={form!r}")
     lines += [
         "",
         "[Examples]",
@@ -2257,11 +2711,15 @@ def write_config_txt(
         f"actual_n_examples_low={actual_n_examples_low}",
         f"individual_example_ids_low="
         f"{None if individual_ids_low is None else list(individual_ids_low)}",
+        f"actual_n_examples_all_post_period={actual_n_examples_all_post_period}",
+        f"actual_n_examples_high_post_period={actual_n_examples_high_post_period}",
+        f"actual_n_examples_low_post_period={actual_n_examples_low_post_period}",
         "",
         "[Numerics]",
         f"annotation_rounding_dp={ANNOTATION_ROUNDING_DP}",
         f"head_resum_atol={HEAD_RESUM_ATOL}",
         f"completeness_atol={COMPLETENESS_ATOL}",
+        f"confidence_one_atol={CONFIDENCE_ONE_ATOL}",
         "",
         "[CompletenessResiduals]",
     ]
@@ -2287,7 +2745,7 @@ def parse_individual_ids(raw: str | None) -> list[str] | None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Direct Logit Attribution on verbalised-confidence digit tokens."
+        description="Direct Logit Attribution on verbalised-confidence tokens."
     )
     p.add_argument(
         "--model_name",
@@ -2300,7 +2758,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--input_h5",
         type=str,
         required=True,
-        help="Processed verbalised embeddings H5 (must use extend_probability_span).",
+        help=(
+            "Processed verbalised embeddings H5. Numeric runs must use "
+            "extend_probability_span. Linguistic runs assume a variable-length "
+            "extended Confidence: span."
+        ),
     )
     p.add_argument(
         "--device",
@@ -2318,15 +2780,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["float32"],
         help="DLA computation dtype (forced float32 on CPU).",
     )
-    p.add_argument("--expected_probability_tokens", type=int, default=5)
+    p.add_argument(
+        "--linguistic_confidence_prompt",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "If true, attribute linguistic Confidence: DLA (Mistral only). "
+            "Assumes a variable-length extended span: confidence_token_vs_rest at "
+            "the first phrase token, plus L_vs_Un at span index 6 (kept only when "
+            "decoded_tokens at that index is L or Un). If false (default), "
+            "run numeric Probability: digit DLA."
+        ),
+    )
+    p.add_argument(
+        "--expected_probability_tokens",
+        type=int,
+        default=5,
+        help="Numeric-only: stored probability span length before the +2 extension.",
+    )
+    p.add_argument(
+        "--expected_confidence_tokens",
+        type=int,
+        default=5,
+        help=(
+            "When --linguistic_confidence_prompt, unextended Confidence: span length "
+            "(prefix plus first phrase token). Stored spans may be longer."
+        ),
+    )
     p.add_argument(
         "--low_conf_threshold",
         type=float,
         default=0.1,
         help=(
-            "Low verbalised-confidence cutoff for example cohorts, and for mapping "
-            "digits into the high_vs_low contrast direction (digit '0' is excluded "
-            "from that direction's low set)."
+            "Low verbalised-confidence cutoff for example cohorts. On numeric runs, "
+            "also maps digits into the high_vs_low contrast direction (digit '0' is "
+            "included in that direction's low set)."
         ),
     )
     p.add_argument(
@@ -2334,8 +2822,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.9,
         help=(
-            "High verbalised-confidence cutoff for example cohorts, and for mapping "
-            "digits into the high_vs_low contrast direction."
+            "High verbalised-confidence cutoff for example cohorts. On numeric runs, "
+            "also maps digits into the high_vs_low contrast direction."
         ),
     )
     p.add_argument(
@@ -2404,6 +2892,17 @@ def main() -> None:
             "--model_name=google/gemma-3-12b-it "
             f"(got {args.model_name!r})."
         )
+    if args.linguistic_confidence_prompt and args.expected_confidence_tokens < 1:
+        raise ValueError("--expected_confidence_tokens must be >= 1")
+    validate_confidence_thresholds(args.high_conf_threshold, args.low_conf_threshold)
+    if args.linguistic_confidence_prompt:
+        if args.model_name != "mistralai/Mistral-7B-Instruct-v0.1":
+            raise ValueError(
+                "--linguistic_confidence_prompt DLA is currently only implemented for "
+                "mistralai/Mistral-7B-Instruct-v0.1 "
+                f"(got {args.model_name!r})."
+            )
+        linguistic_first_tokens_for_model(args.model_name)
 
     # Deduplicate granularity while preserving order
     gran_list: list[str] = []
@@ -2451,23 +2950,64 @@ def main() -> None:
     logging.info("Adapter: %s", asdict(adapter))
     logging.info("Resolved weight keys: %s", tensors.resolved_weight_keys)
 
-    digit_ids = resolve_all_digit_ids(tensors.tokenizer)
-    for d, (tid, form) in digit_ids.items():
-        logging.info("Digit %s -> id=%s form=%r", d, tid, form)
+    digit_ids: dict[str, tuple[int, str]] | None = None
+    high_digits: set[str] | None = None
+    low_digits: set[str] | None = None
+    first_token_ids: dict[str, tuple[int, str]] | None = None
+    l_vs_un_token_ids: dict[str, tuple[int, str]] | None = None
+    if args.linguistic_confidence_prompt:
+        configure_prefix_tokens_for_model(args.model_name)
+        pieces = linguistic_first_tokens_for_model(args.model_name)
+        first_token_ids = resolve_linguistic_first_token_ids(tensors.tokenizer, pieces)
+        for piece, (tid, form) in first_token_ids.items():
+            logging.info("Linguistic first token %r -> id=%s form=%r", piece, tid, form)
+        l_id, l_form = resolve_single_piece_token_id(tensors.tokenizer, "L")
+        un_id, un_form = resolve_single_piece_token_id(tensors.tokenizer, "Un")
+        l_vs_un_token_ids = {"L": (l_id, l_form), "Un": (un_id, un_form)}
+        logging.info("L vs Un: L id=%s form=%r; Un id=%s form=%r", l_id, l_form, un_id, un_form)
+        expected_span = args.expected_confidence_tokens
+        span_mismatch_detail = (
+            f"but expected at least expected_confidence_tokens="
+            f"{args.expected_confidence_tokens} (variable-length extended phrase span)."
+        )
+        contrasts = build_linguistic_contrasts(
+            tensors.w_u,
+            [tid for tid, _form in first_token_ids.values()],
+            l_token_id=l_id,
+            un_token_id=un_id,
+            first_value_index=args.expected_confidence_tokens - 1,
+        )
+    else:
+        digit_ids = resolve_all_digit_ids(tensors.tokenizer)
+        for d, (tid, form) in digit_ids.items():
+            logging.info("Digit %s -> id=%s form=%r", d, tid, form)
+        high_digits, low_digits = high_low_digit_sets(
+            args.high_conf_threshold, args.low_conf_threshold
+        )
+        logging.info(
+            "High digits %s  Low digits %s", sorted(high_digits), sorted(low_digits)
+        )
+        expected_span = args.expected_probability_tokens + 2
+        span_mismatch_detail = (
+            f"but expected exactly expected_probability_tokens+2="
+            f"{args.expected_probability_tokens}+2={expected_span}. "
+            "Input H5 must have been generated with extend_probability_span."
+        )
+        contrasts = build_contrasts(tensors.w_u, digit_ids, high_digits, low_digits)
 
-    high_digits, low_digits = high_low_digit_sets(
-        args.high_conf_threshold, args.low_conf_threshold
-    )
-    logging.info("High digits %s  Low digits %s", sorted(high_digits), sorted(low_digits))
-
+    fill_post_period_excl_one = not args.linguistic_confidence_prompt
     cohorts = load_usable_example_cohorts(
         input_h5,
-        expected_probability_tokens=args.expected_probability_tokens,
+        expected_span=expected_span,
+        span_mismatch_detail=span_mismatch_detail,
         max_examples=args.max_examples_for_mean,
         require_head_source=require_head_source,
         high_conf_threshold=args.high_conf_threshold,
         low_conf_threshold=args.low_conf_threshold,
         fill_confidence_splits=args.confidence_split,
+        require_exact_span=not args.linguistic_confidence_prompt,
+        fill_post_period_excl_one=fill_post_period_excl_one,
+        require_decoded_tokens=args.linguistic_confidence_prompt,
     )
     examples_all = cohorts.all
     actual_n_all = len(examples_all)
@@ -2501,6 +3041,28 @@ def main() -> None:
     individual_ids_low: list[str] | None = None
     actual_n_high: int | None = None
     actual_n_low: int | None = None
+    actual_n_all_post: int | None = None
+    actual_n_high_post: int | None = None
+    actual_n_low_post: int | None = None
+    if fill_post_period_excl_one:
+        if not cohorts.all_excl_one:
+            raise ValueError(
+                "No usable post-period examples after excluding "
+                "verbalised_confidence == 1.0."
+            )
+        actual_n_all_post = len(cohorts.all_excl_one)
+        logging.info(
+            "Using %d post-period all-examples excluding confidence 1.0 (cap=%d)",
+            actual_n_all_post,
+            args.max_examples_for_mean,
+        )
+        if actual_n_all_post <= args.n_individual_examples:
+            raise ValueError(
+                f"Post-period all-examples cohort has {actual_n_all_post} usable "
+                "examples after excluding verbalised_confidence == 1.0, which must "
+                f"be strictly greater than --n_individual_examples "
+                f"({args.n_individual_examples})."
+            )
     if args.confidence_split:
         if not cohorts.high:
             raise ValueError(
@@ -2540,30 +3102,148 @@ def main() -> None:
         )
         logging.info("Individual example IDs (high_conf): %s", individual_ids_high)
         logging.info("Individual example IDs (low_conf): %s", individual_ids_low)
+        if fill_post_period_excl_one:
+            if not cohorts.high_excl_one:
+                raise ValueError(
+                    "confidence_split enabled but post-period high-confidence cohort "
+                    "is empty (verbalised_confidence >= "
+                    f"{args.high_conf_threshold} and != 1.0)."
+                )
+            if not cohorts.low_excl_one:
+                raise ValueError(
+                    "confidence_split enabled but post-period low-confidence cohort "
+                    "is empty (verbalised_confidence <= "
+                    f"{args.low_conf_threshold} and != 1.0)."
+                )
+            actual_n_high_post = len(cohorts.high_excl_one)
+            actual_n_low_post = len(cohorts.low_excl_one)
+            if actual_n_high_post <= args.n_individual_examples:
+                raise ValueError(
+                    f"Post-period high-confidence cohort has {actual_n_high_post} "
+                    "usable examples after excluding verbalised_confidence == 1.0, "
+                    "which must be strictly greater than --n_individual_examples "
+                    f"({args.n_individual_examples})."
+                )
+            if actual_n_low_post <= args.n_individual_examples:
+                raise ValueError(
+                    f"Post-period low-confidence cohort has {actual_n_low_post} "
+                    "usable examples after excluding verbalised_confidence == 1.0, "
+                    "which must be strictly greater than --n_individual_examples "
+                    f"({args.n_individual_examples})."
+                )
+            logging.info(
+                "Using %d post-period high-conf / %d post-period low-conf examples "
+                "excluding confidence 1.0 (cap=%d each)",
+                actual_n_high_post,
+                actual_n_low_post,
+                args.max_examples_for_mean,
+            )
 
     if need_o_proj:
         fallback_examples = list(examples_all)
         if args.confidence_split:
             fallback_examples.extend(cohorts.high)
             fallback_examples.extend(cohorts.low)
+        if fill_post_period_excl_one:
+            fallback_examples.extend(cohorts.all_excl_one)
+            if args.confidence_split:
+                fallback_examples.extend(cohorts.high_excl_one)
+                fallback_examples.extend(cohorts.low_excl_one)
         maybe_invert_o_proj_for_concat_fallback(tensors, fallback_examples)
 
-    contrasts = build_contrasts(tensors.w_u, digit_ids, high_digits, low_digits)
+    l_vs_un_skipped_ids: set[str] = set()
+
+    def _examples_for_contrast(
+        examples: list[ExampleData], contrast: ContrastSpec
+    ) -> list[ExampleData]:
+        kept: list[ExampleData] = []
+        for ex in examples:
+            if contrast.span_index is not None and len(ex.res) <= contrast.span_index:
+                continue
+            if contrast.name == "L_vs_Un":
+                if contrast.span_index is None:
+                    raise ValueError("L_vs_Un contrast is missing span_index.")
+                token, first_prob, reason = _l_vs_un_token_check(ex, contrast.span_index)
+                if reason is not None:
+                    if ex.example_id not in l_vs_un_skipped_ids:
+                        l_vs_un_skipped_ids.add(ex.example_id)
+                        _log_l_vs_un_skip(
+                            ex,
+                            span_index=contrast.span_index,
+                            token=token,
+                            first_prob_token_index=first_prob,
+                            reason=reason,
+                        )
+                    continue
+            kept.append(ex)
+        return kept
+
+    def _individual_ids_for_filtered(
+        filtered: list[ExampleData], preferred_ids: Sequence[str]
+    ) -> list[str]:
+        usable_ids = [ex.example_id for ex in filtered]
+        usable_set = set(usable_ids)
+        chosen = [i for i in preferred_ids if i in usable_set]
+        if len(chosen) < args.n_individual_examples:
+            for eid in usable_ids:
+                if eid not in chosen:
+                    chosen.append(eid)
+                if len(chosen) >= args.n_individual_examples:
+                    break
+        return chosen[: args.n_individual_examples]
 
     def _run_cohort_experiments(
         *,
         cohort_examples: list[ExampleData],
+        post_period_examples: list[ExampleData] | None,
         individual_ids: Sequence[str],
         dirname_suffix: str,
+        cohort_label: str,
     ) -> None:
-        examples_by_id = {ex.example_id: ex for ex in cohort_examples}
         for contrast in contrasts:
+            examples = (
+                post_period_examples
+                if contrast.position == "post_period" and post_period_examples is not None
+                else cohort_examples
+            )
+            filtered = _examples_for_contrast(examples, contrast)
+            if not filtered:
+                need = (
+                    "any usable span"
+                    if contrast.span_index is None
+                    else f"span_len > {contrast.span_index}"
+                )
+                raise ValueError(
+                    f"No {cohort_label} examples with {need} for contrast "
+                    f"{contrast.name!r}."
+                )
+            if len(filtered) <= args.n_individual_examples:
+                raise ValueError(
+                    f"{cohort_label} cohort for contrast {contrast.name!r} has "
+                    f"{len(filtered)} examples after span filtering, which must be "
+                    f"strictly greater than --n_individual_examples "
+                    f"({args.n_individual_examples})."
+                )
+            contrast_individual_ids = _individual_ids_for_filtered(
+                filtered, individual_ids
+            )
+            examples_by_id = {ex.example_id: ex for ex in filtered}
             for gran in gran_list:
                 leaf = f"{contrast.name}__{gran}{dirname_suffix}"
-                exp_name = f"{contrast.position}/{leaf}"
-                logging.info("Running experiment %s", exp_name)
+                if args.linguistic_confidence_prompt:
+                    exp_name = leaf
+                    exp_dir = run_root / leaf
+                else:
+                    exp_name = f"{contrast.position}/{leaf}"
+                    exp_dir = run_root / contrast.position / leaf
+                logging.info(
+                    "Running experiment %s (n=%d, span_index=%s)",
+                    exp_name,
+                    len(filtered),
+                    contrast.span_index,
+                )
                 result = run_dla_for_experiment(
-                    cohort_examples,
+                    filtered,
                     contrast=contrast,
                     granularity=gran,
                     tensors=tensors,
@@ -2572,10 +3252,10 @@ def main() -> None:
                     legacy_gemma_pre_postnorm_h5=args.legacy_gemma_pre_postnorm_h5,
                 )
                 summary = write_experiment_outputs(
-                    run_root / contrast.position / leaf,
+                    exp_dir,
                     result,
                     examples_by_id,
-                    individual_ids,
+                    contrast_individual_ids,
                     n_layers=adapter.n_layers,
                     n_heads=adapter.n_query_heads,
                     bar_chart_top_k=args.bar_chart_top_k,
@@ -2594,19 +3274,37 @@ def main() -> None:
     completeness_summaries: dict = {}
     _run_cohort_experiments(
         cohort_examples=examples_all,
+        post_period_examples=(
+            cohorts.all_excl_one if fill_post_period_excl_one else None
+        ),
         individual_ids=individual_ids_all,
         dirname_suffix="",
+        cohort_label="all-examples",
     )
     if args.confidence_split:
         _run_cohort_experiments(
             cohort_examples=cohorts.high,
+            post_period_examples=(
+                cohorts.high_excl_one if fill_post_period_excl_one else None
+            ),
             individual_ids=individual_ids_high or [],
             dirname_suffix="__high_conf",
+            cohort_label="high-confidence",
         )
         _run_cohort_experiments(
             cohort_examples=cohorts.low,
+            post_period_examples=(
+                cohorts.low_excl_one if fill_post_period_excl_one else None
+            ),
             individual_ids=individual_ids_low or [],
             dirname_suffix="__low_conf",
+            cohort_label="low-confidence",
+        )
+
+    if args.linguistic_confidence_prompt:
+        logging.info(
+            "L_vs_Un skipped %d examples whose span-index-6 token was not L or Un.",
+            len(l_vs_un_skipped_ids),
         )
 
     finished_at = datetime.now().isoformat(timespec="seconds")
@@ -2618,12 +3316,21 @@ def main() -> None:
         digit_ids=digit_ids,
         high_digits=high_digits,
         low_digits=low_digits,
+        first_token_ids=first_token_ids,
+        l_vs_un_token_ids=l_vs_un_token_ids,
         individual_ids_all=individual_ids_all,
         individual_ids_high=individual_ids_high,
         individual_ids_low=individual_ids_low,
         actual_n_examples_all=actual_n_all,
         actual_n_examples_high=actual_n_high,
         actual_n_examples_low=actual_n_low,
+        post_period_exclude_confidence_one=fill_post_period_excl_one,
+        actual_n_examples_all_post_period=actual_n_all_post,
+        actual_n_examples_high_post_period=actual_n_high_post,
+        actual_n_examples_low_post_period=actual_n_low_post,
+        l_vs_un_skipped_not_l_or_un=(
+            len(l_vs_un_skipped_ids) if args.linguistic_confidence_prompt else None
+        ),
         completeness_summaries=completeness_summaries,
         finished_at=finished_at,
         weight_load_method=tensors.weight_load_method,
