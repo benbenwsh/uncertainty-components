@@ -114,7 +114,6 @@ def write_config_txt(
         f"finished_at={finished_at}",
         f"model_name={args.model_name}",
         f"input_h5={args.input_h5}",
-        f"new_h5_format={args.new_h5_format}",
         f"device={args.device if args.device else 'auto'}",
         f"top_k={args.top_k}",
         f"softcap={softcap}",
@@ -160,12 +159,11 @@ def main() -> None:
         choices=list(SUPPORTED_MODEL_NAMES),
         help="Supported: Mistral-7B-Instruct-v0.1, gemma-3-12b-it, Qwen2.5-32B-Instruct.",
     )
-    parser.add_argument("--input_h5", type=str, required=True, help="Path to *_verbalised_embeddings.h5 file.")
     parser.add_argument(
-        "--new_h5_format",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="If set, read 'res' from the new {res,attn,mlp} H5 response format.",
+        "--input_h5",
+        type=str,
+        required=True,
+        help="Path to *_verbalised_embeddings.h5 file (new {res,attn,mlp} format).",
     )
     parser.add_argument("--low_conf_threshold", type=float, default=0.1)
     parser.add_argument("--high_conf_threshold", type=float, default=0.9)
@@ -202,7 +200,7 @@ def main() -> None:
         default=False,
         help=(
             "If true, compute mass-mean directions at attn-out and mlp-out and emit "
-            "red-attn / blue-mlp top-k tables. Requires --new_h5_format."
+            "red-attn / blue-mlp top-k tables."
         ),
     )
     parser.add_argument("--device", type=str, default=None, help="Optional torch device, e.g. cuda:0 or cpu")
@@ -218,8 +216,6 @@ def main() -> None:
     args = parser.parse_args()
     if args.top_k <= 0:
         raise ValueError("--top_k must be >= 1")
-    if args.subblock_mode and not args.new_h5_format:
-        raise ValueError("--subblock_mode requires --new_h5_format (attn/mlp H5 fields).")
     configure_prefix_tokens_for_model(args.model_name)
 
     logging.basicConfig(
@@ -278,7 +274,6 @@ def main() -> None:
                 expected_probability_tokens=direction_prob_token_budget,
                 low_conf_threshold=args.low_conf_threshold,
                 high_conf_threshold=args.high_conf_threshold,
-                new_h5_format=args.new_h5_format,
             )
         )
         logging.info(
@@ -408,7 +403,6 @@ def main() -> None:
         "finished_at": finished_at,
         "input_h5": args.input_h5,
         "model_name": args.model_name,
-        "new_h5_format": args.new_h5_format,
         "subblock_mode": args.subblock_mode,
         "device": str(device),
         "top_k": args.top_k,
