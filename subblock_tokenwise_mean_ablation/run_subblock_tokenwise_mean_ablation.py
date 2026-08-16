@@ -39,27 +39,25 @@ REPO_ROOT = SCRIPT_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from blockwise_mean_ablation.run_blockwise_mean_ablation import (
-    compute_pre_probability_group_means_by_component,
-)
 from blockwise_zero_ablation.run_blockwise_zero_ablation import SUBBLOCK_TO_HOOK
 from layerwise_mean_ablation.run_mean_ablation import (
     BRIEF_PROMPTS,
     CONFIDENCE_PROMPT,
     _completion_token_index_to_abs_pos,
     _greedy_extend_with_fwd_hooks,
-    collect_confidence_group_ids,
     configure_prefix_tokens_for_model,
     construct_fewshot_prompt_from_indices,
     encode_example_id,
     greedy_generate,
-    load_examples_h5,
     load_hooked_transformer,
     load_eval_dataset,
     parse_ablate_layers,
     parse_guess_and_probability_indices,
     parse_mode_confidence_from_response,
     split_answerable_indices,
+)
+from subblock_tokenwise_mean_ablation.h5_subblock_probability_means import (
+    compute_probability_subblock_group_means_streaming,
 )
 
 
@@ -998,25 +996,19 @@ def main() -> None:
     ablate_layers = parse_ablate_layers(args.ablate_layers, model.cfg.n_layers)
     run_layers = list(range(model.cfg.n_layers)) if args.individual_layers else ablate_layers
 
-    logging.info("Loading examples: %s", args.input_h5)
-    examples_h5 = load_examples_h5(Path(args.input_h5))
-    logging.info("Examples loaded")
-    means_by_component, low_ids, high_ids = compute_pre_probability_group_means_by_component(
-        examples_h5,
-        ablate_layers=run_layers,
-        low_conf_threshold=args.low_conf_threshold,
-        high_conf_threshold=args.high_conf_threshold,
-        mean_from_low_confidence=args.mean_from_low_confidence,
-        expected_probability_tokens=mean_prob_token_budget,
-        expected_guess_tokens=args.expected_guess_tokens,
-    )
-    logging.info("Subblock verbalised embedding means computed for %s", args.ablate_subblocks)
-    if not args.parse_mode_verbalised_confidence:
-        low_ids, high_ids = collect_confidence_group_ids(
-            examples_h5,
+    logging.info("Streaming probability subblock means: %s", args.input_h5)
+    means_by_component, low_ids, high_ids, h5_example_count = (
+        compute_probability_subblock_group_means_streaming(
+            args.input_h5,
+            ablate_layers=run_layers,
+            ablate_subblocks=args.ablate_subblocks,
+            expected_probability_tokens=mean_prob_token_budget,
             low_conf_threshold=args.low_conf_threshold,
             high_conf_threshold=args.high_conf_threshold,
+            mean_from_low_confidence=args.mean_from_low_confidence,
         )
+    )
+    logging.info("Subblock verbalised embedding means computed for %s", args.ablate_subblocks)
 
     mean_source_ids = low_ids if args.mean_from_low_confidence else high_ids
     if args.ablate_with_same_confidence:
@@ -1114,7 +1106,7 @@ def main() -> None:
             prompt_indices=prompt_indices,
             low_conf_count=len(low_ids),
             high_conf_count=len(high_ids),
-            h5_example_count=len(examples_h5),
+            h5_example_count=h5_example_count,
             baseline_mean=baseline_mean,
             baseline_count=baseline_count,
             token_position_means=token_position_means,
@@ -1234,7 +1226,7 @@ def main() -> None:
             prompt_indices=prompt_indices,
             low_conf_count=len(low_ids),
             high_conf_count=len(high_ids),
-            h5_example_count=len(examples_h5),
+            h5_example_count=h5_example_count,
             baseline_mean=baseline_mean,
             baseline_count=baseline_count,
             token_position_means=token_position_means,
@@ -1344,7 +1336,7 @@ def main() -> None:
         prompt_indices=prompt_indices,
         low_conf_count=len(low_ids),
         high_conf_count=len(high_ids),
-        h5_example_count=len(examples_h5),
+        h5_example_count=h5_example_count,
         baseline_mean=baseline_mean,
         baseline_count=baseline_count,
         token_position_means=line_token_means,
