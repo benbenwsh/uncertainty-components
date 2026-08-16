@@ -544,7 +544,20 @@ def _topn_for_distribution(dist: np.ndarray, top_k: int) -> tuple[np.ndarray, np
 
 
 def _format_token_decoded(tokenizer, token_id: int) -> str:
-    return tokenizer.decode([int(token_id)], clean_up_tokenization_spaces=False)
+    token = tokenizer.decode([int(token_id)], clean_up_tokenization_spaces=False)
+    return token if token else "<empty>"
+
+
+def _disable_table_mathtext(table) -> None:
+    """Stop matplotlib from parsing ``$...$`` in cell text (tokens like ``$$`` crash savefig)."""
+    for cell in table.get_celld().values():
+        text = cell.get_text()
+        if hasattr(text, "set_parse_math"):
+            text.set_parse_math(False)
+        else:
+            raw = text.get_text()
+            if "$" in raw:
+                text.set_text(raw.replace("$", r"\$"))
 
 
 def _get_run_base_dir(results_dir: Path) -> Path:
@@ -757,6 +770,7 @@ def _save_topk_table_png(
                 cell = table[(r + 1, c)]
                 cell.set_facecolor((0.1, 0.3, 1.0, alpha))
 
+    _disable_table_mathtext(table)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -827,6 +841,7 @@ def _save_topk_table_png_subblocks(
         for c in range(1, len(col_labels)):
             table[(row_idx + 1, c)].set_facecolor(color)
 
+    _disable_table_mathtext(table)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
