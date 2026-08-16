@@ -19,8 +19,9 @@ Output:
     - embeddings_sem_answer_k_tokens (when --attention_score_tokenwise_k_mode)
     - decoded_tokens (when --attention_score_tokenwise_k_mode)
 
-  Also writes a companion *_summary.json with the same structure but all
-  embeddings_* fields omitted.
+  With --linguistic_confidence_prompt and --extend_probability_span, the stored
+  embeddings_probability list is extended by the remaining tokens of the matched
+  natural-language confidence phrase (variable length).
 
   With --balance (default), also writes a balanced copy under a `balanced/`
   subdirectory, capping each verbalised_confidence bin at --balance_cap.
@@ -44,7 +45,18 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from process_generations_tok_bef_gen import (
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _SCRIPT_DIR.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from ans_gen.generate_answers_h5 import (  # noqa: E402
+    _LINGUISTIC_PHRASES_BY_LENGTH,
+    parse_linguistic_confidence_from_response,
+)
+from process_generations_tok_bef_gen import (  # noqa: E402
     parse_probability_from_response,
 )
 
@@ -72,6 +84,7 @@ GEMMA_PROBABILITY_PREFIX_TOKENS = [
     [":"],
     [" "],
 ]
+GEMMA_CONFIDENCE_PREFIX_TOKENS: list[list[str]] = []
 
 # Qwen2.5 token alternatives (from ans_gen/generated_answers/3_32B_200 decoded tokens)
 QWEN_GUESS_PREFIX_TOKENS = [
@@ -84,6 +97,7 @@ QWEN_PROBABILITY_PREFIX_TOKENS = [
     [":"],
     [" "],
 ]
+QWEN_CONFIDENCE_PREFIX_TOKENS: list[list[str]] = []
 
 # Mistral-7B-Instruct-v0.1 (from ans_gen/generated_answers/1_svamp_mistral)
 MISTRAL_GUESS_PREFIX_TOKENS = [
@@ -101,24 +115,99 @@ MISTRAL_PROBABILITY_PREFIX_TOKENS = [
     [":"],
     [""],  # space before number decodes as empty string
 ]
+MISTRAL_CONFIDENCE_PREFIX_TOKENS = [
+    ["\n"],
+    ["Conf"],
+    ["idence"],
+    [":"],
+]
+
+# Phrase token sequences after Confidence: (per-token decode, no specials).
+# Built by encoding "\nConfidence: " + phrase with each model tokenizer.
+GEMMA_LINGUISTIC_PHRASE_TOKENS: dict[str, tuple[str, ...]] = {
+    "Almost Certain": (" Almost", " Certain"),
+    "Highly Likely": (" Highly", " Likely"),
+    "Very Good Chance": (" Very", " Good", " Chance"),
+    "We Believe": (" We", " Believe"),
+    "Probably": (" Probably",),
+    "Probable": (" Prob", "able"),
+    "Likely": (" Likely",),
+    "Better than Even": (" Better", " than", " Even"),
+    "About Even": (" About", " Even"),
+    "We Doubt": (" We", " Doubt"),
+    "Unlikely": (" Un", "likely"),
+    "Probably Not": (" Probably", " Not"),
+    "Little Chance": (" Little", " Chance"),
+    "Chances are Slight": (" Chances", " are", " Slight"),
+    "Improbable": (" Im", "probable"),
+    "Highly Unlikely": (" Highly", " Un", "likely"),
+    "Almost No Chance": (" Almost", " No", " Chance"),
+}
+QWEN_LINGUISTIC_PHRASE_TOKENS: dict[str, tuple[str, ...]] = {
+    "Almost Certain": (" Almost", " Certain"),
+    "Highly Likely": (" Highly", " Likely"),
+    "Very Good Chance": (" Very", " Good", " Chance"),
+    "We Believe": (" We", " Believe"),
+    "Probably": (" Probably",),
+    "Probable": (" Prob", "able"),
+    "Likely": (" Likely",),
+    "Better than Even": (" Better", " than", " Even"),
+    "About Even": (" About", " Even"),
+    "We Doubt": (" We", " Doub", "t"),
+    "Unlikely": (" Un", "likely"),
+    "Probably Not": (" Probably", " Not"),
+    "Little Chance": (" Little", " Chance"),
+    "Chances are Slight": (" Ch", "ances", " are", " S", "light"),
+    "Improbable": (" Im", "prob", "able"),
+    "Highly Unlikely": (" Highly", " Un", "likely"),
+    "Almost No Chance": (" Almost", " No", " Chance"),
+}
+MISTRAL_LINGUISTIC_PHRASE_TOKENS: dict[str, tuple[str, ...]] = {
+    "Almost Certain": ("Almost", "Certain"),
+    "Highly Likely": ("High", "ly", "L", "ik", "ely"),
+    "Very Good Chance": ("Very", "Good", "Ch", "ance"),
+    "We Believe": ("We", "Bel", "ieve"),
+    "Probably": ("Probably",),
+    "Probable": ("Pro", "b", "able"),
+    "Likely": ("L", "ik", "ely"),
+    "Better than Even": ("Better", "than", "Even"),
+    "About Even": ("About", "Even"),
+    "We Doubt": ("We", "Dou", "bt"),
+    "Unlikely": ("Un", "likely"),
+    "Probably Not": ("Probably", "Not"),
+    "Little Chance": ("Little", "Ch", "ance"),
+    "Chances are Slight": ("Ch", "ances", "are", "S", "light"),
+    "Improbable": ("Impro", "b", "able"),
+    "Highly Unlikely": ("High", "ly", "Un", "likely"),
+    "Almost No Chance": ("Almost", "No", "Ch", "ance"),
+}
 
 # Active tables; set via configure_prefix_tokens_for_model(model_name).
 GUESS_PREFIX_TOKENS: list[list[str]] = GEMMA_GUESS_PREFIX_TOKENS
 PROBABILITY_PREFIX_TOKENS: list[list[str]] = GEMMA_PROBABILITY_PREFIX_TOKENS
+CONFIDENCE_PREFIX_TOKENS: list[list[str]] = GEMMA_CONFIDENCE_PREFIX_TOKENS
+LINGUISTIC_PHRASE_TOKENS: dict[str, tuple[str, ...]] = GEMMA_LINGUISTIC_PHRASE_TOKENS
 
 
 def configure_prefix_tokens_for_model(model_name: str) -> None:
-    """Set GUESS/PROBABILITY_PREFIX_TOKENS from exact model_name (case-sensitive)."""
-    global GUESS_PREFIX_TOKENS, PROBABILITY_PREFIX_TOKENS
+    """Set GUESS/PROBABILITY/CONFIDENCE/phrase token tables from exact model_name."""
+    global GUESS_PREFIX_TOKENS, PROBABILITY_PREFIX_TOKENS, CONFIDENCE_PREFIX_TOKENS
+    global LINGUISTIC_PHRASE_TOKENS
     if model_name == "google/gemma-3-12b-it":
         GUESS_PREFIX_TOKENS = GEMMA_GUESS_PREFIX_TOKENS
         PROBABILITY_PREFIX_TOKENS = GEMMA_PROBABILITY_PREFIX_TOKENS
+        CONFIDENCE_PREFIX_TOKENS = GEMMA_CONFIDENCE_PREFIX_TOKENS
+        LINGUISTIC_PHRASE_TOKENS = GEMMA_LINGUISTIC_PHRASE_TOKENS
     elif model_name == "Qwen/Qwen2.5-32B-Instruct":
         GUESS_PREFIX_TOKENS = QWEN_GUESS_PREFIX_TOKENS
         PROBABILITY_PREFIX_TOKENS = QWEN_PROBABILITY_PREFIX_TOKENS
+        CONFIDENCE_PREFIX_TOKENS = QWEN_CONFIDENCE_PREFIX_TOKENS
+        LINGUISTIC_PHRASE_TOKENS = QWEN_LINGUISTIC_PHRASE_TOKENS
     elif model_name == "mistralai/Mistral-7B-Instruct-v0.1":
         GUESS_PREFIX_TOKENS = MISTRAL_GUESS_PREFIX_TOKENS
         PROBABILITY_PREFIX_TOKENS = MISTRAL_PROBABILITY_PREFIX_TOKENS
+        CONFIDENCE_PREFIX_TOKENS = MISTRAL_CONFIDENCE_PREFIX_TOKENS
+        LINGUISTIC_PHRASE_TOKENS = MISTRAL_LINGUISTIC_PHRASE_TOKENS
     else:
         raise ValueError(
             f"Unsupported model_name for Guess/Probability token parsing: {model_name!r}. "
@@ -162,38 +251,88 @@ def _match_token_prefix(
     return None
 
 
-def parse_guess_and_probability_indices(decoded_tokens: list) -> tuple[int, int, int] | None:
+def parse_guess_and_probability_indices(
+    decoded_tokens: list,
+    *,
+    linguistic_confidence_prompt: bool = False,
+) -> tuple[int, int, int] | None:
     """
     Returns:
       - last_guess_token_index: first token index of semantic answer
-      - first_prob_token_index: token index at "\\n" before "Probability:" (first occurrence)
-      - end_prob_token_index: first token index of probability value
+      - first_prob_token_index: token index at the Probability:/Confidence: marker
+      - end_prob_token_index: first token index after the marker (value start)
     """
     guess_start = _match_token_prefix(decoded_tokens, GUESS_PREFIX_TOKENS, start=0)
     if guess_start is None:
         return None
 
     last_guess_token_index = guess_start + len(GUESS_PREFIX_TOKENS)
+    prefix_tokens = (
+        CONFIDENCE_PREFIX_TOKENS if linguistic_confidence_prompt else PROBABILITY_PREFIX_TOKENS
+    )
+    if not prefix_tokens:
+        return None
 
     prob_start = _match_token_prefix(
-        decoded_tokens, PROBABILITY_PREFIX_TOKENS, start=last_guess_token_index
+        decoded_tokens, prefix_tokens, start=last_guess_token_index
     )
     if prob_start is None:
         return None
 
     first_prob_token_index = prob_start
-    end_prob_token_index = prob_start + len(PROBABILITY_PREFIX_TOKENS)
+    end_prob_token_index = prob_start + len(prefix_tokens)
+
+    if linguistic_confidence_prompt:
+        end_ok = end_prob_token_index <= len(decoded_tokens)
+    else:
+        # Ensure a number token after the whitespace in Probability:
+        end_ok = end_prob_token_index < len(decoded_tokens)
 
     if (
         last_guess_token_index <= 0
         or last_guess_token_index >= len(decoded_tokens)
-        or end_prob_token_index >= len(decoded_tokens)  # ensure a number token after the whitespace
+        or not end_ok
         or last_guess_token_index >= first_prob_token_index
         or first_prob_token_index >= end_prob_token_index
     ):
         return None
 
     return (last_guess_token_index, first_prob_token_index, end_prob_token_index)
+
+
+_EOS_DECODED_TOKENS = frozenset(
+    {
+        "</s>",
+        "<eos>",
+        "<end_of_turn>",
+        "<|im_end|>",
+        "<|endoftext|>",
+        "<unk>",
+    }
+)
+
+
+def _linguistic_phrases_longest_first() -> list[tuple[str, tuple[str, ...]]]:
+    return sorted(LINGUISTIC_PHRASE_TOKENS.items(), key=lambda kv: len(kv[1]), reverse=True)
+
+
+def match_linguistic_phrase_tokens(
+    decoded_tokens: list,
+    start: int,
+) -> tuple[str, tuple[str, ...]] | None:
+    """Match a full phrase token list at ``decoded_tokens[start:]`` (longest first)."""
+    if start < 0 or start >= len(decoded_tokens):
+        return None
+    for phrase, toks in _linguistic_phrases_longest_first():
+        n = len(toks)
+        if n == 0 or start + n > len(decoded_tokens):
+            continue
+        window = tuple(decoded_tokens[start : start + n])
+        if any(tok in _EOS_DECODED_TOKENS for tok in window):
+            continue
+        if window == toks:
+            return phrase, toks
+    return None
 
 
 def _first_probability_value_char_span(full_str: str) -> tuple[int, int] | None:
@@ -209,6 +348,39 @@ def _first_probability_value_char_span(full_str: str) -> tuple[int, int] | None:
         return None
     match = matches[0]
     return match.start(1), match.end(1) - 1 # inclusive
+
+
+def _first_confidence_value_char_span(full_str: str) -> tuple[int, int] | None:
+    """Return [start,end] char span for the first linguistic phrase after ``Confidence:``."""
+    if not full_str:
+        return None
+    matches = list(
+        re.finditer(r"confidence\s*:\s*(.+)", full_str, re.IGNORECASE | re.DOTALL)
+    )
+    if not matches:
+        return None
+    match = matches[0]
+    line = match.group(1).split("\n")[0]
+    for phrase, _prob in _LINGUISTIC_PHRASES_BY_LENGTH:
+        found = re.search(re.escape(phrase), line, re.IGNORECASE)
+        if found:
+            abs_start = match.start(1) + found.start()
+            abs_end = match.start(1) + found.end() - 1
+            return abs_start, abs_end
+    return None
+
+
+def _confidence_value_token_span(decoded_tokens: list, full_str: str) -> tuple[int, int] | None:
+    """Map linguistic confidence phrase char span to [start,end] token indices."""
+    span = _first_confidence_value_char_span(full_str)
+    if span is None:
+        return None
+    char_start, char_end = span
+    token_start = _token_index_for_char_offset(decoded_tokens, char_start)
+    token_end = _token_index_for_char_offset(decoded_tokens, char_end)
+    if token_start > token_end:
+        return None
+    return token_start, token_end
 
 
 def _probability_value_token_span(decoded_tokens: list, full_str: str) -> tuple[int, int] | None:
@@ -256,7 +428,7 @@ def _compute_embeddings_from_source(
     expected_probability_tokens: int,
     example_id,
     source_label: str,
-    extend_probability_span: bool = False,
+    probability_span_extra_tokens: int = 0,
     attention_score_tokenwise_k_mode: bool = False,
 ) -> dict:
     if source_embeddings is None:
@@ -345,10 +517,15 @@ def _compute_embeddings_from_source(
             )
         embeddings_sem_answer_k_tokens.append(emb)
 
-    # Probability span as in prior script, with optional fixed +2 extension.
-    prob_span_end_index = end_prob_token_index + (2 if extend_probability_span else 0)
+    # Probability span: unextended marker+first-value tokens, plus optional extras.
+    if probability_span_extra_tokens < 0:
+        raise ValueError(
+            f"{source_label}: probability_span_extra_tokens must be >= 0, "
+            f"got {probability_span_extra_tokens}"
+        )
+    prob_span_end_index = end_prob_token_index + probability_span_extra_tokens
     effective_expected_probability_tokens = (
-        expected_probability_tokens + 2 if extend_probability_span else expected_probability_tokens
+        expected_probability_tokens + probability_span_extra_tokens
     )
     embeddings_probability = source_embeddings[first_prob_token_index:prob_span_end_index+1]
     if len(embeddings_probability) != effective_expected_probability_tokens:
@@ -577,12 +754,14 @@ def process_example(
     *,
     expected_guess_tokens: int,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int,
     collect_attn_block_embeddings: bool,
     collect_mlp_block_embeddings: bool,
     collect_qkvo_embeddings: bool,
     collect_concat_embeddings: bool,
     attention_score_tokenwise_k_mode: bool,
     extend_probability_span: bool,
+    linguistic_confidence_prompt: bool,
 ) -> dict | None:
     most_likely = example.get("most_likely_answer")
     question = example.get("question")
@@ -608,36 +787,67 @@ def process_example(
         )
         return None
     full_str = "".join(decoded_tokens)
-    prob = parse_probability_from_response(full_str)
-    if prob is None:
-        logging.warning(
-            "Skipping example %s: could not parse probability from response. response=%r",
-            example_id,
-            response_str,
-        )
-        return None
+    if linguistic_confidence_prompt:
+        prob = parse_linguistic_confidence_from_response(full_str)
+        if prob is None:
+            logging.warning(
+                "Skipping example %s: could not parse linguistic confidence from response. response=%r",
+                example_id,
+                response_str,
+            )
+            return None
+    else:
+        prob = parse_probability_from_response(full_str)
+        if prob is None:
+            logging.warning(
+                "Skipping example %s: could not parse probability from response. response=%r",
+                example_id,
+                response_str,
+            )
+            return None
 
-    indices = parse_guess_and_probability_indices(decoded_tokens)
+    indices = parse_guess_and_probability_indices(
+        decoded_tokens,
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
+    )
     if indices is None:
+        marker = "Guess/Confidence" if linguistic_confidence_prompt else "Guess/Probability"
         logging.warning(
-            "Skipping example %s: could not parse Guess/Probability token spans. response=%r",
+            "Skipping example %s: could not parse %s token spans. response=%r",
             example_id,
+            marker,
             response_str,
         )
         return None
     last_guess_token_index, first_prob_token_index, end_prob_token_index = indices
-    prob_value_token_span = _probability_value_token_span(decoded_tokens, full_str)
+    if linguistic_confidence_prompt:
+        prob_value_token_span = _confidence_value_token_span(decoded_tokens, full_str)
+    else:
+        prob_value_token_span = _probability_value_token_span(decoded_tokens, full_str)
     if prob_value_token_span is None:
+        value_kind = "confidence phrase" if linguistic_confidence_prompt else "probability value"
         logging.warning(
-            "Skipping example %s: could not map probability value token span. response=%r",
+            "Skipping example %s: could not map %s token span. response=%r",
             example_id,
+            value_kind,
             response_str,
         )
         return None
     prob_value_start_token_index, prob_value_end_token_index = prob_value_token_span
-    if not (prob_value_start_token_index <= end_prob_token_index <= prob_value_end_token_index):
+    if linguistic_confidence_prompt:
+        # Confidence: prefix has no trailing space token; the phrase starts at or after
+        # the first token following the marker.
+        value_span_ok = (
+            end_prob_token_index <= prob_value_start_token_index <= prob_value_end_token_index
+        )
+    else:
+        # Probability: prefix includes the space; end_prob_token_index is the first digit.
+        value_span_ok = (
+            prob_value_start_token_index <= end_prob_token_index <= prob_value_end_token_index
+        )
+    if not value_span_ok:
         logging.warning(
-            "Skipping example %s: value token span [%d,%d] does not include end_prob_token_index=%d. response=%r",
+            "Skipping example %s: value token span [%d,%d] is inconsistent with end_prob_token_index=%d. response=%r",
             example_id,
             prob_value_start_token_index,
             prob_value_end_token_index,
@@ -645,10 +855,40 @@ def process_example(
             response_str,
         )
         return None
-    if extend_probability_span and end_prob_token_index + 2 >= len(decoded_tokens):
+    if linguistic_confidence_prompt:
+        span_expected = expected_confidence_tokens
+        span_extra = 0
+        if extend_probability_span:
+            matched = match_linguistic_phrase_tokens(decoded_tokens, end_prob_token_index)
+            if matched is None:
+                logging.warning(
+                    "Skipping example %s: could not match linguistic phrase tokens "
+                    "at end_prob_token_index=%d. decoded_tokens[%d:]=%r response=%r",
+                    example_id,
+                    end_prob_token_index,
+                    end_prob_token_index,
+                    decoded_tokens[end_prob_token_index:],
+                    response_str,
+                )
+                return None
+            _phrase, phrase_toks = matched
+            span_extra = len(phrase_toks) - 1
+            if span_extra < 0:
+                logging.warning(
+                    "Skipping example %s: empty linguistic phrase token list for %r. response=%r",
+                    example_id,
+                    _phrase,
+                    response_str,
+                )
+                return None
+    else:
+        span_expected = expected_probability_tokens
+        span_extra = 2 if extend_probability_span else 0
+    if span_extra > 0 and end_prob_token_index + span_extra >= len(decoded_tokens):
         logging.warning(
-            "Skipping example %s: need 2 extra probability tokens after index %d, but decoded_tokens has len=%d. response=%r",
+            "Skipping example %s: need %d extra probability tokens after index %d, but decoded_tokens has len=%d. response=%r",
             example_id,
+            span_extra,
             end_prob_token_index,
             len(decoded_tokens),
             response_str,
@@ -665,10 +905,10 @@ def process_example(
             prob_value_start_token_index=prob_value_start_token_index,
             prob_value_end_token_index=prob_value_end_token_index,
             expected_guess_tokens=expected_guess_tokens,
-            expected_probability_tokens=expected_probability_tokens,
+            expected_probability_tokens=span_expected,
             example_id=example_id,
             source_label="res",
-            extend_probability_span=extend_probability_span,
+            probability_span_extra_tokens=span_extra,
         )
     except ValueError as exc:
         logging.warning("Skipping example %s: %s", example_id, exc)
@@ -692,10 +932,10 @@ def process_example(
                     prob_value_start_token_index=prob_value_start_token_index,
                     prob_value_end_token_index=prob_value_end_token_index,
                     expected_guess_tokens=expected_guess_tokens,
-                    expected_probability_tokens=expected_probability_tokens,
+                    expected_probability_tokens=span_expected,
                     example_id=example_id,
                     source_label="attn",
-                    extend_probability_span=extend_probability_span,
+                    probability_span_extra_tokens=span_extra,
                 )
             except ValueError as exc:
                 logging.error(
@@ -722,10 +962,10 @@ def process_example(
                     prob_value_start_token_index=prob_value_start_token_index,
                     prob_value_end_token_index=prob_value_end_token_index,
                     expected_guess_tokens=expected_guess_tokens,
-                    expected_probability_tokens=expected_probability_tokens,
+                    expected_probability_tokens=span_expected,
                     example_id=example_id,
                     source_label="mlp",
-                    extend_probability_span=extend_probability_span,
+                    probability_span_extra_tokens=span_extra,
                 )
             except ValueError as exc:
                 logging.error(
@@ -807,10 +1047,10 @@ def process_example(
                 prob_value_start_token_index=prob_value_start_token_index,
                 prob_value_end_token_index=prob_value_end_token_index,
                 expected_guess_tokens=expected_guess_tokens,
-                expected_probability_tokens=expected_probability_tokens,
+                expected_probability_tokens=span_expected,
                 example_id=example_id,
                 source_label="k",
-                extend_probability_span=extend_probability_span,
+                probability_span_extra_tokens=span_extra,
                 attention_score_tokenwise_k_mode=True,
             )
         except ValueError as exc:
@@ -836,10 +1076,10 @@ def process_example(
                 prob_value_start_token_index=prob_value_start_token_index,
                 prob_value_end_token_index=prob_value_end_token_index,
                 expected_guess_tokens=expected_guess_tokens,
-                expected_probability_tokens=expected_probability_tokens,
+                expected_probability_tokens=span_expected,
                 example_id=example_id,
                 source_label=source_label,
-                extend_probability_span=extend_probability_span,
+                probability_span_extra_tokens=span_extra,
             )
         except ValueError as exc:
             logging.error(config["invalid_log"], example_id, exc)
@@ -1149,6 +1389,27 @@ def main():
         help="Expected number of stored probability embeddings (list length).",
     )
     parser.add_argument(
+        "--expected_confidence_tokens",
+        type=int,
+        default=5,
+        help=(
+            "When --linguistic_confidence_prompt, expected number of stored embeddings "
+            "in the unextended Confidence: span (prefix plus first phrase token). "
+            "With --extend_probability_span, remaining phrase tokens are appended."
+        ),
+    )
+    parser.add_argument(
+        "--linguistic_confidence_prompt",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "If true, parse Confidence: phrases and map them to numeric verbalised_confidence; "
+            "if false (default), parse numeric Probability: values. Combined with "
+            "--extend_probability_span, remaining phrase tokens are stored in "
+            "embeddings_probability."
+        ),
+    )
+    parser.add_argument(
         "--collect_attn_block_embeddings",
         default=True,
         action=argparse.BooleanOptionalAction,
@@ -1177,7 +1438,7 @@ def main():
     )
     parser.add_argument(
         "--attention_score_tokenwise_k_mode",
-        default=True,
+        default=False,
         action=argparse.BooleanOptionalAction,
         help=(
             "Also store tokenwise K prompt/semantic-answer fields for downstream attention "
@@ -1190,8 +1451,9 @@ def main():
         default=False,
         action=argparse.BooleanOptionalAction,
         help=(
-            "Extend embeddings_probability by 2 tokens past the first probability-value token "
-            "(for example, 7 to 9 with default --expected_probability_tokens)."
+            "Extend embeddings_probability past the first probability-value / first "
+            "confidence-phrase token. Numeric runs add 2 tokens. Linguistic runs add "
+            "the remaining tokens of the matched natural-language confidence phrase."
         ),
     )
     parser.add_argument(
@@ -1242,6 +1504,21 @@ def main():
         configure_prefix_tokens_for_model(args.model_name)
     except ValueError as exc:
         logging.error("%s", exc)
+        sys.exit(1)
+    if args.linguistic_confidence_prompt and args.extend_probability_span:
+        if not LINGUISTIC_PHRASE_TOKENS:
+            logging.error(
+                "--extend_probability_span with --linguistic_confidence_prompt requires "
+                "a non-empty linguistic phrase token table for --model_name=%r.",
+                args.model_name,
+            )
+            sys.exit(1)
+    if args.linguistic_confidence_prompt and not CONFIDENCE_PREFIX_TOKENS:
+        logging.error(
+            "--linguistic_confidence_prompt requires a non-empty Confidence: prefix table "
+            "for --model_name=%r. Fill GEMMA/QWEN_CONFIDENCE_PREFIX_TOKENS or use Mistral.",
+            args.model_name,
+        )
         sys.exit(1)
 
     will_balance = args.balance_from_h5 is not None or args.balance
@@ -1346,12 +1623,14 @@ def main():
                 example,
                 expected_guess_tokens=args.expected_guess_tokens,
                 expected_probability_tokens=args.expected_probability_tokens,
+                expected_confidence_tokens=args.expected_confidence_tokens,
                 collect_attn_block_embeddings=args.collect_attn_block_embeddings,
                 collect_mlp_block_embeddings=args.collect_mlp_block_embeddings,
                 collect_qkvo_embeddings=args.collect_qkvo_embeddings,
                 collect_concat_embeddings=args.collect_concat_embeddings,
                 attention_score_tokenwise_k_mode=args.attention_score_tokenwise_k_mode,
                 extend_probability_span=args.extend_probability_span,
+                linguistic_confidence_prompt=args.linguistic_confidence_prompt,
             )
             if out is None:
                 n_reject += 1
