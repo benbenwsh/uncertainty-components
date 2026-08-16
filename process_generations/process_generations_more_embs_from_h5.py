@@ -15,9 +15,9 @@ Output:
     - embeddings_mean_sem_answer
     - embeddings_probability
     - embeddings_mean_prob_val
+    - decoded_tokens
     - embeddings_prompt_k_tokens (when --attention_score_tokenwise_k_mode)
     - embeddings_sem_answer_k_tokens (when --attention_score_tokenwise_k_mode)
-    - decoded_tokens (when --attention_score_tokenwise_k_mode)
 
   With --linguistic_confidence_prompt and --extend_probability_span, the stored
   embeddings_probability list is extended by the remaining tokens of the matched
@@ -1092,9 +1092,9 @@ def process_example(
         "embeddings_mean_sem_answer": {"res": res_processed["embeddings_mean_sem_answer"]},
         "embeddings_probability": {"res": res_processed["embeddings_probability"]},
         "embeddings_mean_prob_val": {"res": res_processed["embeddings_mean_prob_val"]},
+        "decoded_tokens": decoded_tokens,
     }
     if attention_score_tokenwise_k_mode:
-        processed_response["decoded_tokens"] = decoded_tokens
         processed_response["embeddings_prompt_k_tokens"] = {
             "k": k_tokenwise_processed["embeddings_prompt_k_tokens"]
         }
