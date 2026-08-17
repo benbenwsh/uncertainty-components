@@ -63,6 +63,11 @@ from layerwise_mean_ablation.run_mean_ablation import (
 
 TRAIN_RATIO = 0.9
 CONFIDENCE_GROUPS = ("low_confidence", "high_confidence")
+NONE_MODE_CONFIDENCE_BUCKETS = ("eq_1", "lt_1")
+NONE_MODE_CONFIDENCE_BUCKET_LABELS = {
+    "eq_1": "none_eq_1",
+    "lt_1": "none_lt_1",
+}
 ABLATION_UNIT_KEY = "selected_layer_heads"
 _ATTN_UNIT_RE = re.compile(r"^a(\d+)\.h(\d+)$")
 _MLP_UNIT_RE = re.compile(r"^m(\d+)$")
@@ -543,16 +548,113 @@ def greedy_generate_selected_layer_heads_zero_ablated(
     )
 
 
-def _empty_group_metrics(ablation_modes: Sequence[str]) -> Dict[str, object]:
-    confidence: Dict[str, RunningMean] = {mode: RunningMean() for mode in ablation_modes}
-    delta: Dict[str, RunningMean] = {mode: RunningMean() for mode in ablation_modes if mode != "none"}
-    identical: Dict[str, int] = {mode: 0 for mode in ablation_modes if mode != "none"}
+def _empty_mode_trackers(ablation_modes: Sequence[str]) -> Dict[str, object]:
     return {
-        "confidence": confidence,
-        "delta": delta,
-        "identical": identical,
+        "confidence": {mode: RunningMean() for mode in ablation_modes},
+        "delta": {mode: RunningMean() for mode in ablation_modes if mode != "none"},
+        "identical": {mode: 0 for mode in ablation_modes if mode != "none"},
+        "example_count": 0,
+    }
+
+
+def _none_mode_confidence_bucket(baseline_mode_confidence: Optional[float]) -> Optional[str]:
+    if baseline_mode_confidence is None:
+        return None
+    if float(baseline_mode_confidence) == 1.0:
+        return "eq_1"
+    return "lt_1"
+
+
+def _record_ablation_mode_metrics(
+    trackers: Dict[str, object],
+    *,
+    mode_name: str,
+    mode_confidence: Optional[float],
+    confidence_delta: Optional[float],
+    responses_identical: bool,
+) -> None:
+    if responses_identical:
+        trackers["identical"][mode_name] += 1
+    if mode_confidence is not None:
+        trackers["confidence"][mode_name].update(float(mode_confidence))
+    if confidence_delta is not None:
+        trackers["delta"][mode_name].update(confidence_delta)
+
+
+def _modes_summary_from_trackers(
+    ablation_modes: Sequence[str],
+    *,
+    confidence: Dict[str, RunningMean],
+    delta: Dict[str, RunningMean],
+    identical: Dict[str, int],
+) -> Dict[str, dict]:
+    modes_out: Dict[str, dict] = {}
+    for mode_name in ablation_modes:
+        running = confidence[mode_name]
+        entry: dict = {
+            "mean_confidence": running.value(),
+            "sample_count": running.n,
+        }
+        if mode_name != "none":
+            delta_running = delta[mode_name]
+            entry["mean_confidence_delta"] = delta_running.value()
+            entry["confidence_delta_sample_count"] = delta_running.n
+            entry["responses_identical_true"] = int(identical[mode_name])
+        modes_out[mode_name] = entry
+    return modes_out
+
+
+def _append_mode_metric_lines(
+    lines: List[str],
+    *,
+    ablation_modes: Sequence[str],
+    confidence: Dict[str, RunningMean],
+    delta: Dict[str, RunningMean],
+    identical: Dict[str, int],
+    skip_one_confidence_n: Optional[int] = None,
+) -> None:
+    for mode_name in ablation_modes:
+        metric_key = f"{mode_name}__{ABLATION_UNIT_KEY}"
+        running = confidence.get(mode_name)
+        mode_mean = None if running is None else running.value()
+        valid_count = 0 if running is None else running.n
+        if mode_name == "none":
+            if mode_mean is None:
+                none_line = f"{metric_key}=None ({valid_count})"
+            else:
+                none_line = f"{metric_key}={mode_mean:.6f} ({valid_count})"
+            if skip_one_confidence_n is not None:
+                none_line += f" [skipped_one_confidence: {skip_one_confidence_n}]"
+            lines.append(none_line)
+            continue
+        identical_n = int(identical.get(mode_name, 0))
+        delta_running = delta.get(mode_name)
+        delta_mean = None if delta_running is None else delta_running.value()
+        if mode_mean is None:
+            mean_str = "None"
+        else:
+            mean_str = f"{mode_mean:.6f}"
+        if delta_mean is None:
+            delta_str = "None"
+        else:
+            delta_str = f"{delta_mean:+.6f}"
+        lines.append(
+            f"{metric_key}={mean_str} ({valid_count}) "
+            f"[mean_delta: {delta_str}] [responses_identical: {identical_n}]"
+        )
+
+
+def _empty_group_metrics(ablation_modes: Sequence[str]) -> Dict[str, object]:
+    trackers = _empty_mode_trackers(ablation_modes)
+    return {
+        "confidence": trackers["confidence"],
+        "delta": trackers["delta"],
+        "identical": trackers["identical"],
         "evaluated_count": 0,
         "skipped_one_confidence": 0,
+        "by_none_mode_confidence": {
+            bucket: _empty_mode_trackers(ablation_modes) for bucket in NONE_MODE_CONFIDENCE_BUCKETS
+        },
     }
 
 
@@ -577,6 +679,7 @@ def write_config_txt(
     mode_confidence: Dict[str, Dict[str, RunningMean]],
     mode_delta: Dict[str, Dict[str, RunningMean]],
     mode_identical: Dict[str, Dict[str, int]],
+    by_none_mode_confidence: Dict[str, Dict[str, Dict[str, object]]],
     finished_at: str,
 ) -> None:
     lines = [
@@ -631,44 +734,39 @@ def write_config_txt(
         "",
         "[Mode Confidence Metrics]",
         "Values below are running-mean verbalised confidence per group.",
+        "Additional sections split each group by none-mode verbalised confidence",
+        "(eq_1: exactly 1.0; lt_1: parsed and < 1.0).",
         "",
     ]
     for group_name in CONFIDENCE_GROUPS:
         lines.append(f"[{group_name}]")
-        per_mode = mode_confidence.get(group_name, {})
-        per_delta = mode_delta.get(group_name, {})
-        per_identical = mode_identical.get(group_name, {})
-        for mode_name in args.ablation_mode:
-            metric_key = f"{mode_name}__{ABLATION_UNIT_KEY}"
-            running = per_mode.get(mode_name)
-            mode_mean = None if running is None else running.value()
-            valid_count = 0 if running is None else running.n
-            if mode_name == "none":
-                if mode_mean is None:
-                    none_line = f"{metric_key}=None ({valid_count})"
-                else:
-                    none_line = f"{metric_key}={mode_mean:.6f} ({valid_count})"
-                if args.skip_one_confidence:
-                    skipped_n = int(skipped_one_confidence.get(group_name, 0))
-                    none_line += f" [skipped_one_confidence: {skipped_n}]"
-                lines.append(none_line)
-                continue
-            identical_n = int(per_identical.get(mode_name, 0))
-            delta_running = per_delta.get(mode_name)
-            delta_mean = None if delta_running is None else delta_running.value()
-            if mode_mean is None:
-                mean_str = "None"
-            else:
-                mean_str = f"{mode_mean:.6f}"
-            if delta_mean is None:
-                delta_str = "None"
-            else:
-                delta_str = f"{delta_mean:+.6f}"
-            lines.append(
-                f"{metric_key}={mean_str} ({valid_count}) "
-                f"[mean_delta: {delta_str}] [responses_identical: {identical_n}]"
-            )
+        _append_mode_metric_lines(
+            lines,
+            ablation_modes=args.ablation_mode,
+            confidence=mode_confidence.get(group_name, {}),
+            delta=mode_delta.get(group_name, {}),
+            identical=mode_identical.get(group_name, {}),
+            skip_one_confidence_n=(
+                int(skipped_one_confidence.get(group_name, 0)) if args.skip_one_confidence else None
+            ),
+        )
         lines.append("")
+        group_buckets = by_none_mode_confidence.get(group_name, {})
+        for bucket_name in NONE_MODE_CONFIDENCE_BUCKETS:
+            bucket = group_buckets.get(bucket_name, {})
+            bucket_label = NONE_MODE_CONFIDENCE_BUCKET_LABELS[bucket_name]
+            example_count = int(bucket.get("example_count", 0)) if bucket else 0
+            lines.append(f"[{group_name} / {bucket_label}]")
+            lines.append(f"example_count={example_count}")
+            if bucket:
+                _append_mode_metric_lines(
+                    lines,
+                    ablation_modes=args.ablation_mode,
+                    confidence=bucket["confidence"],
+                    delta=bucket["delta"],
+                    identical=bucket["identical"],
+                )
+            lines.append("")
     lines.extend(["[Run]", f"finished_at={finished_at}"])
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -690,28 +788,38 @@ def build_summary(
     mode_confidence: Dict[str, Dict[str, RunningMean]],
     mode_delta: Dict[str, Dict[str, RunningMean]],
     mode_identical: Dict[str, Dict[str, int]],
+    by_none_mode_confidence: Dict[str, Dict[str, Dict[str, object]]],
 ) -> dict:
     groups: Dict[str, dict] = {}
     for group_name in CONFIDENCE_GROUPS:
         selected_count = low_conf_count if group_name == "low_confidence" else high_conf_count
-        modes_out: Dict[str, dict] = {}
-        for mode_name in args.ablation_mode:
-            running = mode_confidence[group_name][mode_name]
-            entry: dict = {
-                "mean_confidence": running.value(),
-                "sample_count": running.n,
+        modes_out = _modes_summary_from_trackers(
+            args.ablation_mode,
+            confidence=mode_confidence[group_name],
+            delta=mode_delta[group_name],
+            identical=mode_identical[group_name],
+        )
+        none_mode_buckets: Dict[str, dict] = {}
+        group_buckets = by_none_mode_confidence.get(group_name, {})
+        for bucket_name in NONE_MODE_CONFIDENCE_BUCKETS:
+            bucket = group_buckets.get(bucket_name, {})
+            none_mode_buckets[bucket_name] = {
+                "example_count": int(bucket.get("example_count", 0)) if bucket else 0,
+                "modes": _modes_summary_from_trackers(
+                    args.ablation_mode,
+                    confidence=bucket["confidence"],
+                    delta=bucket["delta"],
+                    identical=bucket["identical"],
+                )
+                if bucket
+                else {},
             }
-            if mode_name != "none":
-                delta_running = mode_delta[group_name][mode_name]
-                entry["mean_confidence_delta"] = delta_running.value()
-                entry["confidence_delta_sample_count"] = delta_running.n
-                entry["responses_identical_true"] = int(mode_identical[group_name][mode_name])
-            modes_out[mode_name] = entry
         groups[group_name] = {
             "selected_count": selected_count,
             "evaluated_count": int(evaluated_counts.get(group_name, 0)),
             "skipped_one_confidence_count": int(skipped_one_confidence.get(group_name, 0)),
             "modes": modes_out,
+            "by_none_mode_confidence": none_mode_buckets,
         }
     return {
         "run_root": run_root,
@@ -987,6 +1095,11 @@ def main() -> None:
                         len(selected_ids),
                         ex_id,
                     )
+                none_bucket = _none_mode_confidence_bucket(baseline_mode_confidence)
+                bucket_metrics: Optional[Dict[str, object]] = None
+                if none_bucket is not None:
+                    bucket_metrics = metrics["by_none_mode_confidence"][none_bucket]
+                    bucket_metrics["example_count"] += 1
 
                 for mode_name in args.ablation_mode:
                     key = mode_to_output_key(mode_name)
@@ -997,6 +1110,10 @@ def main() -> None:
                         }
                         if baseline_mode_confidence is not None and not skip_remaining_modes:
                             metrics["confidence"][mode_name].update(float(baseline_mode_confidence))
+                        if bucket_metrics is not None and baseline_mode_confidence is not None:
+                            bucket_metrics["confidence"][mode_name].update(
+                                float(baseline_mode_confidence)
+                            )
                         continue
                     if skip_remaining_modes:
                         continue
@@ -1011,24 +1128,36 @@ def main() -> None:
                         expected_guess_tokens=args.expected_guess_tokens,
                         expected_probability_tokens=args.expected_probability_tokens,
                     )
-                    mode_confidence = (
+                    parsed_mode_confidence = (
                         parse_mode_confidence_from_response(response)
                         if args.parse_mode_verbalised_confidence
                         else None
                     )
                     responses_identical = response == baseline_response
-                    if responses_identical:
-                        metrics["identical"][mode_name] += 1
-                    if mode_confidence is not None:
-                        metrics["confidence"][mode_name].update(float(mode_confidence))
                     confidence_delta: Optional[float] = None
-                    if mode_confidence is not None and baseline_mode_confidence is not None:
-                        confidence_delta = float(mode_confidence) - float(baseline_mode_confidence)
-                        metrics["delta"][mode_name].update(confidence_delta)
+                    if parsed_mode_confidence is not None and baseline_mode_confidence is not None:
+                        confidence_delta = float(parsed_mode_confidence) - float(
+                            baseline_mode_confidence
+                        )
+                    _record_ablation_mode_metrics(
+                        metrics,
+                        mode_name=mode_name,
+                        mode_confidence=parsed_mode_confidence,
+                        confidence_delta=confidence_delta,
+                        responses_identical=responses_identical,
+                    )
+                    if bucket_metrics is not None:
+                        _record_ablation_mode_metrics(
+                            bucket_metrics,
+                            mode_name=mode_name,
+                            mode_confidence=parsed_mode_confidence,
+                            confidence_delta=confidence_delta,
+                            responses_identical=responses_identical,
+                        )
                     entry[key] = {
                         ABLATION_UNIT_KEY: {
                             "response": response,
-                            "verbalised_confidence": mode_confidence,
+                            "verbalised_confidence": parsed_mode_confidence,
                             "confidence_delta": confidence_delta,
                             "responses_identical": responses_identical,
                         }
@@ -1062,6 +1191,10 @@ def main() -> None:
     mode_identical = {
         group_name: group_metrics[group_name]["identical"] for group_name in CONFIDENCE_GROUPS
     }
+    by_none_mode_confidence = {
+        group_name: group_metrics[group_name]["by_none_mode_confidence"]
+        for group_name in CONFIDENCE_GROUPS
+    }
 
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(results_mini, f, ensure_ascii=False, indent=2)
@@ -1085,6 +1218,7 @@ def main() -> None:
         mode_confidence=mode_confidence,
         mode_delta=mode_delta,
         mode_identical=mode_identical,
+        by_none_mode_confidence=by_none_mode_confidence,
         finished_at=datetime.now().astimezone().isoformat(timespec="seconds"),
     )
     summary_path = summary_json_path(out_path)
@@ -1105,6 +1239,7 @@ def main() -> None:
                 mode_confidence=mode_confidence,
                 mode_delta=mode_delta,
                 mode_identical=mode_identical,
+                by_none_mode_confidence=by_none_mode_confidence,
             ),
             f,
             ensure_ascii=False,

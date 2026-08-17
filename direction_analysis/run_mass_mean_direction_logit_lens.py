@@ -298,7 +298,7 @@ def main() -> None:
             "If true (and not using linguistic confidence), treat probability span length as "
             "expected_probability_tokens + 2. If true together with "
             "--linguistic_confidence_prompt, accept embeddings_probability lengths "
-            ">= expected_probability_tokens and use only the first N tokens."
+            ">= expected_confidence_tokens and use only the first N of those tokens."
         ),
     )
     parser.add_argument(
@@ -347,11 +347,7 @@ def main() -> None:
         expected_confidence_tokens=args.expected_confidence_tokens,
         extend_probability_span=args.extend_probability_span,
     )
-    direction_prob_token_budget = (
-        args.expected_probability_tokens
-        if args.linguistic_confidence_prompt
-        else span_token_count
-    )
+    direction_prob_token_budget = span_token_count
     allow_at_least_expected = (
         bool(args.linguistic_confidence_prompt) and bool(args.extend_probability_span)
     )
