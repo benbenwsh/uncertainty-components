@@ -3,7 +3,8 @@
 
 Recomputes mass-mean directions from an H5 file, projects each (layer, token)
 direction through the model's final RMSNorm + lm_head, and writes one unshaded
-top-k table PNG per probability-span token position.
+top-k table PNG per probability-span token position for both the original
+direction (tables/positive) and its negation (tables/negative).
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ import logging
 import os
 from pathlib import Path
 import sys
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -45,6 +46,7 @@ from logit_lens_improved.run_logit_lens_improved import (
 
 MODULE_NAME = "direction_analysis"
 RESULTS_STEM = "mass_mean_direction_logit_lens"
+DIRECTION_SIGNS = ("positive", "negative")
 
 
 def _resolve_run_root(cli_output_dir: Optional[str]) -> str:
@@ -91,6 +93,112 @@ def _token_labels_from_prefix(
     return labels
 
 
+def _write_token_tables(
+    *,
+    tables_dir: Path,
+    n_tokens: int,
+    token_labels: Sequence[str],
+    top_k: int,
+    device,
+    tokenizer,
+    w_u,
+    b_u,
+    norm_weight,
+    norm_eps,
+    softcap: Optional[float],
+    subblock_mode: bool,
+    direction_probability: np.ndarray,
+    direction_attn: Optional[np.ndarray],
+    direction_mlp: Optional[np.ndarray],
+    sign: str,
+) -> List[str]:
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    table_paths: List[str] = []
+    if subblock_mode:
+        logging.info(
+            "Writing %d %s subblock top-k tables (top_k=%d) to %s",
+            n_tokens,
+            sign,
+            top_k,
+            tables_dir,
+        )
+        if direction_attn is None or direction_mlp is None:
+            raise ValueError("Subblock tables require attn and mlp direction arrays.")
+        for tok_idx in range(n_tokens):
+            top_ids_attn, top_vals_attn = _compute_topk(
+                direction_attn[:, tok_idx, :],
+                top_k=top_k,
+                device=device,
+                w_u=w_u,
+                b_u=b_u,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+                softcap=softcap,
+            )
+            top_ids_mlp, top_vals_mlp = _compute_topk(
+                direction_mlp[:, tok_idx, :],
+                top_k=top_k,
+                device=device,
+                w_u=w_u,
+                b_u=b_u,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+                softcap=softcap,
+            )
+            out_path = tables_dir / f"probability_token_{tok_idx}.png"
+            _save_topk_table_png_subblocks(
+                out_path,
+                tokenizer=tokenizer,
+                top_ids_attn=top_ids_attn,
+                top_vals_attn=top_vals_attn,
+                top_ids_mlp=top_ids_mlp,
+                top_vals_mlp=top_vals_mlp,
+            )
+            table_paths.append(str(out_path))
+            logging.info(
+                "Wrote %s (sign=%s token_label=%r)",
+                out_path,
+                sign,
+                token_labels[tok_idx] if tok_idx < len(token_labels) else f"pos_{tok_idx}",
+            )
+    else:
+        logging.info(
+            "Writing %d %s unshaded top-k tables (top_k=%d) to %s",
+            n_tokens,
+            sign,
+            top_k,
+            tables_dir,
+        )
+        for tok_idx in range(n_tokens):
+            hidden = direction_probability[:, tok_idx, :]
+            top_ids, top_vals = _compute_topk(
+                hidden,
+                top_k=top_k,
+                device=device,
+                w_u=w_u,
+                b_u=b_u,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+                softcap=softcap,
+            )
+            out_path = tables_dir / f"probability_token_{tok_idx}.png"
+            _save_topk_table_png(
+                out_path,
+                tokenizer=tokenizer,
+                top_ids=top_ids,
+                top_vals=top_vals,
+                shade_body=False,
+            )
+            table_paths.append(str(out_path))
+            logging.info(
+                "Wrote %s (sign=%s token_label=%r)",
+                out_path,
+                sign,
+                token_labels[tok_idx] if tok_idx < len(token_labels) else f"pos_{tok_idx}",
+            )
+    return table_paths
+
+
 def write_config_txt(
     path: str,
     *,
@@ -103,8 +211,9 @@ def write_config_txt(
     h5_example_count: int,
     vocab_size: int,
     softcap: Optional[float],
-    table_paths: Sequence[str],
+    table_paths_by_sign: Dict[str, Sequence[str]],
     finished_at: str,
+    allow_at_least_expected: bool,
 ) -> None:
     lines = [
         "Mass-Mean Direction Logit Lens Config",
@@ -134,13 +243,16 @@ def write_config_txt(
         f"expected_probability_tokens={args.expected_probability_tokens}",
         f"expected_confidence_tokens={args.expected_confidence_tokens}",
         f"extend_probability_span={args.extend_probability_span}",
+        f"allow_at_least_expected={allow_at_least_expected}",
         f"span_token_count={span_token_count}",
         f"expected_guess_tokens={args.expected_guess_tokens}",
         "",
-        "[Tables]",
     ]
-    for p in table_paths:
-        lines.append(f"table={p}")
+    for sign in DIRECTION_SIGNS:
+        lines.append(f"[Tables / {sign}]")
+        for p in table_paths_by_sign.get(sign, []):
+            lines.append(f"table={p}")
+        lines.append("")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -149,7 +261,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Logit-lens top-k tables for probability-span mass-mean directions "
-            "(one table per token position)."
+            "(one table per token position, for both the original direction and its negation)."
         )
     )
     parser.add_argument(
@@ -184,7 +296,9 @@ def main() -> None:
         default=False,
         help=(
             "If true (and not using linguistic confidence), treat probability span length as "
-            "expected_probability_tokens + 2."
+            "expected_probability_tokens + 2. If true together with "
+            "--linguistic_confidence_prompt, accept embeddings_probability lengths "
+            ">= expected_probability_tokens and use only the first N tokens."
         ),
     )
     parser.add_argument(
@@ -238,6 +352,14 @@ def main() -> None:
         if args.linguistic_confidence_prompt
         else span_token_count
     )
+    allow_at_least_expected = (
+        bool(args.linguistic_confidence_prompt) and bool(args.extend_probability_span)
+    )
+    logging.info(
+        "Span budget=%d allow_at_least_expected=%s",
+        direction_prob_token_budget,
+        allow_at_least_expected,
+    )
 
     logging.info("Computing probability mass-mean directions (streaming H5)...")
     direction_attn: Optional[np.ndarray] = None
@@ -249,6 +371,7 @@ def main() -> None:
                 expected_probability_tokens=direction_prob_token_budget,
                 low_conf_threshold=args.low_conf_threshold,
                 high_conf_threshold=args.high_conf_threshold,
+                allow_at_least_expected=allow_at_least_expected,
             )
         )
         direction_attn = np.asarray(direction_by_component["attn"], dtype=np.float32)
@@ -274,6 +397,7 @@ def main() -> None:
                 expected_probability_tokens=direction_prob_token_budget,
                 low_conf_threshold=args.low_conf_threshold,
                 high_conf_threshold=args.high_conf_threshold,
+                allow_at_least_expected=allow_at_least_expected,
             )
         )
         logging.info(
@@ -313,76 +437,31 @@ def main() -> None:
             f"vs lm_head in_features={w_u.shape[1]}."
         )
 
-    tables_dir = Path(run_root) / "tables"
-    tables_dir.mkdir(parents=True, exist_ok=True)
-    table_paths: List[str] = []
-    if args.subblock_mode:
-        logging.info("Writing %d subblock top-k tables (top_k=%d)", n_tokens, args.top_k)
-        assert direction_attn is not None and direction_mlp is not None
-        for tok_idx in range(n_tokens):
-            top_ids_attn, top_vals_attn = _compute_topk(
-                direction_attn[:, tok_idx, :],
-                top_k=args.top_k,
-                device=device,
-                w_u=w_u,
-                b_u=b_u,
-                norm_weight=norm_weight,
-                norm_eps=norm_eps,
-                softcap=softcap,
-            )
-            top_ids_mlp, top_vals_mlp = _compute_topk(
-                direction_mlp[:, tok_idx, :],
-                top_k=args.top_k,
-                device=device,
-                w_u=w_u,
-                b_u=b_u,
-                norm_weight=norm_weight,
-                norm_eps=norm_eps,
-                softcap=softcap,
-            )
-            out_path = tables_dir / f"probability_token_{tok_idx}.png"
-            _save_topk_table_png_subblocks(
-                out_path,
-                tokenizer=tokenizer,
-                top_ids_attn=top_ids_attn,
-                top_vals_attn=top_vals_attn,
-                top_ids_mlp=top_ids_mlp,
-                top_vals_mlp=top_vals_mlp,
-            )
-            table_paths.append(str(out_path))
-            logging.info(
-                "Wrote %s (token_label=%r)",
-                out_path,
-                token_labels[tok_idx] if tok_idx < len(token_labels) else f"pos_{tok_idx}",
-            )
-    else:
-        logging.info("Writing %d unshaded top-k tables (top_k=%d)", n_tokens, args.top_k)
-        for tok_idx in range(n_tokens):
-            hidden = direction_probability[:, tok_idx, :]
-            top_ids, top_vals = _compute_topk(
-                hidden,
-                top_k=args.top_k,
-                device=device,
-                w_u=w_u,
-                b_u=b_u,
-                norm_weight=norm_weight,
-                norm_eps=norm_eps,
-                softcap=softcap,
-            )
-            out_path = tables_dir / f"probability_token_{tok_idx}.png"
-            _save_topk_table_png(
-                out_path,
-                tokenizer=tokenizer,
-                top_ids=top_ids,
-                top_vals=top_vals,
-                shade_body=False,
-            )
-            table_paths.append(str(out_path))
-            logging.info(
-                "Wrote %s (token_label=%r)",
-                out_path,
-                token_labels[tok_idx] if tok_idx < len(token_labels) else f"pos_{tok_idx}",
-            )
+    tables_root = Path(run_root) / "tables"
+    write_kwargs = dict(
+        n_tokens=n_tokens,
+        token_labels=token_labels,
+        top_k=args.top_k,
+        device=device,
+        tokenizer=tokenizer,
+        w_u=w_u,
+        b_u=b_u,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+        softcap=softcap,
+        subblock_mode=args.subblock_mode,
+    )
+    table_paths_by_sign: Dict[str, List[str]] = {}
+    for sign in DIRECTION_SIGNS:
+        scale = 1.0 if sign == "positive" else -1.0
+        table_paths_by_sign[sign] = _write_token_tables(
+            tables_dir=tables_root / sign,
+            direction_probability=scale * direction_probability,
+            direction_attn=None if direction_attn is None else scale * direction_attn,
+            direction_mlp=None if direction_mlp is None else scale * direction_mlp,
+            sign=sign,
+            **write_kwargs,
+        )
 
     finished_at = datetime.now().isoformat(timespec="seconds")
     write_config_txt(
@@ -396,8 +475,9 @@ def main() -> None:
         h5_example_count=h5_example_count,
         vocab_size=vocab_size,
         softcap=softcap,
-        table_paths=table_paths,
+        table_paths_by_sign=table_paths_by_sign,
         finished_at=finished_at,
+        allow_at_least_expected=allow_at_least_expected,
     )
     summary = {
         "finished_at": finished_at,
@@ -411,11 +491,12 @@ def main() -> None:
         "span_token_count": n_tokens,
         "direction_probability_shape": list(direction_probability.shape),
         "vocab_size": vocab_size,
+        "allow_at_least_expected": allow_at_least_expected,
         "low_conf_count": len(low_ids),
         "high_conf_count": len(high_ids),
         "h5_example_count": h5_example_count,
         "token_labels": token_labels,
-        "tables": table_paths,
+        "tables": table_paths_by_sign,
     }
     with open(os.path.join(run_root, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
