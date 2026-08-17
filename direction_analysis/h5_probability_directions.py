@@ -24,6 +24,28 @@ def _is_expected_or_plus_two(actual_len: int, expected_len: int) -> bool:
     return actual_len in (expected_len, expected_len + 2)
 
 
+def _check_probability_span_length(
+    n_tok: int,
+    expected_probability_tokens: int,
+    *,
+    allow_at_least_expected: bool,
+    loc: str,
+    ex_id: str,
+) -> None:
+    if allow_at_least_expected:
+        if n_tok < expected_probability_tokens:
+            raise ValueError(
+                f"Example {ex_id} {loc} len={n_tok}; "
+                f"expected at least {expected_probability_tokens}."
+            )
+        return
+    if not _is_expected_or_plus_two(n_tok, expected_probability_tokens):
+        raise ValueError(
+            f"Example {ex_id} {loc} len={n_tok}; "
+            f"expected {expected_probability_tokens} or {expected_probability_tokens + 2}."
+        )
+
+
 def _read_verbalised_confidence(r0: h5py.Group) -> Optional[float]:
     ds = r0.get("verbalised_confidence")
     if ds is None or not isinstance(ds, h5py.Dataset):
@@ -99,14 +121,17 @@ def _read_probability_span(
     expected_probability_tokens: int,
     n_layers: Optional[int],
     ex_id: str,
+    allow_at_least_expected: bool = False,
 ) -> Tuple[np.ndarray, int]:
     """Return ``(n_layers, T, d_model)`` for one example's probability span."""
     n_tok = _h5_list_length(tok_group)
-    if not _is_expected_or_plus_two(n_tok, expected_probability_tokens):
-        raise ValueError(
-            f"Example {ex_id} embeddings_probability len={n_tok}; "
-            f"expected {expected_probability_tokens} or {expected_probability_tokens + 2}."
-        )
+    _check_probability_span_length(
+        n_tok,
+        expected_probability_tokens,
+        allow_at_least_expected=allow_at_least_expected,
+        loc="embeddings_probability",
+        ex_id=ex_id,
+    )
     use_n = expected_probability_tokens
     selected_tokens = []
     inferred_n_layers = n_layers
@@ -188,14 +213,17 @@ def _read_subblock_probability_span(
     n_layers: Optional[int],
     ex_id: str,
     component: str,
+    allow_at_least_expected: bool = False,
 ) -> Tuple[np.ndarray, int]:
     """Return ``(n_layers, T, d_model)`` for one example's attn or mlp probability span."""
     n_tok = _h5_list_length(tok_group)
-    if not _is_expected_or_plus_two(n_tok, expected_probability_tokens):
-        raise ValueError(
-            f"Example {ex_id} embeddings_probability/{component} len={n_tok}; "
-            f"expected {expected_probability_tokens} or {expected_probability_tokens + 2}."
-        )
+    _check_probability_span_length(
+        n_tok,
+        expected_probability_tokens,
+        allow_at_least_expected=allow_at_least_expected,
+        loc=f"embeddings_probability/{component}",
+        ex_id=ex_id,
+    )
     selected_tokens = []
     inferred_n_layers = n_layers
     d_model: Optional[int] = None
@@ -231,6 +259,7 @@ def compute_probability_mass_mean_direction_streaming(
     high_conf_threshold: float,
     new_h5_format: bool = True,
     log_every: int = 50,
+    allow_at_least_expected: bool = False,
 ) -> Tuple[np.ndarray, set[str], set[str], int, int]:
     """Stream H5 and compute probability-span mass-mean direction.
 
@@ -309,6 +338,7 @@ def compute_probability_mass_mean_direction_streaming(
                     expected_probability_tokens=expected_probability_tokens,
                     n_layers=n_layers,
                     ex_id=ex_id_str,
+                    allow_at_least_expected=allow_at_least_expected,
                 )
                 # span: (n_layers, T, d)
                 if is_low:
@@ -372,6 +402,7 @@ def compute_probability_subblock_mass_mean_directions_streaming(
     high_conf_threshold: float,
     components: Sequence[str] = SUBBLOCK_COMPONENTS,
     log_every: int = 50,
+    allow_at_least_expected: bool = False,
 ) -> Tuple[Dict[str, np.ndarray], set[str], set[str], int, int]:
     """Stream H5 and compute attn/mlp probability-span mass-mean directions.
 
@@ -455,6 +486,7 @@ def compute_probability_subblock_mass_mean_directions_streaming(
                         n_layers=n_layers,
                         ex_id=ex_id_str,
                         component=component,
+                        allow_at_least_expected=allow_at_least_expected,
                     )
                     spans[component] = span
 

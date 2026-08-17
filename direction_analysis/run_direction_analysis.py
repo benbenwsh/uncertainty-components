@@ -319,11 +319,7 @@ def main() -> None:
         expected_confidence_tokens=args.expected_confidence_tokens,
         extend_probability_span=args.extend_probability_span,
     )
-    direction_prob_token_budget = (
-        args.expected_probability_tokens
-        if args.linguistic_confidence_prompt
-        else span_token_count
-    )
+    direction_prob_token_budget = span_token_count
 
     logging.info("Computing probability mass-mean directions (streaming H5)...")
     direction_probability, low_ids, high_ids, n_layers, h5_example_count = (
