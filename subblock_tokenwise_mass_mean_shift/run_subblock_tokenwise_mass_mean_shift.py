@@ -740,6 +740,33 @@ def _directed_deviation_from_baseline(
     return max(0.0, diff)
 
 
+def _grid_input_output_tick_labels(token_labels: Sequence[str], n_cols: int) -> Tuple[List[str], List[str]]:
+    output_labels = [f"{i}:{_render_token_label(tok)}" for i, tok in enumerate(token_labels)]
+    if len(output_labels) < n_cols:
+        output_labels.extend([""] * (n_cols - len(output_labels)))
+    output_labels = output_labels[:n_cols]
+    input_labels = ["<last_answer_token>"] + output_labels[:-1]
+    if len(input_labels) < n_cols:
+        input_labels.extend([""] * (n_cols - len(input_labels)))
+    return input_labels[:n_cols], output_labels
+
+
+def _apply_input_output_token_axes(ax, *, n_cols: int, token_labels: Sequence[str]):
+    input_labels, output_labels = _grid_input_output_tick_labels(token_labels, n_cols)
+    ax.set_xticks(np.arange(n_cols))
+    ax.set_xticklabels(output_labels, rotation=30, ha="right")
+    ax.tick_params(axis="x", which="major", bottom=True, top=False, labelbottom=True, labeltop=False)
+    ax.xaxis.set_label_position("bottom")
+    ax.set_xlabel("Output tokens")
+
+    ax_top = ax.twiny()
+    ax_top.set_xlim(ax.get_xlim())
+    ax_top.set_xticks(np.arange(n_cols))
+    ax_top.set_xticklabels(input_labels, rotation=30, ha="left")
+    ax_top.set_xlabel("Input tokens")
+    return ax_top
+
+
 def write_layer_token_grid_plot(
     *,
     path: str,
@@ -750,6 +777,7 @@ def write_layer_token_grid_plot(
     mean_from_low_confidence: bool,
     linguistic_confidence_prompt: bool = False,
 ) -> None:
+    del linguistic_confidence_prompt
     n_rows, n_cols = matrix_values.shape
     max_dev = (
         float(np.nanmax(matrix_deviation_desired))
@@ -779,21 +807,12 @@ def write_layer_token_grid_plot(
 
     ax.set_yticks(np.arange(n_rows))
     ax.set_yticklabels([str(layer) for layer in run_layers])
-    ax.set_xticks(np.arange(n_cols))
-    ax.set_xticklabels(
-        [f"{i}:{_render_token_label(tok)}" for i, tok in enumerate(token_labels)],
-        rotation=30,
-        ha="left",
-    )
-    ax.xaxis.tick_top()
-    ax.xaxis.set_label_position("top")
-    xlabel = "Confidence token position" if linguistic_confidence_prompt else "Probability token position"
-    ax.set_xlabel(xlabel)
     ax.set_ylabel("Layer")
     direction = "below" if mean_from_low_confidence else "above"
     ax.set_title(
         f"Layer x token confidence (blue alpha = deviation {direction} baseline; opposite = 0)"
     )
+    _apply_input_output_token_axes(ax, n_cols=n_cols, token_labels=token_labels)
 
     ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
     ax.set_yticks(np.arange(-0.5, n_rows, 1), minor=True)

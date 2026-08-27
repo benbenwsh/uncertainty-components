@@ -212,47 +212,25 @@ def build_single_token_subblock_mean_replace_hooks(
     component_to_layer_to_mean_vectors: Dict[str, Dict[int, torch.Tensor]],
     *,
     prompt_len: int,
-    seq_len_provider: Callable[[], int],
     decoded_tokens_provider: Callable[[], List[str]],
     token_position: int,
     expected_probability_tokens: int,
     extend_probability_span: bool = False,
-    log_context: str = "",
 ) -> List[Tuple[str, Callable]]:
     """Build mean-replace hooks for one or more subblocks at a single token position.
 
     When multiple subblocks are present, all hooks are registered together so
     attn and mlp are ablated simultaneously in the same forward pass.
     """
-    _last_logged_key: Dict[str, object | None] = {"value": None}
 
     def _abs_positions() -> List[int]:
-        decoded_tokens = decoded_tokens_provider()
-        positions = _absolute_prob_single_position(
+        return _absolute_prob_single_position(
             prompt_len,
-            decoded_tokens,
+            decoded_tokens_provider(),
             token_position=token_position,
             expected_probability_tokens=expected_probability_tokens,
             extend_probability_span=extend_probability_span,
         )
-        if positions:
-            seq_len = seq_len_provider()
-            log_key = (seq_len, tuple(positions))
-            if _last_logged_key["value"] != log_key:
-                _last_logged_key["value"] = log_key
-                prefix = f"{log_context} " if log_context else ""
-                rendered_tokens = [_render_token_label(token) for token in decoded_tokens]
-                logging.info(
-                    "%sAblation forward pass (parse ok): ablation_positions=%s "
-                    "subblocks=%s prompt_len=%d seq_len=%d decoded_tokens=%s",
-                    prefix,
-                    positions,
-                    list(component_to_layer_to_mean_vectors.keys()),
-                    prompt_len,
-                    seq_len,
-                    rendered_tokens,
-                )
-        return positions
 
     hooks: List[Tuple[str, Callable]] = []
     for subblock, layer_to_mean_vectors in component_to_layer_to_mean_vectors.items():
@@ -299,17 +277,10 @@ def greedy_generate_probability_single_token_mean_replaced(
     token_position: int,
     expected_probability_tokens: int,
     extend_probability_span: bool = False,
-    log_context: str = "",
 ) -> Tuple[str, List[str]]:
     tokens = model.to_tokens(local_prompt)
     prompt_len = int(tokens.shape[1])
     decoded_tokens: List[str] = []
-
-    def _seq_len() -> int:
-        # `_greedy_extend_with_fwd_hooks()` grows its own local `tokens`, so use
-        # prompt length plus the shared decoded-token buffer to reflect the
-        # current autoregressive sequence length seen by this hook callback.
-        return prompt_len + len(decoded_tokens)
 
     def _decoded_tokens() -> List[str]:
         return decoded_tokens
@@ -317,12 +288,10 @@ def greedy_generate_probability_single_token_mean_replaced(
     hooks = build_single_token_subblock_mean_replace_hooks(
         component_to_layer_to_mean_vectors,
         prompt_len=prompt_len,
-        seq_len_provider=_seq_len,
         decoded_tokens_provider=_decoded_tokens,
         token_position=token_position,
         expected_probability_tokens=expected_probability_tokens,
         extend_probability_span=extend_probability_span,
-        log_context=log_context,
     )
     return _greedy_extend_with_fwd_hooks(
         model,
@@ -522,7 +491,6 @@ def run_tokenwise_evaluation(
                         token_position=token_position,
                         expected_probability_tokens=expected_probability_tokens,
                         extend_probability_span=extend_probability_span,
-                        log_context=f"{split_name} {ex_id} {_token_mode_key(token_position)}",
                     )
                 )
                 confidence = (
@@ -754,6 +722,33 @@ def _directed_deviation_from_baseline(
     return max(0.0, diff)
 
 
+def _grid_input_output_tick_labels(token_labels: Sequence[str], n_cols: int) -> Tuple[List[str], List[str]]:
+    output_labels = [f"{i}:{_render_token_label(tok)}" for i, tok in enumerate(token_labels)]
+    if len(output_labels) < n_cols:
+        output_labels.extend([""] * (n_cols - len(output_labels)))
+    output_labels = output_labels[:n_cols]
+    input_labels = ["<last_answer_token>"] + output_labels[:-1]
+    if len(input_labels) < n_cols:
+        input_labels.extend([""] * (n_cols - len(input_labels)))
+    return input_labels[:n_cols], output_labels
+
+
+def _apply_input_output_token_axes(ax, *, n_cols: int, token_labels: Sequence[str]):
+    input_labels, output_labels = _grid_input_output_tick_labels(token_labels, n_cols)
+    ax.set_xticks(np.arange(n_cols))
+    ax.set_xticklabels(output_labels, rotation=30, ha="right")
+    ax.tick_params(axis="x", which="major", bottom=True, top=False, labelbottom=True, labeltop=False)
+    ax.xaxis.set_label_position("bottom")
+    ax.set_xlabel("Output tokens")
+
+    ax_top = ax.twiny()
+    ax_top.set_xlim(ax.get_xlim())
+    ax_top.set_xticks(np.arange(n_cols))
+    ax_top.set_xticklabels(input_labels, rotation=30, ha="left")
+    ax_top.set_xlabel("Input tokens")
+    return ax_top
+
+
 def write_layer_token_grid_plot(
     *,
     path: str,
@@ -792,17 +787,9 @@ def write_layer_token_grid_plot(
 
     ax.set_yticks(np.arange(n_rows))
     ax.set_yticklabels([str(layer) for layer in run_layers])
-    ax.set_xticks(np.arange(n_cols))
-    ax.set_xticklabels(
-        [f"{i}:{_render_token_label(tok)}" for i, tok in enumerate(token_labels)],
-        rotation=30,
-        ha="left",
-    )
-    ax.xaxis.tick_top()
-    ax.xaxis.set_label_position("top")
-    ax.set_xlabel("Probability token position")
     ax.set_ylabel("Layer")
     ax.set_title("Layer x token confidence (blue alpha = |deviation from baseline|)")
+    _apply_input_output_token_axes(ax, n_cols=n_cols, token_labels=token_labels)
 
     ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
     ax.set_yticks(np.arange(-0.5, n_rows, 1), minor=True)

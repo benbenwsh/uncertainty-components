@@ -294,6 +294,64 @@ def config_txt_path(full_output_path: str) -> str:
     return os.path.join(out_dir, "config.txt")
 
 
+def resolve_confidence_groups(
+    *,
+    mean_from_low_confidence: bool,
+    ablate_with_same_confidence: bool = False,
+) -> Tuple[str, str]:
+    """Return (mean_source_group, ablation_target_group) labels."""
+    source_group = "low_confidence" if mean_from_low_confidence else "high_confidence"
+    if ablate_with_same_confidence:
+        return source_group, source_group
+    target_group = "high_confidence" if mean_from_low_confidence else "low_confidence"
+    return source_group, target_group
+
+
+# (combo_dir_name, mean_from_low_confidence, ablate_with_same_confidence)
+CONFIDENCE_GROUP_PAIR_COMBOS: Tuple[Tuple[str, bool, bool], ...] = (
+    ("mean_low_target_high", True, False),
+    ("mean_high_target_low", False, False),
+    ("mean_low_target_low", True, True),
+    ("mean_high_target_high", False, True),
+)
+
+
+def resolve_combo_target_ids(
+    low_ids: set[str],
+    high_ids: set[str],
+    *,
+    mean_from_low_confidence: bool,
+    ablate_with_same_confidence: bool,
+) -> set[str]:
+    source_ids = low_ids if mean_from_low_confidence else high_ids
+    if ablate_with_same_confidence:
+        return source_ids
+    return high_ids if mean_from_low_confidence else low_ids
+
+
+def layer_tensor_means_from_numpy(
+    verbalised_embedding_means: Dict[str, np.ndarray],
+    run_layers: Sequence[int],
+    *,
+    device: str,
+    torch_dtype: torch.dtype,
+) -> Dict[int, Dict[str, torch.Tensor]]:
+    layer_to_means: Dict[int, Dict[str, torch.Tensor]] = {}
+    for i, layer_idx in enumerate(run_layers):
+        layer_to_means[int(layer_idx)] = {
+            "prompt_mean": torch.tensor(verbalised_embedding_means["prompt_mean"][i], device=device, dtype=torch_dtype),
+            "guess": torch.tensor(verbalised_embedding_means["guess"][i], device=device, dtype=torch_dtype),
+            "sem_answer_mean": torch.tensor(
+                verbalised_embedding_means["sem_answer_mean"][i], device=device, dtype=torch_dtype
+            ),
+            "probability": torch.tensor(verbalised_embedding_means["probability"][i], device=device, dtype=torch_dtype),
+            "probability_value_mean": torch.tensor(
+                verbalised_embedding_means["probability_value_mean"][i], device=device, dtype=torch_dtype
+            ),
+        }
+    return layer_to_means
+
+
 def write_config_txt(
     path: str,
     *,
@@ -317,9 +375,13 @@ def write_config_txt(
     mode_verbalised_confidence_effect_counts: Optional[Dict[str, int]] = None,
     mode_uncertainty_score_means: Optional[Dict[str, Optional[float]]] = None,
     mode_uncertainty_score_counts: Optional[Dict[str, int]] = None,
+    ablate_with_same_confidence: bool = False,
+    all_confidence_group_pairs: bool = False,
 ) -> None:
-    source_group = "low_confidence" if mean_from_low_confidence else "high_confidence"
-    target_group = "high_confidence" if mean_from_low_confidence else "low_confidence"
+    source_group, target_group = resolve_confidence_groups(
+        mean_from_low_confidence=mean_from_low_confidence,
+        ablate_with_same_confidence=ablate_with_same_confidence,
+    )
     lines = [
         "Layerwise Mean Ablation Configuration",
         "====================================",
@@ -349,11 +411,14 @@ def write_config_txt(
         "",
         "[Ablation]",
         f"ablation_mode={args.ablation_mode}",
+        f"all_confidence_group_pairs={all_confidence_group_pairs}",
         f"mean_from_low_confidence={mean_from_low_confidence}",
+        f"ablate_with_same_confidence={ablate_with_same_confidence}",
         f"mean_source_group={source_group}",
         f"ablation_target_group={target_group}",
         f"ablate_layers_spec={args.ablate_layers}",
         f"ablate_layers_resolved={','.join(str(layer) for layer in ablate_layers)}",
+        f"layer_indexing={LAYER_INDEXING_NOTE}",
         f"num_ablated_layers={len(ablate_layers)}",
         f"expected_probability_tokens={args.expected_probability_tokens}",
         f"parse_mode_verbalised_confidence={parse_mode_verbalised_confidence}",
@@ -412,6 +477,101 @@ def write_config_txt(
         f.write("\n".join(lines) + "\n")
 
 
+def write_individual_layer_summary_and_plot(
+    individual_root: str,
+    *,
+    args: argparse.Namespace,
+    model_n_layers: int,
+    run_layers: Sequence[int],
+    mean_from_low_confidence: bool,
+    ablate_with_same_confidence: bool,
+    all_confidence_group_pairs: bool,
+    per_layer_mode_means: Dict[int, Dict[str, Optional[float]]],
+) -> None:
+    mean_source_group, ablation_target_group = resolve_confidence_groups(
+        mean_from_low_confidence=mean_from_low_confidence,
+        ablate_with_same_confidence=ablate_with_same_confidence,
+    )
+    modes_non_none = [mode for mode in args.ablation_mode if mode != "none"]
+    baseline_none_mean = None
+    if "none" in args.ablation_mode and per_layer_mode_means:
+        first_layer = run_layers[0]
+        baseline_none_mean = per_layer_mode_means[first_layer].get("none")
+
+    summary_path = os.path.join(individual_root, "summary.txt")
+    summary_lines = [
+        "Individual Layer Mean Ablation Summary",
+        "=====================================",
+        "",
+        "[Setup]",
+        f"model_name={args.model_name}",
+        f"input_h5={args.input_h5}",
+        f"dataset={args.dataset}",
+        f"ablation_mode={args.ablation_mode}",
+        f"num_layers={model_n_layers}",
+        f"run_layers={','.join(str(layer) for layer in run_layers)}",
+        f"num_samples={args.num_samples}",
+        f"num_few_shot={args.num_few_shot}",
+        f"model_max_new_tokens={args.model_max_new_tokens}",
+        f"all_confidence_group_pairs={all_confidence_group_pairs}",
+        f"mean_from_low_confidence={mean_from_low_confidence}",
+        f"ablate_with_same_confidence={ablate_with_same_confidence}",
+        f"mean_source_group={mean_source_group}",
+        f"ablation_target_group={ablation_target_group}",
+        f"parse_mode_verbalised_confidence={args.parse_mode_verbalised_confidence}",
+        "",
+    ]
+    if "none" in args.ablation_mode:
+        if baseline_none_mean is None:
+            summary_lines.append("none_mean_verbalised_confidence=None")
+        else:
+            summary_lines.append(f"none_mean_verbalised_confidence={baseline_none_mean:.6f}")
+        summary_lines.append("")
+
+    summary_lines.append("[Per-layer verbalised confidence]")
+    if modes_non_none:
+        header = "layer\t" + "\t".join(modes_non_none)
+        summary_lines.append(header)
+        for layer_idx in run_layers:
+            row_vals = []
+            for mode in modes_non_none:
+                val = per_layer_mode_means[layer_idx].get(mode)
+                row_vals.append("None" if val is None else f"{val:.6f}")
+            summary_lines.append(f"{layer_idx}\t" + "\t".join(row_vals))
+    else:
+        summary_lines.append("No non-none modes selected.")
+    summary_lines.append("")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(summary_lines))
+    logging.info("Wrote %s", summary_path)
+
+    plot_path = os.path.join(individual_root, "verbalised_confidence_by_layer.png")
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for mode in modes_non_none:
+        ys: List[float] = []
+        xs: List[int] = []
+        for layer_idx in run_layers:
+            y_val = per_layer_mode_means[layer_idx].get(mode)
+            if y_val is not None:
+                xs.append(layer_idx)
+                ys.append(float(y_val))
+        if ys:
+            ax.plot(xs, ys, marker="o", label=mode)
+    if baseline_none_mean is not None:
+        ax.axhline(y=float(baseline_none_mean), linestyle="--", label="none (baseline)")
+    ax.set_xlabel("Layer")
+    ax.set_ylabel("Verbalised confidence")
+    ax.set_ylim(0.0, 1.0)
+    ax.set_title("Individual layer verbalised confidence")
+    ax.grid(True, alpha=0.3)
+    if modes_non_none or baseline_none_mean is not None:
+        ax.legend()
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logging.info("Wrote %s", plot_path)
+
+
 def mode_to_output_key(mode: str) -> str:
     if mode == "none":
         return "no_replacement"
@@ -435,6 +595,8 @@ def mode_to_output_key(mode: str) -> str:
         return "probability_value_mean_replace"
     if mode == "semantic_answer_mean_replace":
         return "semantic_answer_mean_replace"
+    if mode == "semantic_answer_including_first_prob_mean_replace":
+        return "semantic_answer_including_first_prob_mean_replace"
     if mode == "prompt_tokens_mean_replace":
         return "prompt_tokens_mean_replace"
     if mode == "sem_ans_tokens_during_gen":
@@ -713,6 +875,12 @@ def load_examples_h5(path: Path) -> Dict[str, dict]:
     return examples
 
 
+LAYER_INDEXING_NOTE = (
+    "display: 0=embedding resid_pre (blocks.0.hook_resid_pre); "
+    "k>=1=resid_post of TL block k-1"
+)
+
+
 def parse_ablate_layers(spec: str, n_layers: int) -> List[int]:
     spec = spec.strip()
     if "-" in spec and "," not in spec:
@@ -724,6 +892,17 @@ def parse_ablate_layers(spec: str, n_layers: int) -> List[int]:
         if layer_idx < 0 or layer_idx >= n_layers:
             raise ValueError(f"Layer index {layer_idx} out of range [0, {n_layers}) for this model.")
     return layers
+
+
+def hook_name_for_display_layer(display_layer: int) -> str:
+    """Map display layer index to the residual-stream intervention hook.
+
+    Display 0 is the input embedding (resid-pre of block 0). Display k>=1 is
+    resid-post of TransformerLens block k-1.
+    """
+    if display_layer == 0:
+        return "blocks.0.hook_resid_pre"
+    return f"blocks.{display_layer - 1}.hook_resid_post"
 
 
 def _as_layer_hidden(arr_like: np.ndarray) -> np.ndarray:
@@ -748,6 +927,7 @@ def compute_confidence_group_means(
     expected_probability_tokens: int,
     mean_from_low_confidence: bool,
     new_h5_format: bool = False,
+    h5_res_indices: Optional[Sequence[int]] = None,
 ) -> Tuple[np.ndarray, set[str], set[str]]:
     """
     Returns:
@@ -792,10 +972,16 @@ def compute_confidence_group_means(
         emb_prob = emb_prob[:expected_probability_tokens]
 
         token_vectors: List[np.ndarray] = []
+        resid_post_layers = (
+            np.asarray(h5_res_indices)
+            if h5_res_indices is not None
+            else np.asarray(ablate_layers) + 1
+        )
         for tok_arr in emb_prob:
             layer_hidden = _as_layer_hidden(tok_arr)  # [n_layers + 1, hidden_dim]
-            # HF res[0] is the embedding; resid_post of TL block i is res[i + 1].
-            selected = layer_hidden[np.asarray(ablate_layers) + 1, :]
+            # Default: HF res[0] is the embedding; resid_post of TL block i is res[i + 1].
+            # Pass h5_res_indices to index those rows directly (display k == res[k]).
+            selected = layer_hidden[resid_post_layers, :]
             token_vectors.append(selected)
         stacked = np.stack(token_vectors, axis=1)  # [num_selected_layers, num_prob_tokens - 1, hidden_dim]
         source_vectors.append(stacked)
@@ -848,6 +1034,7 @@ def compute_verbalised_embedding_group_means(
     expected_guess_tokens: int,
     mean_from_low_confidence: bool,
     new_h5_format: bool = False,
+    h5_res_indices: Optional[Sequence[int]] = None,
 ) -> Tuple[Dict[str, np.ndarray], set[str], set[str]]:
     """Build per-layer mean replacement vectors for verbalised-embedding regions.
 
@@ -863,10 +1050,14 @@ def compute_verbalised_embedding_group_means(
     or ``expected_probability_tokens + 2``; only the first
     ``expected_probability_tokens`` rows are used.
 
+    By default H5 ``res`` rows are ``ablate_layers + 1`` (skip embedding; resid-post
+    of TransformerLens block i is ``res[i + 1]``). Pass ``h5_res_indices`` to index
+    those rows directly (display layer k == ``res[k]``).
+
     Returns:
       - dict of mean tensors keyed by region (`prompt_mean`, `guess`,
         `sem_answer_mean`, `probability`, `probability_value_mean`) with layer
-        dimension restricted to `ablate_layers`
+        dimension restricted to `ablate_layers` (or `h5_res_indices` if set)
       - low-confidence example IDs
       - high-confidence example IDs
     """
@@ -942,7 +1133,11 @@ def compute_verbalised_embedding_group_means(
             )
         emb_prob = emb_prob[:expected_probability_tokens]
 
-        resid_post_layers = np.asarray(ablate_layers) + 1
+        resid_post_layers = (
+            np.asarray(h5_res_indices)
+            if h5_res_indices is not None
+            else np.asarray(ablate_layers) + 1
+        )
         prompt_layer_hidden = _as_layer_hidden(emb_prompt)[resid_post_layers, :]
         sem_answer_layer_hidden = _as_layer_hidden(emb_sem_answer)[resid_post_layers, :]
         mean_prob_val_layer_hidden = _as_layer_hidden(emb_mean_prob_val)[resid_post_layers, :]
@@ -1063,15 +1258,26 @@ def _absolute_prob_marker_except_last_token(prompt_len: int, decoded_tokens: Lis
     return out
 
 
-def _absolute_sem_answer_positions(prompt_len: int, decoded_tokens: List[str]) -> List[int]:
-    """Absolute indices for semantic-answer completion tokens (between ``Guess:`` answer start and ``Probability:`` marker)."""
+def _absolute_sem_answer_positions(
+    prompt_len: int,
+    decoded_tokens: List[str],
+    *,
+    include_first_prob: bool = False,
+) -> List[int]:
+    """Absolute indices for semantic-answer completion tokens (between ``Guess:`` answer start and ``Probability:`` marker).
+
+    Completion indices are ``range(last_guess_token_index, first_prob_token_index)`` by default.
+    If ``include_first_prob`` is true, the range is inclusive of ``first_prob_token_index``
+    (the residual whose input is the last semantic-answer token).
+    """
     parsed = parse_guess_and_probability_indices(decoded_tokens)
     if parsed is None:
         return []
     last_guess_token_index, first_prob_token_index, _ = parsed
     seq_len = prompt_len + len(decoded_tokens)
+    end = first_prob_token_index + (1 if include_first_prob else 0)
     out: List[int] = []
-    for k in range(last_guess_token_index, first_prob_token_index):
+    for k in range(last_guess_token_index, end):
         p = _completion_token_index_to_abs_pos(prompt_len, k)
         if 0 <= p < seq_len:
             out.append(p)
@@ -1159,16 +1365,20 @@ def _build_resid_post_mean_replace_hooks(
     seq_len_provider: Callable[[], int],
     abs_positions_provider: Callable[[], List[int]],
     strict_num_prob_positions: bool,
+    hook_name_for_layer: Optional[Callable[[int], str]] = None,
 ) -> List[Tuple[str, Callable]]:
     """
-    Shared ``hook_resid_post`` factory: ``abs_positions_provider`` returns the same
-    layout as ``_absolute_prob_positions`` (length ``num_prob_tokens`` when full).
+    Shared residual-stream mean-replace factory: ``abs_positions_provider`` returns
+    the same layout as ``_absolute_prob_positions`` (length ``num_prob_tokens`` when
+    full). Dict keys are display layers; default hook mapping is
+    ``hook_name_for_display_layer``. Pass ``hook_name_for_layer`` to override.
     """
     num_prob_tokens = next(iter(layer_to_mean_vectors.values())).shape[0]
     hooks: List[Tuple[str, Callable]] = []
+    name_fn = hook_name_for_layer or hook_name_for_display_layer
 
     for layer in layer_to_mean_vectors:
-        hook_name = f"blocks.{layer}.hook_resid_post"
+        hook_name = name_fn(layer)
 
         def _make_hook(layer_idx: int):
             def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
@@ -1323,7 +1533,8 @@ def greedy_generate(
     local_prompt: str,
     max_new_tokens: int,
     fwd_hooks: Optional[List[Tuple[str, Callable]]] = None,
-) -> Tuple[str, List[str]]:
+    return_generated_ids: bool = False,
+) -> Tuple[str, List[str]] | Tuple[str, List[str], List[int]]:
     tokens = model.to_tokens(local_prompt)
     generated: List[int] = []
     decoded_tokens: List[str] = []
@@ -1349,6 +1560,8 @@ def greedy_generate(
                 break
 
     response = _postprocess_response_from_full_decode(model, tokens, local_prompt)
+    if return_generated_ids:
+        return response, decoded_tokens, generated
     return response, decoded_tokens
 
 
@@ -1494,7 +1707,7 @@ def build_pre_probability_mean_replace_hooks(
     required_keys = {"prompt_mean", "guess", "sem_answer_mean", "probability"}
 
     for layer in layer_to_verbalised_embedding_means:
-        hook_name = f"blocks.{layer}.hook_resid_post"
+        hook_name = hook_name_for_display_layer(layer)
 
         def _make_hook(layer_idx: int):
             def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
@@ -1648,7 +1861,7 @@ def build_all_pre_guess_mean_replace_hooks(
 
     hooks: List[Tuple[str, Callable]] = []
     for layer in layer_to_verbalised_embedding_means:
-        hook_name = f"blocks.{layer}.hook_resid_post"
+        hook_name = hook_name_for_display_layer(layer)
 
         def _make_hook(layer_idx: int):
             def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
@@ -1727,7 +1940,7 @@ def build_guess_then_guess_and_probability_mean_replace_hooks(
     """
     hooks: List[Tuple[str, Callable]] = []
     for layer in layer_to_verbalised_embedding_means:
-        hook_name = f"blocks.{layer}.hook_resid_post"
+        hook_name = hook_name_for_display_layer(layer)
 
         def _make_hook(layer_idx: int):
             def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
@@ -1842,7 +2055,7 @@ def build_probability_value_mean_replace_hooks(
     """
     hooks: List[Tuple[str, Callable]] = []
     for layer in layer_to_verbalised_embedding_means:
-        hook_name = f"blocks.{layer}.hook_resid_post"
+        hook_name = hook_name_for_display_layer(layer)
 
         def _make_hook(layer_idx: int):
             def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
@@ -1916,20 +2129,26 @@ def build_semantic_answer_mean_replace_hooks(
     *,
     prompt_len: int,
     decoded_tokens_provider: Callable[[], List[str]],
+    include_first_prob: bool = False,
 ) -> List[Tuple[str, Callable]]:
     """
     Dynamic hooks for semantic-answer ablation:
     - no-op until ``parse_guess_and_probability_indices`` succeeds;
     - replace every semantic-answer token with the shared ``sem_answer_mean`` vector.
+    If ``include_first_prob``, also replace the residual at ``first_prob_token_index``.
     """
     hooks: List[Tuple[str, Callable]] = []
     for layer in layer_to_verbalised_embedding_means:
-        hook_name = f"blocks.{layer}.hook_resid_post"
+        hook_name = hook_name_for_display_layer(layer)
 
         def _make_hook(layer_idx: int):
             def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
                 del hook
-                sem_positions = _absolute_sem_answer_positions(prompt_len, decoded_tokens_provider())
+                sem_positions = _absolute_sem_answer_positions(
+                    prompt_len,
+                    decoded_tokens_provider(),
+                    include_first_prob=include_first_prob,
+                )
                 if not sem_positions:
                     return activation
 
@@ -1958,6 +2177,8 @@ def greedy_generate_semantic_answer_mean_replaced(
     local_prompt: str,
     max_new_tokens: int,
     layer_to_verbalised_embedding_means: Dict[int, Dict[str, torch.Tensor]],
+    *,
+    include_first_prob: bool = False,
 ) -> Tuple[str, List[str]]:
     tokens = model.to_tokens(local_prompt)
     prompt_len = int(tokens.shape[1])
@@ -1970,6 +2191,7 @@ def greedy_generate_semantic_answer_mean_replaced(
         layer_to_verbalised_embedding_means=layer_to_verbalised_embedding_means,
         prompt_len=prompt_len,
         decoded_tokens_provider=_decoded_tokens,
+        include_first_prob=include_first_prob,
     )
     return _greedy_extend_with_fwd_hooks(model, local_prompt, max_new_tokens, tokens, decoded_tokens, hooks)
 
@@ -1987,7 +2209,7 @@ def build_prompt_tokens_mean_replace_hooks(
     """
     hooks: List[Tuple[str, Callable]] = []
     for layer in layer_to_verbalised_embedding_means:
-        hook_name = f"blocks.{layer}.hook_resid_post"
+        hook_name = hook_name_for_display_layer(layer)
 
         def _make_hook(layer_idx: int):
             def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
@@ -2050,7 +2272,7 @@ def build_sem_ans_tokens_during_gen_hooks(
     """
     hooks: List[Tuple[str, Callable]] = []
     for layer in layer_to_verbalised_embedding_means:
-        hook_name = f"blocks.{layer}.hook_resid_post"
+        hook_name = hook_name_for_display_layer(layer)
 
         def _make_hook(layer_idx: int):
             def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
@@ -2143,7 +2365,10 @@ def main() -> None:
         "--ablate_layers",
         type=str,
         default="12-15",
-        help="Inclusive range '12-15' or comma list '12,13,14,15' (Zero-indexing!).",
+        help=(
+            "Inclusive range '12-15' or comma list '12,13,14,15' (display indices: "
+            "0=embedding resid-pre, k>=1=resid-post of TL block k-1)."
+        ),
     )
     parser.add_argument(
         "--ablation_mode",
@@ -2163,6 +2388,7 @@ def main() -> None:
             "probability_first_two_and_index6_tokens_mean_replace",
             "probability_value_mean_replace",
             "semantic_answer_mean_replace",
+            "semantic_answer_including_first_prob_mean_replace",
             "prompt_tokens_mean_replace",
             "sem_ans_tokens_during_gen",
         ],
@@ -2180,6 +2406,7 @@ def main() -> None:
             "probability_first_two_and_index6_tokens_mean_replace",
             "probability_value_mean_replace",
             "semantic_answer_mean_replace",
+            "semantic_answer_including_first_prob_mean_replace",
             "prompt_tokens_mean_replace",
             "sem_ans_tokens_during_gen",
         ],
@@ -2203,6 +2430,9 @@ def main() -> None:
             "probability[-1] for the first position and embeddings_mean_prob_val mean for later positions. "
             "semantic_answer_mean_replace: no hooks until Guess/Probability parse succeeds; then replace "
             "every semantic-answer token with the shared embeddings_mean_sem_answer group mean. "
+            "semantic_answer_including_first_prob_mean_replace: same as semantic_answer_mean_replace but "
+            "the ablated span also includes first_prob_token_index (residual whose input is the last "
+            "semantic-answer token). "
             "prompt_tokens_mean_replace: no-op until Guess: prefix parses; then replace all prompt token "
             "positions with the shared embeddings_mean_prompt group mean. "
             "sem_ans_tokens_during_gen: no-op until Guess: prefix parses; replace semantic-answer tokens "
@@ -2212,12 +2442,35 @@ def main() -> None:
     parser.add_argument("--low_conf_threshold", type=float, default=0.1)
     parser.add_argument("--high_conf_threshold", type=float, default=0.9)
     parser.add_argument(
+        "--all_confidence_group_pairs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "If true (default), run all four mean-source × target-group combinations "
+            "(mean_low_target_high, mean_high_target_low, mean_low_target_low, mean_high_target_high) "
+            "and ignore --mean_from_low_confidence / --ablate_with_same_confidence. "
+            "If false, run a single combination from those two flags."
+        ),
+    )
+    parser.add_argument(
         "--mean_from_low_confidence",
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
             "If true (default), compute means from low-confidence examples and ablate high-confidence examples. "
-            "If false, compute means from high-confidence examples and ablate low-confidence examples."
+            "If false, reverse source and target groups. "
+            "When --ablate_with_same_confidence is set, targets match the mean-source group instead. "
+            "Ignored when --all_confidence_group_pairs is true."
+        ),
+    )
+    parser.add_argument(
+        "--ablate_with_same_confidence",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If true, ablate examples from the same confidence group used for the mean "
+            "(within-group control). If false (default), ablate the opposite group. "
+            "Ignored when --all_confidence_group_pairs is true."
         ),
     )
     parser.add_argument("--expected_probability_tokens", type=int, default=7)
@@ -2237,7 +2490,9 @@ def main() -> None:
         default=None,
         help=(
             "Optional output path. If unset, saves to "
-            "layerwise_mean_ablation/results/<incrementing_run_id>/ablation_results.json"
+            "layerwise_mean_ablation/results/<incrementing_run_id>/ablation_results.json. "
+            "When --all_confidence_group_pairs is true, combo subdirectories are created under "
+            "that run directory."
         ),
     )
     parser.add_argument(
@@ -2245,8 +2500,12 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "If true, ignore --ablate_layers and run a separate ablation for each layer. "
-            "Outputs are written under results/individual_layers/<run_id>/<layer_idx>/."
+            "If true, ignore --ablate_layers and run a separate ablation for each "
+            "display layer (n_layers+1 rows: 0=embedding resid-pre, k>=1=resid-post "
+            "of TL block k-1). Outputs are written under "
+            "results/individual_layers/<run_id>/<layer_idx>/, or under "
+            "results/individual_layers/<run_id>/<combo>/<layer_idx>/ when "
+            "--all_confidence_group_pairs is true."
         ),
     )
     args = parser.parse_args()
@@ -2280,8 +2539,8 @@ def main() -> None:
 
     logging.info("Loading HookedTransformer: %s", args.model_name)
     model = load_hooked_transformer(args.model_name, device=device, torch_dtype=torch_dtype)
-    ablate_layers = parse_ablate_layers(args.ablate_layers, model.cfg.n_layers)
-    run_layers = list(range(model.cfg.n_layers)) if args.individual_layers else ablate_layers
+    ablate_layers = parse_ablate_layers(args.ablate_layers, model.cfg.n_layers + 1)
+    run_layers = list(range(model.cfg.n_layers + 1)) if args.individual_layers else ablate_layers
 
     examples_h5 = load_examples_h5(Path(args.input_h5))
     modes = set(args.ablation_mode)
@@ -2296,25 +2555,46 @@ def main() -> None:
         or "guess_then_guess_and_probability_tokens_mean_replace" in modes
         or "probability_value_mean_replace" in modes
         or "semantic_answer_mean_replace" in modes
+        or "semantic_answer_including_first_prob_mean_replace" in modes
         or "prompt_tokens_mean_replace" in modes
         or "sem_ans_tokens_during_gen" in modes
     )
 
     low_ids: set[str]
     high_ids: set[str]
-    verbalised_embedding_means: Optional[Dict[str, np.ndarray]] = None
+    means_by_source: Dict[bool, Optional[Dict[int, Dict[str, torch.Tensor]]]] = {True: None, False: None}
+
+    if args.all_confidence_group_pairs:
+        logging.info(
+            "all_confidence_group_pairs=True; ignoring --mean_from_low_confidence=%s and "
+            "--ablate_with_same_confidence=%s.",
+            args.mean_from_low_confidence,
+            args.ablate_with_same_confidence,
+        )
+        source_flags: Tuple[bool, ...] = (True, False)
+        combos: List[Tuple[Optional[str], bool, bool]] = [
+            (name, mean_from_low, same) for name, mean_from_low, same in CONFIDENCE_GROUP_PAIR_COMBOS
+        ]
+    else:
+        source_flags = (bool(args.mean_from_low_confidence),)
+        combos = [(None, bool(args.mean_from_low_confidence), bool(args.ablate_with_same_confidence))]
 
     if need_verbalised_embedding_means:
-        verbalised_embedding_means, low_ids, high_ids = compute_verbalised_embedding_group_means(
-            examples_h5,
-            run_layers,
-            low_conf_threshold=args.low_conf_threshold,
-            high_conf_threshold=args.high_conf_threshold,
-            expected_probability_tokens=args.expected_probability_tokens,
-            expected_guess_tokens=args.expected_guess_tokens,
-            mean_from_low_confidence=args.mean_from_low_confidence,
-            new_h5_format=args.new_h5_format,
-        )
+        for mean_from_low in source_flags:
+            np_means, low_ids, high_ids = compute_verbalised_embedding_group_means(
+                examples_h5,
+                run_layers,
+                low_conf_threshold=args.low_conf_threshold,
+                high_conf_threshold=args.high_conf_threshold,
+                expected_probability_tokens=args.expected_probability_tokens,
+                expected_guess_tokens=args.expected_guess_tokens,
+                mean_from_low_confidence=mean_from_low,
+                new_h5_format=args.new_h5_format,
+                h5_res_indices=run_layers,
+            )
+            means_by_source[mean_from_low] = layer_tensor_means_from_numpy(
+                np_means, run_layers, device=device, torch_dtype=torch_dtype
+            )
     else:
         low_ids, high_ids = collect_confidence_group_ids(
             examples_h5,
@@ -2325,46 +2605,47 @@ def main() -> None:
     logging.info("Low-confidence example IDs: %s", low_ids)
     logging.info("High-confidence example IDs: %s", high_ids)
     logging.info(
-        "Loaded %d H5 examples. low_conf=%d (<=%.3f), high_conf=%d (>=%.3f), layers=%s, mean_from_low_confidence=%s, individual_layers=%s",
+        "Loaded %d H5 examples. low_conf=%d (<=%.3f), high_conf=%d (>=%.3f), layers=%s, "
+        "all_confidence_group_pairs=%s, mean_from_low_confidence=%s, ablate_with_same_confidence=%s, "
+        "individual_layers=%s",
         len(examples_h5),
         len(low_ids),
         args.low_conf_threshold,
         len(high_ids),
         args.high_conf_threshold,
         run_layers,
+        args.all_confidence_group_pairs,
         args.mean_from_low_confidence,
+        args.ablate_with_same_confidence,
         args.individual_layers,
     )
-
-    mean_source_ids = low_ids if args.mean_from_low_confidence else high_ids
-    ablation_target_ids = high_ids if args.mean_from_low_confidence else low_ids
-    logging.info(
-        "Mean source group=%s (%d ids), ablation target group=%s (%d ids).",
-        "low_confidence" if args.mean_from_low_confidence else "high_confidence",
-        len(mean_source_ids),
-        "high_confidence" if args.mean_from_low_confidence else "low_confidence",
-        len(ablation_target_ids),
-    )
-
-    layer_to_verbalised_embedding_means: Optional[Dict[int, Dict[str, torch.Tensor]]] = None
-    if need_verbalised_embedding_means:
-        if verbalised_embedding_means is None:
-            raise ValueError("Internal error: requested means but verbalised_embedding_means was not computed.")
-        layer_to_verbalised_embedding_means = {}
-        for i, layer_idx in enumerate(run_layers):
-            layer_to_verbalised_embedding_means[layer_idx] = {
-                "prompt_mean": torch.tensor(verbalised_embedding_means["prompt_mean"][i], device=device, dtype=torch_dtype),
-                "guess": torch.tensor(verbalised_embedding_means["guess"][i], device=device, dtype=torch_dtype),
-                "sem_answer_mean": torch.tensor(verbalised_embedding_means["sem_answer_mean"][i], device=device, dtype=torch_dtype),
-                "probability": torch.tensor(verbalised_embedding_means["probability"][i], device=device, dtype=torch_dtype),
-                "probability_value_mean": torch.tensor(
-                    verbalised_embedding_means["probability_value_mean"][i], device=device, dtype=torch_dtype
-                ),
-            }
+    for combo_name, mean_from_low, same in combos:
+        mean_source_ids = low_ids if mean_from_low else high_ids
+        combo_target_ids = resolve_combo_target_ids(
+            low_ids,
+            high_ids,
+            mean_from_low_confidence=mean_from_low,
+            ablate_with_same_confidence=same,
+        )
+        mean_source_group, ablation_target_group = resolve_confidence_groups(
+            mean_from_low_confidence=mean_from_low,
+            ablate_with_same_confidence=same,
+        )
+        logging.info(
+            "Confidence combo %s: mean_source=%s ablation_target=%s "
+            "(mean_source_count=%d ablation_target_count=%d)",
+            combo_name or "single",
+            mean_source_group,
+            ablation_target_group,
+            len(mean_source_ids),
+            len(combo_target_ids),
+        )
 
     def run_one_evaluation(
         # This contains {"prompt_mean", "guess", "sem_answer_mean", "probability", "probability_value_mean"}
         layer_to_verbalised_embedding_means_eval: Optional[Dict[int, Dict[str, torch.Tensor]]],
+        ablation_target_ids: set[str],
+        mean_from_low_confidence: bool,
         cached_none: Optional[Dict[str, Dict[str, Dict[str, object]]]] = None,
         sentence_transformer=None,
     ) -> Tuple[
@@ -2443,7 +2724,7 @@ def main() -> None:
                 logging.warning(
                     "No ablation target IDs available for %s split (mean_from_low_confidence=%s).",
                     split_name,
-                    args.mean_from_low_confidence,
+                    mean_from_low_confidence,
                 )
                 continue
 
@@ -2665,16 +2946,22 @@ def main() -> None:
                             if args.parse_mode_verbalised_confidence
                             else None
                         )
-                    elif mode == "semantic_answer_mean_replace":
+                    elif mode in (
+                        "semantic_answer_mean_replace",
+                        "semantic_answer_including_first_prob_mean_replace",
+                    ):
                         if layer_to_verbalised_embedding_means_eval is None:
                             raise ValueError(
-                                "Mode semantic_answer_mean_replace requested but verbalised embedding means are unavailable."
+                                f"Mode {mode} requested but verbalised embedding means are unavailable."
                             )
                         response, decoded_tokens = greedy_generate_semantic_answer_mean_replaced(
                             model=model,
                             local_prompt=local_prompt,
                             max_new_tokens=args.model_max_new_tokens,
                             layer_to_verbalised_embedding_means=layer_to_verbalised_embedding_means_eval,
+                            include_first_prob=(
+                                mode == "semantic_answer_including_first_prob_mean_replace"
+                            ),
                         )
                         mode_confidence = (
                             parse_mode_confidence_from_response(response)
@@ -2755,7 +3042,7 @@ def main() -> None:
                             mode_confidence = entry[mode_key].get("verbalised_confidence")
                             if mode_confidence is None or baseline_confidence is None:
                                 meets_none_confidence_direction = None
-                            elif args.mean_from_low_confidence:
+                            elif mean_from_low_confidence:
                                 meets_none_confidence_direction = mode_confidence < baseline_confidence
                             else:
                                 meets_none_confidence_direction = mode_confidence > baseline_confidence
@@ -2789,7 +3076,7 @@ def main() -> None:
                                 vce = compute_verbalised_confidence_effect(
                                     float(baseline_confidence),
                                     float(mode_confidence),
-                                    mean_from_low_confidence=args.mean_from_low_confidence,
+                                    mean_from_low_confidence=mean_from_low_confidence,
                                 )
                                 if vce is not None:
                                     entry[mode_key]["verbalised_confidence_effect"] = vce
@@ -2878,7 +3165,7 @@ def main() -> None:
         )
 
     # Compute the output for baseline none mode (no ablation) so individual-layer runs can reuse the same baseline.
-    def build_none_cache() -> Dict[str, Dict[str, Dict[str, object]]]:
+    def build_none_cache(ablation_target_ids: set[str]) -> Dict[str, Dict[str, Dict[str, object]]]:
         none_cache: Dict[str, Dict[str, Dict[str, object]]] = {"train": {}, "validation": {}}
         for split_name, eval_ds in [("train", train_ds), ("validation", val_ds)]:
             split_target = (
@@ -2924,76 +3211,160 @@ def main() -> None:
             )
             sentence_transformer = load_sentence_transformer_for_metrics()
 
-    derived_metric_kwargs: Dict[str, object] = {}
-    if "none" in args.ablation_mode and len(args.ablation_mode) > 1:
-        derived_metric_kwargs = {
-            "mode_semantic_similarity_means": None,
-            "mode_semantic_similarity_counts": None,
-            "mode_verbalised_confidence_effect_means": None,
-            "mode_verbalised_confidence_effect_counts": None,
-            "mode_uncertainty_score_means": None,
-            "mode_uncertainty_score_counts": None,
-        }
+    none_cache_by_target: Dict[str, Dict[str, Dict[str, Dict[str, object]]]] = {}
+    precompute_none = "none" in args.ablation_mode and (
+        args.individual_layers or args.all_confidence_group_pairs
+    )
+    if precompute_none:
+        for _combo_name, mean_from_low, same in combos:
+            _source_group, target_group = resolve_confidence_groups(
+                mean_from_low_confidence=mean_from_low,
+                ablate_with_same_confidence=same,
+            )
+            if target_group in none_cache_by_target:
+                continue
+            target_ids = resolve_combo_target_ids(
+                low_ids,
+                high_ids,
+                mean_from_low_confidence=mean_from_low,
+                ablate_with_same_confidence=same,
+            )
+            logging.info(
+                "Computing baseline none-mode for target group %s (%d ids).",
+                target_group,
+                len(target_ids),
+            )
+            none_cache_by_target[target_group] = build_none_cache(target_ids)
 
-    if not args.individual_layers:
-        (
-            results,
-            mini_results,
-            mode_confidence_means,
-            mode_confidence_counts,
-            _,
-            mode_responses_identical_true,
-            mode_semantic_similarity_means,
-            mode_semantic_similarity_counts,
-            mode_verbalised_confidence_effect_means,
-            mode_verbalised_confidence_effect_counts,
-            mode_uncertainty_score_means,
-            mode_uncertainty_score_counts,
-        ) = run_one_evaluation(
-            layer_to_verbalised_embedding_means,
-            cached_none=None,
-            sentence_transformer=sentence_transformer,
-        )
-        if "none" in args.ablation_mode and len(args.ablation_mode) > 1:
-            derived_metric_kwargs = {
-                "mode_semantic_similarity_means": mode_semantic_similarity_means,
-                "mode_semantic_similarity_counts": mode_semantic_similarity_counts,
-                "mode_verbalised_confidence_effect_means": mode_verbalised_confidence_effect_means,
-                "mode_verbalised_confidence_effect_counts": mode_verbalised_confidence_effect_counts,
-                "mode_uncertainty_score_means": mode_uncertainty_score_means,
-                "mode_uncertainty_score_counts": mode_uncertainty_score_counts,
-            }
-
-        with open(out_path, "w", encoding="utf-8") as f:
+    def persist_run_outputs(
+        json_path: str,
+        *,
+        results: dict,
+        mini_results: dict,
+        ablate_layers_for_config: Sequence[int],
+        mean_from_low_confidence: bool,
+        ablate_with_same_confidence: bool,
+        mode_confidence_means: Dict[str, Optional[float]],
+        mode_confidence_counts: Dict[str, int],
+        mode_responses_identical_true: Dict[str, int],
+        derived_metric_kwargs: Dict[str, object],
+    ) -> None:
+        os.makedirs(os.path.dirname(json_path) or ".", exist_ok=True)
+        with open(json_path, "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
-        logging.info("Wrote %s", out_path)
+        logging.info("Wrote %s", json_path)
 
-        mini_out_path = mini_output_json_path(out_path)
+        mini_out_path = mini_output_json_path(json_path)
         with open(mini_out_path, "w", encoding="utf-8") as f:
             json.dump(mini_results, f, ensure_ascii=False, indent=2)
         logging.info("Wrote %s", mini_out_path)
 
-        config_out_path = config_txt_path(out_path)
+        config_out_path = config_txt_path(json_path)
         finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
         write_config_txt(
             config_out_path,
             args=args,
             device=device,
             model_n_layers=model.cfg.n_layers,
-            ablate_layers=ablate_layers,
+            ablate_layers=ablate_layers_for_config,
             prompt_indices=prompt_indices,
             low_conf_count=len(low_ids),
             high_conf_count=len(high_ids),
             h5_example_count=len(examples_h5),
-            mean_from_low_confidence=args.mean_from_low_confidence,
+            mean_from_low_confidence=mean_from_low_confidence,
             parse_mode_verbalised_confidence=args.parse_mode_verbalised_confidence,
             mode_confidence_means=mode_confidence_means,
             mode_confidence_counts=mode_confidence_counts,
             mode_responses_identical_true=mode_responses_identical_true,
             finished_at=finished_at,
+            ablate_with_same_confidence=ablate_with_same_confidence,
+            all_confidence_group_pairs=args.all_confidence_group_pairs,
             **derived_metric_kwargs,
         )
         logging.info("Wrote %s", config_out_path)
+
+    def derived_metrics_from_eval(
+        mode_semantic_similarity_means,
+        mode_semantic_similarity_counts,
+        mode_verbalised_confidence_effect_means,
+        mode_verbalised_confidence_effect_counts,
+        mode_uncertainty_score_means,
+        mode_uncertainty_score_counts,
+    ) -> Dict[str, object]:
+        if not ("none" in args.ablation_mode and len(args.ablation_mode) > 1):
+            return {}
+        return {
+            "mode_semantic_similarity_means": mode_semantic_similarity_means,
+            "mode_semantic_similarity_counts": mode_semantic_similarity_counts,
+            "mode_verbalised_confidence_effect_means": mode_verbalised_confidence_effect_means,
+            "mode_verbalised_confidence_effect_counts": mode_verbalised_confidence_effect_counts,
+            "mode_uncertainty_score_means": mode_uncertainty_score_means,
+            "mode_uncertainty_score_counts": mode_uncertainty_score_counts,
+        }
+
+    if not args.individual_layers:
+        for combo_name, mean_from_low, same in combos:
+            _source_group, target_group = resolve_confidence_groups(
+                mean_from_low_confidence=mean_from_low,
+                ablate_with_same_confidence=same,
+            )
+            combo_target_ids = resolve_combo_target_ids(
+                low_ids,
+                high_ids,
+                mean_from_low_confidence=mean_from_low,
+                ablate_with_same_confidence=same,
+            )
+            layer_means = means_by_source[mean_from_low]
+            combo_json_path = (
+                out_path
+                if combo_name is None
+                else os.path.join(run_root, combo_name, "ablation_results.json")
+            )
+            logging.info(
+                "Running mean-ablation combo %s (mean_source=%s, target=%s).",
+                combo_name or "single",
+                "low_confidence" if mean_from_low else "high_confidence",
+                target_group,
+            )
+            (
+                results,
+                mini_results,
+                mode_confidence_means,
+                mode_confidence_counts,
+                _,
+                mode_responses_identical_true,
+                mode_semantic_similarity_means,
+                mode_semantic_similarity_counts,
+                mode_verbalised_confidence_effect_means,
+                mode_verbalised_confidence_effect_counts,
+                mode_uncertainty_score_means,
+                mode_uncertainty_score_counts,
+            ) = run_one_evaluation(
+                layer_means,
+                combo_target_ids,
+                mean_from_low,
+                cached_none=none_cache_by_target.get(target_group),
+                sentence_transformer=sentence_transformer,
+            )
+            persist_run_outputs(
+                combo_json_path,
+                results=results,
+                mini_results=mini_results,
+                ablate_layers_for_config=ablate_layers,
+                mean_from_low_confidence=mean_from_low,
+                ablate_with_same_confidence=same,
+                mode_confidence_means=mode_confidence_means,
+                mode_confidence_counts=mode_confidence_counts,
+                mode_responses_identical_true=mode_responses_identical_true,
+                derived_metric_kwargs=derived_metrics_from_eval(
+                    mode_semantic_similarity_means,
+                    mode_semantic_similarity_counts,
+                    mode_verbalised_confidence_effect_means,
+                    mode_verbalised_confidence_effect_counts,
+                    mode_uncertainty_score_means,
+                    mode_uncertainty_score_counts,
+                ),
+            )
         return
 
     run_root_norm = run_root.rstrip(os.sep)
@@ -3002,156 +3373,85 @@ def main() -> None:
     individual_root = os.path.join(results_root, "individual_layers", run_id)
     os.makedirs(individual_root, exist_ok=True)
 
-    cached_none: Optional[Dict[str, Dict[str, Dict[str, object]]]] = None
-    if "none" in args.ablation_mode:
-        logging.info("Computing baseline none-mode once for individual layer sweep.")
-        cached_none = build_none_cache()
-
-    per_layer_mode_means: Dict[int, Dict[str, Optional[float]]] = {}
-    for layer_idx in run_layers:
-        logging.info("Running individual-layer ablation for layer %d", layer_idx)
-        layer_dir = os.path.join(individual_root, str(layer_idx))
-        os.makedirs(layer_dir, exist_ok=True)
-        layer_pre_map = (
-            None if layer_to_verbalised_embedding_means is None else {layer_idx: layer_to_verbalised_embedding_means[layer_idx]}
+    for combo_name, mean_from_low, same in combos:
+        _source_group, target_group = resolve_confidence_groups(
+            mean_from_low_confidence=mean_from_low,
+            ablate_with_same_confidence=same,
         )
-        (
-            results,
-            mini_results,
-            mode_confidence_means,
-            mode_confidence_counts,
-            _,
-            mode_responses_identical_true,
-            mode_semantic_similarity_means,
-            mode_semantic_similarity_counts,
-            mode_verbalised_confidence_effect_means,
-            mode_verbalised_confidence_effect_counts,
-            mode_uncertainty_score_means,
-            mode_uncertainty_score_counts,
-        ) = run_one_evaluation(
-            layer_pre_map,
-            cached_none=cached_none,
-            sentence_transformer=sentence_transformer,
+        combo_target_ids = resolve_combo_target_ids(
+            low_ids,
+            high_ids,
+            mean_from_low_confidence=mean_from_low,
+            ablate_with_same_confidence=same,
         )
-        per_layer_mode_means[layer_idx] = mode_confidence_means
-        if "none" in args.ablation_mode and len(args.ablation_mode) > 1:
-            derived_metric_kwargs = {
-                "mode_semantic_similarity_means": mode_semantic_similarity_means,
-                "mode_semantic_similarity_counts": mode_semantic_similarity_counts,
-                "mode_verbalised_confidence_effect_means": mode_verbalised_confidence_effect_means,
-                "mode_verbalised_confidence_effect_counts": mode_verbalised_confidence_effect_counts,
-                "mode_uncertainty_score_means": mode_uncertainty_score_means,
-                "mode_uncertainty_score_counts": mode_uncertainty_score_counts,
-            }
+        layer_means = means_by_source[mean_from_low]
+        combo_root = individual_root if combo_name is None else os.path.join(individual_root, combo_name)
+        os.makedirs(combo_root, exist_ok=True)
+        cached_none = none_cache_by_target.get(target_group)
+        logging.info(
+            "Running individual-layer combo %s (mean_source=%s, target=%s).",
+            combo_name or "single",
+            "low_confidence" if mean_from_low else "high_confidence",
+            target_group,
+        )
 
-        layer_out_path = os.path.join(layer_dir, "ablation_results.json")
-        with open(layer_out_path, "w", encoding="utf-8") as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
-        logging.info("Wrote %s", layer_out_path)
+        per_layer_mode_means: Dict[int, Dict[str, Optional[float]]] = {}
+        for layer_idx in run_layers:
+            logging.info("Running individual-layer ablation for layer %d (%s)", layer_idx, combo_name or "single")
+            layer_dir = os.path.join(combo_root, str(layer_idx))
+            os.makedirs(layer_dir, exist_ok=True)
+            layer_pre_map = None if layer_means is None else {layer_idx: layer_means[layer_idx]}
+            (
+                results,
+                mini_results,
+                mode_confidence_means,
+                mode_confidence_counts,
+                _,
+                mode_responses_identical_true,
+                mode_semantic_similarity_means,
+                mode_semantic_similarity_counts,
+                mode_verbalised_confidence_effect_means,
+                mode_verbalised_confidence_effect_counts,
+                mode_uncertainty_score_means,
+                mode_uncertainty_score_counts,
+            ) = run_one_evaluation(
+                layer_pre_map,
+                combo_target_ids,
+                mean_from_low,
+                cached_none=cached_none,
+                sentence_transformer=sentence_transformer,
+            )
+            per_layer_mode_means[layer_idx] = mode_confidence_means
+            persist_run_outputs(
+                os.path.join(layer_dir, "ablation_results.json"),
+                results=results,
+                mini_results=mini_results,
+                ablate_layers_for_config=[layer_idx],
+                mean_from_low_confidence=mean_from_low,
+                ablate_with_same_confidence=same,
+                mode_confidence_means=mode_confidence_means,
+                mode_confidence_counts=mode_confidence_counts,
+                mode_responses_identical_true=mode_responses_identical_true,
+                derived_metric_kwargs=derived_metrics_from_eval(
+                    mode_semantic_similarity_means,
+                    mode_semantic_similarity_counts,
+                    mode_verbalised_confidence_effect_means,
+                    mode_verbalised_confidence_effect_counts,
+                    mode_uncertainty_score_means,
+                    mode_uncertainty_score_counts,
+                ),
+            )
 
-        layer_mini_path = os.path.join(layer_dir, "ablation_results_mini.json")
-        with open(layer_mini_path, "w", encoding="utf-8") as f:
-            json.dump(mini_results, f, ensure_ascii=False, indent=2)
-        logging.info("Wrote %s", layer_mini_path)
-
-        layer_config_path = os.path.join(layer_dir, "config.txt")
-        finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
-        write_config_txt(
-            layer_config_path,
+        write_individual_layer_summary_and_plot(
+            combo_root,
             args=args,
-            device=device,
             model_n_layers=model.cfg.n_layers,
-            ablate_layers=[layer_idx],
-            prompt_indices=prompt_indices,
-            low_conf_count=len(low_ids),
-            high_conf_count=len(high_ids),
-            h5_example_count=len(examples_h5),
-            mean_from_low_confidence=args.mean_from_low_confidence,
-            parse_mode_verbalised_confidence=args.parse_mode_verbalised_confidence,
-            mode_confidence_means=mode_confidence_means,
-            mode_confidence_counts=mode_confidence_counts,
-            mode_responses_identical_true=mode_responses_identical_true,
-            finished_at=finished_at,
-            **derived_metric_kwargs,
+            run_layers=run_layers,
+            mean_from_low_confidence=mean_from_low,
+            ablate_with_same_confidence=same,
+            all_confidence_group_pairs=args.all_confidence_group_pairs,
+            per_layer_mode_means=per_layer_mode_means,
         )
-        logging.info("Wrote %s", layer_config_path)
-
-    summary_path = os.path.join(individual_root, "summary.txt")
-    modes_non_none = [mode for mode in args.ablation_mode if mode != "none"]
-    baseline_none_mean = None
-    if "none" in args.ablation_mode and per_layer_mode_means:
-        first_layer = run_layers[0]
-        baseline_none_mean = per_layer_mode_means[first_layer].get("none")
-
-    summary_lines = [
-        "Individual Layer Mean Ablation Summary",
-        "=====================================",
-        "",
-        "[Setup]",
-        f"model_name={args.model_name}",
-        f"input_h5={args.input_h5}",
-        f"dataset={args.dataset}",
-        f"ablation_mode={args.ablation_mode}",
-        f"num_layers={model.cfg.n_layers}",
-        f"run_layers={','.join(str(layer) for layer in run_layers)}",
-        f"num_samples={args.num_samples}",
-        f"num_few_shot={args.num_few_shot}",
-        f"model_max_new_tokens={args.model_max_new_tokens}",
-        f"mean_from_low_confidence={args.mean_from_low_confidence}",
-        f"mean_source_group={'low_confidence' if args.mean_from_low_confidence else 'high_confidence'}",
-        f"ablation_target_group={'high_confidence' if args.mean_from_low_confidence else 'low_confidence'}",
-        f"parse_mode_verbalised_confidence={args.parse_mode_verbalised_confidence}",
-        "",
-    ]
-    if "none" in args.ablation_mode:
-        if baseline_none_mean is None:
-            summary_lines.append("none_mean_verbalised_confidence=None")
-        else:
-            summary_lines.append(f"none_mean_verbalised_confidence={baseline_none_mean:.6f}")
-        summary_lines.append("")
-
-    summary_lines.append("[Per-layer verbalised confidence]")
-    if modes_non_none:
-        header = "layer\t" + "\t".join(modes_non_none)
-        summary_lines.append(header)
-        for layer_idx in run_layers:
-            row_vals = []
-            for mode in modes_non_none:
-                val = per_layer_mode_means[layer_idx].get(mode)
-                row_vals.append("None" if val is None else f"{val:.6f}")
-            summary_lines.append(f"{layer_idx}\t" + "\t".join(row_vals))
-    else:
-        summary_lines.append("No non-none modes selected.")
-    summary_lines.append("")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(summary_lines))
-    logging.info("Wrote %s", summary_path)
-
-    plot_path = os.path.join(individual_root, "verbalised_confidence_by_layer.png")
-    fig, ax = plt.subplots(figsize=(10, 5))
-    for mode in modes_non_none:
-        ys: List[float] = []
-        xs: List[int] = []
-        for layer_idx in run_layers:
-            y_val = per_layer_mode_means[layer_idx].get(mode)
-            if y_val is not None:
-                xs.append(layer_idx)
-                ys.append(float(y_val))
-        if ys:
-            ax.plot(xs, ys, marker="o", label=mode)
-    if baseline_none_mean is not None:
-        ax.axhline(y=float(baseline_none_mean), linestyle="--", label="none (baseline)")
-    ax.set_xlabel("Layer")
-    ax.set_ylabel("Verbalised confidence")
-    ax.set_ylim(0.0, 1.0)
-    ax.set_title("Individual layer verbalised confidence")
-    ax.grid(True, alpha=0.3)
-    if modes_non_none or baseline_none_mean is not None:
-        ax.legend()
-    fig.tight_layout()
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    logging.info("Wrote %s", plot_path)
 
 
 if __name__ == "__main__":

@@ -15,29 +15,18 @@ source /vol/cuda/13.0.0/setup.sh
 /usr/bin/nvidia-smi
 uptime
 
-# Subblock tokenwise mean ablation (attn and/or mlp).
-# --ablate_subblocks attn        -> ablate attn-out only
-# --ablate_subblocks mlp         -> ablate mlp-out only
-# --ablate_subblocks attn mlp    -> ablate both simultaneously
-
-# Both attn+mlp simultaneously (individual-layer heatmap):
-python3 ./subblock_tokenwise_mean_ablation/run_subblock_tokenwise_mean_ablation.py \
+python3 ./componentwise_input_mass_mean_shift/run_componentwise_input_mass_mean_shift.py \
   --model_name google/gemma-3-12b-it \
   --input_h5 ./process_generations/processed_generations_more_h5/new_gemma/4_trivia_gemma_extended_with_concat_3000_train/balanced/train_verbalised_embeddings.h5 \
-  --dataset trivia_qa \
   --no-enable_brief \
-  --num_samples 20 \
+  --num_samples 30 \
   --device cuda:0 \
   --dtype bfloat16 \
-  --new_h5_format \
-  --ablate_subblocks mlp \
+  --ablate_heads m42,m47,a45.h3,m44,m43,a47.h8,a47.h7,m33,m40,a43.h9
+  --dataset trivia_qa \
   --low_conf_threshold 0.2 \
   --high_conf_threshold 0.8 \
-  --individual_layers \
   --expected_guess_tokens 3 \
   --expected_probability_tokens 5 \
-  --extend_probability_span \
-  --no-mean_from_low_confidence
-
-# N.B. num_samples refer to the max number of iterations to perform, not limiting
-# the mean vector computation
+  --alpha 0.5 1.0 1.5 \
+  --ablation_mode none probability_pre_and_post_period_digit_mean_replace extended_probability_last_token_mean_replace probability_last_token_mean_replace

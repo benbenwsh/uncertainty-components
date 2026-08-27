@@ -20,10 +20,9 @@ python3 ./direction_analysis/run_mass_mean_direction_logit_lens.py \
   --model_name mistralai/Mistral-7B-Instruct-v0.1 \
   --input_h5 ./process_generations/processed_generations_more_h5/mistral/2_200_9_prob_toks/train_verbalised_embeddings.h5 \
   --device cuda:0 \
-  --new_h5_format \
   --expected_guess_tokens 5 \
   --expected_probability_tokens 7 \
   --extend_probability_span \
   --low_conf_threshold 0.1 \
   --high_conf_threshold 0.9 \
-  --top_k 3
+  --top_k 5

@@ -61,6 +61,10 @@ from process_generations_more_embs_from_h5 import (  # noqa: E402
     MISTRAL_CONFIDENCE_PREFIX_TOKENS,
     QWEN_CONFIDENCE_PREFIX_TOKENS,
 )
+from layerwise_mean_ablation.run_mean_ablation import (  # noqa: E402
+    LAYER_INDEXING_NOTE,
+    hook_name_for_display_layer,
+)
 
 CONFIDENCE_PROMPT_NUMERIC = (
     "Provide your best guess and the probability that it is correct (0.0 to 1.0) "
@@ -509,6 +513,7 @@ def write_config_txt(
         "confidence_direction_expectation_for_high_targets=perturbed_confidence_lt_none",
         f"ablate_layers_spec={args.ablate_layers}",
         f"ablate_layers_resolved={','.join(str(layer) for layer in ablate_layers)}",
+        f"layer_indexing={LAYER_INDEXING_NOTE}",
         f"num_ablated_layers={len(ablate_layers)}",
         f"expected_probability_tokens={args.expected_probability_tokens}",
         f"expected_confidence_tokens={args.expected_confidence_tokens}",
@@ -1756,7 +1761,7 @@ def build_direction_perturb_hooks(
     )
     activation_applier = activation_applier_builder(prompt_len, decoded_tokens_provider)
     for layer in layer_to_span_delta:
-        hook_name = f"blocks.{layer}.hook_resid_post"
+        hook_name = hook_name_for_display_layer(layer)
 
         def _make_hook(layer_idx: int):
             def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
@@ -1823,6 +1828,7 @@ def compute_low_high_span_means_and_directions(
     expected_probability_tokens: int,
     expected_guess_tokens: int,
     new_h5_format: bool = False,
+    h5_res_indices: Optional[Sequence[int]] = None,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray], set[str], set[str]]:
     low_vectors: Dict[str, List[np.ndarray]] = {
         "prompt_mean": [],
@@ -1840,7 +1846,11 @@ def compute_low_high_span_means_and_directions(
     }
     low_ids: set[str] = set()
     high_ids: set[str] = set()
-    resid_post_layers = np.asarray(ablate_layers) + 1
+    resid_post_layers = (
+        np.asarray(h5_res_indices)
+        if h5_res_indices is not None
+        else np.asarray(ablate_layers) + 1
+    )
 
     for ex_id, ex_obj in examples_h5.items():
         responses = ex_obj.get("responses")
@@ -2049,7 +2059,10 @@ def main() -> None:
         "--ablate_layers",
         type=str,
         default="12-15",
-        help="Inclusive range '12-15' or comma list '12,13,14,15' (zero-indexed).",
+        help=(
+            "Inclusive range '12-15' or comma list '12,13,14,15' (display indices: "
+            "0=embedding resid-pre, k>=1=resid-post of TL block k-1)."
+        ),
     )
     parser.add_argument(
         "--ablation_mode",
@@ -2277,7 +2290,7 @@ def main() -> None:
 
     logging.info("Loading HookedTransformer: %s", args.model_name)
     model = load_hooked_transformer(args.model_name, device=device, torch_dtype=torch_dtype)
-    ablate_layers = parse_ablate_layers(args.ablate_layers, model.cfg.n_layers)
+    ablate_layers = parse_ablate_layers(args.ablate_layers, model.cfg.n_layers + 1)
 
     examples_h5 = load_examples_h5(Path(args.input_h5))
     mean_low, mean_high, direction, low_ids, high_ids = compute_low_high_span_means_and_directions(
@@ -2288,6 +2301,7 @@ def main() -> None:
         expected_probability_tokens=args.expected_probability_tokens,
         expected_guess_tokens=args.expected_guess_tokens,
         new_h5_format=args.new_h5_format,
+        h5_res_indices=ablate_layers,
     )
     if args.normalize_span_directions:
         # Mutates direction dict in place

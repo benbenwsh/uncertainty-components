@@ -58,8 +58,8 @@ uptime
 
 # Both attn+mlp simultaneously (individual-layer heatmap):
 python3 ./subblock_tokenwise_mass_mean_shift/run_subblock_tokenwise_mass_mean_shift.py \
-  --model_name Qwen/Qwen2.5-32B-Instruct \
-  --input_h5 ./process_generations/processed_generations_more_h5/qwen_32B/23_32B_1000_train/balanced/train_verbalised_embeddings.h5 \
+  --model_name google/gemma-3-12b-it \
+  --input_h5 ./process_generations/processed_generations_more_h5/new_gemma/4_trivia_gemma_extended_with_concat_3000_train/balanced/train_verbalised_embeddings.h5 \
   --dataset trivia_qa \
   --no-enable_brief \
   --num_samples 20 \
@@ -69,10 +69,13 @@ python3 ./subblock_tokenwise_mass_mean_shift/run_subblock_tokenwise_mass_mean_sh
   --ablate_subblocks attn mlp \
   --individual_layers \
   --alpha 1.0 \
-  --expected_guess_tokens 2 \
+  --expected_guess_tokens 3 \
   --expected_probability_tokens 5 \
   --low_conf_threshold 0.2 \
-  --high_conf_threshold 0.8
+  --high_conf_threshold 0.8 \
+  --extend_probability_span \
+
+
 
 # Low-confidence cohort (uncomment to steer low-conf examples toward higher confidence):
 # python3 ./subblock_tokenwise_mass_mean_shift/run_subblock_tokenwise_mass_mean_shift.py \

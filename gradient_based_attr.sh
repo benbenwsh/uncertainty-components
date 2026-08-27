@@ -15,29 +15,27 @@ source /vol/cuda/13.0.0/setup.sh
 /usr/bin/nvidia-smi
 uptime
 
-# Subblock tokenwise mean ablation (attn and/or mlp).
-# --ablate_subblocks attn        -> ablate attn-out only
-# --ablate_subblocks mlp         -> ablate mlp-out only
-# --ablate_subblocks attn mlp    -> ablate both simultaneously
-
-# Both attn+mlp simultaneously (individual-layer heatmap):
-python3 ./subblock_tokenwise_mean_ablation/run_subblock_tokenwise_mean_ablation.py \
+python3 ./gradient_based_attr/run_gradient_based_attr.py \
   --model_name google/gemma-3-12b-it \
   --input_h5 ./process_generations/processed_generations_more_h5/new_gemma/4_trivia_gemma_extended_with_concat_3000_train/balanced/train_verbalised_embeddings.h5 \
-  --dataset trivia_qa \
-  --no-enable_brief \
-  --num_samples 20 \
   --device cuda:0 \
   --dtype bfloat16 \
-  --new_h5_format \
-  --ablate_subblocks mlp \
-  --low_conf_threshold 0.2 \
-  --high_conf_threshold 0.8 \
-  --individual_layers \
-  --expected_guess_tokens 3 \
   --expected_probability_tokens 5 \
-  --extend_probability_span \
-  --no-mean_from_low_confidence
+  --max_examples_for_mean 50 \
+  --granularity coarse fine
 
-# N.B. num_samples refer to the max number of iterations to perform, not limiting
-# the mean vector computation
+# Default --rerun_autoregressive greedy-decodes Guess:/Probability: from each H5 question.
+# Use --no-rerun_autoregressive to reconstruct the prefix from stored decoded_tokens.
+
+# Linguistic Confidence (Mistral only):
+# python3 ./gradient_based_attr/run_gradient_based_attr.py \
+#   --model_name mistralai/Mistral-7B-Instruct-v0.1 \
+#   --input_h5 ./process_generations/processed_generations_more_h5/5_trivia_mistral_linguistic_extended_train/balanced/train_verbalised_embeddings.h5 \
+#   --device cuda:0 \
+#   --dtype bfloat16 \
+#   --linguistic_confidence_prompt \
+#   --expected_confidence_tokens 5 \
+#   --high_conf_threshold 0.7 \
+#   --low_conf_threshold 0.3 \
+#   --max_examples_for_mean 50 \
+#   --granularity coarse fine

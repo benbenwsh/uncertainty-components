@@ -2404,6 +2404,7 @@ def write_experiment_outputs(
     n_heads: int,
     bar_chart_top_k: int,
     rounding_dp: int,
+    method_label: str = "DLA",
 ) -> dict:
     exp_dir.mkdir(parents=True, exist_ok=True)
     save_attributions_h5(exp_dir / "attributions.h5", result)
@@ -2425,7 +2426,7 @@ def write_experiment_outputs(
         dist_stats if dist_stats else ranked[:bar_chart_top_k],
         top_k=bar_chart_top_k,
         title=(
-            f"{result.position} / {result.contrast_name} / {result.granularity}: "
+            f"{method_label} {result.position} / {result.contrast_name} / {result.granularity}: "
             f"top-{bar_chart_top_k} by |mean|, ordered by mean"
         ),
     )
@@ -2446,7 +2447,7 @@ def write_experiment_outputs(
         row_labels=[str(l) for l in range(n_layers)],
         col_labels=col_labels,
         title=(
-            f"Mean DLA — {result.position} / {result.contrast_name} / {result.granularity} "
+            f"Mean {method_label} — {result.position} / {result.contrast_name} / {result.granularity} "
             f"(n={len(result.example_ids)}; ± normalised separately)"
         ),
         rounding_dp=rounding_dp,
@@ -2467,7 +2468,7 @@ def write_experiment_outputs(
         mean_dir / "bar_chart.png",
         ordered_labels,
         ordered_values,
-        title=f"Mean DLA — {result.position}/{result.contrast_name}/{result.granularity}",
+        title=f"Mean {method_label} — {result.position}/{result.contrast_name}/{result.granularity}",
         top_k=bar_chart_top_k,
         errors=ordered_errors,
     )
@@ -2495,7 +2496,7 @@ def write_experiment_outputs(
             row_labels=[str(l) for l in range(n_layers)],
             col_labels=col_labels,
             title=(
-                f"Example {eid} DLA — {result.position}/{result.contrast_name}/{result.granularity} "
+                f"Example {eid} {method_label} — {result.position}/{result.contrast_name}/{result.granularity} "
                 "(normalised to this example's own min/max; ± separately)"
             ),
             rounding_dp=rounding_dp,
@@ -2514,7 +2515,7 @@ def write_experiment_outputs(
             ex_dir / "bar_chart.png",
             [p[0] for p in ranked_pairs],
             [p[1] for p in ranked_pairs],
-            title=f"Example {eid} — {result.position}/{result.contrast_name}/{result.granularity}",
+            title=f"Example {eid} {method_label} — {result.position}/{result.contrast_name}/{result.granularity}",
             top_k=bar_chart_top_k,
             errors=None,
         )
@@ -2528,6 +2529,386 @@ def write_experiment_outputs(
         "completeness_soft_failure_count": int(result.completeness_soft_failure_count),
         "embed_mean": embed_mean,
     }
+
+
+# ---------------------------------------------------------------------------
+# High-confidence minus low-confidence ranking
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class HighMinusLowRow:
+    label: str
+    diff: float
+    high_mean: float
+    low_mean: float
+    high_sem: float
+    low_sem: float
+
+    @property
+    def diff_sem(self) -> float:
+        return float(np.sqrt(self.high_sem**2 + self.low_sem**2))
+
+
+_EMBED_MEAN_RE = re.compile(
+    r"embedding_contribution\s+mean=([^\s]+)\s+SEM=([^\s]+)"
+)
+_COARSE_ATTN_RE = re.compile(r"^L(\d+)_attn$")
+_COARSE_MLP_RE = re.compile(r"^L(\d+)_mlp$")
+
+
+def _sem_from_column(col: np.ndarray) -> float:
+    n = int(col.shape[0])
+    if n <= 1:
+        return 0.0
+    return float(np.std(col, ddof=1) / np.sqrt(n))
+
+
+def infer_layout_from_labels(labels: Sequence[str]) -> tuple[str, int, int]:
+    """Return (granularity, n_layers, n_heads) from DLA component labels."""
+    labs = list(labels)
+    if not labs:
+        raise ValueError("Cannot infer layout from empty component label list.")
+    if any(_COARSE_ATTN_RE.fullmatch(lab) for lab in labs):
+        layers = []
+        for lab in labs:
+            m = _COARSE_ATTN_RE.fullmatch(lab)
+            if m:
+                layers.append(int(m.group(1)))
+            m = _COARSE_MLP_RE.fullmatch(lab)
+            if m:
+                layers.append(int(m.group(1)))
+        n_layers = max(layers) + 1 if layers else 0
+        return "coarse", n_layers, 0
+    n_heads = sum(1 for lab in labs if _FINE_HEAD_LABEL_RE.fullmatch(lab) and lab.startswith("L0_"))
+    n_mlp = sum(1 for lab in labs if _FINE_MLP_LABEL_RE.fullmatch(lab))
+    if n_mlp < 1:
+        raise ValueError(f"Could not infer fine layout from labels (first={labs[0]!r}).")
+    n_heads = n_heads if n_heads > 0 else (len(labs) // n_mlp) - 1
+    return "fine", n_mlp, n_heads
+
+
+def _decode_h5_label_array(raw) -> list[str]:
+    out: list[str] = []
+    for x in np.asarray(raw).tolist():
+        if isinstance(x, bytes):
+            out.append(x.decode("utf-8"))
+        else:
+            out.append(str(x))
+    return out
+
+
+def load_mean_vector_from_experiment_dir(
+    exp_dir: Path,
+) -> tuple[list[str], np.ndarray, np.ndarray, float, float, int]:
+    """Load (labels, means, sems, embed_mean, embed_sem, n_examples).
+
+    Prefers ``attributions.h5``; falls back to ``mean/ranked.txt``.
+    """
+    h5_path = exp_dir / "attributions.h5"
+    if h5_path.is_file():
+        with h5py.File(h5_path, "r") as f:
+            attrs = np.asarray(f["attributions"], dtype=np.float64)
+            labels = _decode_h5_label_array(f["component_labels"][()])
+            embed = np.asarray(f["embed_attributions"], dtype=np.float64)
+        if attrs.ndim != 2 or attrs.shape[1] != len(labels):
+            raise ValueError(
+                f"{h5_path}: attributions shape {attrs.shape} != n_labels={len(labels)}"
+            )
+        n = int(attrs.shape[0])
+        means = np.mean(attrs, axis=0).astype(np.float32)
+        sems = np.array(
+            [_sem_from_column(attrs[:, c]) for c in range(attrs.shape[1])],
+            dtype=np.float32,
+        )
+        embed_mean = float(np.mean(embed)) if embed.size else 0.0
+        embed_sem = _sem_from_column(embed) if embed.size else 0.0
+        return labels, means, sems, embed_mean, embed_sem, n
+
+    ranked_path = exp_dir / "mean" / "ranked.txt"
+    if not ranked_path.is_file():
+        raise FileNotFoundError(
+            f"{exp_dir} has neither attributions.h5 nor mean/ranked.txt"
+        )
+    labels: list[str] = []
+    means_l: list[float] = []
+    sems_l: list[float] = []
+    embed_mean = 0.0
+    embed_sem = 0.0
+    for line in ranked_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("Ranked") or stripped.startswith("format:"):
+            continue
+        if stripped.startswith("top_10:") or stripped.startswith("bottom_10:"):
+            continue
+        embed_m = _EMBED_MEAN_RE.search(stripped)
+        if embed_m:
+            embed_mean = float(embed_m.group(1))
+            embed_sem = float(embed_m.group(2))
+            continue
+        parts = stripped.split("\t")
+        if len(parts) < 3:
+            continue
+        labels.append(parts[0])
+        means_l.append(float(parts[1]))
+        sems_l.append(float(parts[2]))
+    if not labels:
+        raise ValueError(f"No component rows parsed from {ranked_path}")
+    return (
+        labels,
+        np.asarray(means_l, dtype=np.float32),
+        np.asarray(sems_l, dtype=np.float32),
+        embed_mean,
+        embed_sem,
+        0,
+    )
+
+
+def high_minus_low_rows(
+    labels: Sequence[str],
+    high_means: np.ndarray,
+    low_means: np.ndarray,
+    high_sems: np.ndarray,
+    low_sems: np.ndarray,
+) -> list[HighMinusLowRow]:
+    if not (len(labels) == len(high_means) == len(low_means) == len(high_sems) == len(low_sems)):
+        raise ValueError("high/low mean vectors and labels must have the same length.")
+    rows = [
+        HighMinusLowRow(
+            label=str(lab),
+            diff=float(high_means[i] - low_means[i]),
+            high_mean=float(high_means[i]),
+            low_mean=float(low_means[i]),
+            high_sem=float(high_sems[i]),
+            low_sem=float(low_sems[i]),
+        )
+        for i, lab in enumerate(labels)
+    ]
+    return sorted(rows, key=lambda r: r.diff, reverse=True)
+
+
+def write_ranked_high_minus_low_txt(
+    path: Path,
+    ranked: Sequence[HighMinusLowRow],
+    *,
+    embed_diff: float,
+    embed_high: float,
+    embed_low: float,
+    n_high: int,
+    n_low: int,
+) -> None:
+    lines = [
+        "Ranked components (high_conf mean - low_conf mean; most positive → most negative)",
+        "format: label  diff  high_mean  low_mean  high_sem  low_sem  diff_sem",
+        "",
+        f"n_high={n_high}  n_low={n_low}",
+        (
+            f"embedding_contribution  diff={embed_diff:.6g}  "
+            f"high_mean={embed_high:.6g}  low_mean={embed_low:.6g}"
+        ),
+        "",
+    ]
+    for r in ranked:
+        lines.append(
+            f"{r.label}\t{r.diff:.6g}\t{r.high_mean:.6g}\t{r.low_mean:.6g}\t"
+            f"{r.high_sem:.6g}\t{r.low_sem:.6g}\t{r.diff_sem:.6g}"
+        )
+    summary = _ablate_summary_lines([r.label for r in ranked])
+    if summary:
+        lines.append("")
+        lines.extend(summary)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_high_minus_low_outputs(
+    exp_dir: Path,
+    *,
+    labels: Sequence[str],
+    high_means: np.ndarray,
+    low_means: np.ndarray,
+    high_sems: np.ndarray,
+    low_sems: np.ndarray,
+    position: str,
+    contrast_name: str,
+    granularity: str,
+    n_layers: int,
+    n_heads: int,
+    bar_chart_top_k: int,
+    rounding_dp: int,
+    embed_high: float = 0.0,
+    embed_low: float = 0.0,
+    n_high: int = 0,
+    n_low: int = 0,
+    method_label: str = "DLA",
+) -> list[HighMinusLowRow]:
+    """Write signed high-minus-low ranking, heatmap, and bar chart."""
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    mean_dir = exp_dir / "mean"
+    mean_dir.mkdir(parents=True, exist_ok=True)
+
+    diffs = np.asarray(high_means, dtype=np.float32) - np.asarray(low_means, dtype=np.float32)
+    ranked = high_minus_low_rows(labels, high_means, low_means, high_sems, low_sems)
+    write_ranked_high_minus_low_txt(
+        mean_dir / "ranked.txt",
+        ranked,
+        embed_diff=float(embed_high - embed_low),
+        embed_high=embed_high,
+        embed_low=embed_low,
+        n_high=n_high,
+        n_low=n_low,
+    )
+    mat, col_labels = labels_to_heatmap_matrix(
+        list(labels),
+        diffs,
+        granularity=granularity,
+        n_layers=n_layers,
+        n_heads=n_heads,
+    )
+    write_diverging_heatmap(
+        mean_dir / "heatmap.png",
+        mat,
+        row_labels=[str(l) for l in range(n_layers)],
+        col_labels=col_labels,
+        title=(
+            f"High−low {method_label} — {position} / {contrast_name} / {granularity} "
+            f"(n_high={n_high}, n_low={n_low}; ± normalised separately)"
+        ),
+        rounding_dp=rounding_dp,
+    )
+    write_bar_chart(
+        mean_dir / "bar_chart.png",
+        [r.label for r in ranked],
+        [r.diff for r in ranked],
+        title=(
+            f"High−low {method_label} — {position}/{contrast_name}/{granularity}"
+        ),
+        top_k=bar_chart_top_k,
+        errors=[r.diff_sem for r in ranked],
+    )
+    return ranked
+
+
+def write_high_minus_low_from_results(
+    exp_dir: Path,
+    high: ExperimentResult,
+    low: ExperimentResult,
+    *,
+    n_layers: int,
+    n_heads: int,
+    bar_chart_top_k: int,
+    rounding_dp: int,
+    method_label: str = "DLA",
+) -> list[HighMinusLowRow]:
+    if high.labels != low.labels:
+        raise ValueError(
+            f"High/low label mismatch for {high.position}/{high.contrast_name}/"
+            f"{high.granularity}: {high.labels[:3]} vs {low.labels[:3]}"
+        )
+    high_stats = aggregate_component_stats(high.attributions, high.labels)
+    low_stats = aggregate_component_stats(low.attributions, low.labels)
+    high_means = np.array([s.mean for s in high_stats], dtype=np.float32)
+    low_means = np.array([s.mean for s in low_stats], dtype=np.float32)
+    high_sems = np.array([s.sem for s in high_stats], dtype=np.float32)
+    low_sems = np.array([s.sem for s in low_stats], dtype=np.float32)
+    embed_high = float(np.mean(high.embed_attributions)) if high.embed_attributions.size else 0.0
+    embed_low = float(np.mean(low.embed_attributions)) if low.embed_attributions.size else 0.0
+    return write_high_minus_low_outputs(
+        exp_dir,
+        labels=high.labels,
+        high_means=high_means,
+        low_means=low_means,
+        high_sems=high_sems,
+        low_sems=low_sems,
+        position=high.position,
+        contrast_name=high.contrast_name,
+        granularity=high.granularity,
+        n_layers=n_layers,
+        n_heads=n_heads,
+        bar_chart_top_k=bar_chart_top_k,
+        rounding_dp=rounding_dp,
+        embed_high=embed_high,
+        embed_low=embed_low,
+        n_high=len(high.example_ids),
+        n_low=len(low.example_ids),
+        method_label=method_label,
+    )
+
+
+def _high_minus_low_leaf_name(high_name: str) -> str | None:
+    """Map ``...__high_conf`` directory name to ``...__high_minus_low``."""
+    if high_name.endswith("__high_conf"):
+        return high_name[: -len("__high_conf")] + "__high_minus_low"
+    return None
+
+
+def backfill_high_minus_low_results(
+    results_root: Path,
+    *,
+    bar_chart_top_k: int = 25,
+    rounding_dp: int = ANNOTATION_ROUNDING_DP,
+    method_label: str = "DLA",
+) -> int:
+    """Write ``__high_minus_low`` siblings for every high/low pair under ``results_root``."""
+    if not results_root.is_dir():
+        raise FileNotFoundError(f"Results root not found: {results_root}")
+    n_written = 0
+    for high_dir in sorted(results_root.rglob("*__high_conf")):
+        if not high_dir.is_dir():
+            continue
+        low_dir = high_dir.parent / (high_dir.name[: -len("__high_conf")] + "__low_conf")
+        if not low_dir.is_dir():
+            logging.warning("Skipping %s: matching __low_conf dir not found.", high_dir)
+            continue
+        leaf = _high_minus_low_leaf_name(high_dir.name)
+        if leaf is None:
+            continue
+        out_dir = high_dir.parent / leaf
+        try:
+            h_labels, h_means, h_sems, h_embed, _h_embed_sem, n_high = (
+                load_mean_vector_from_experiment_dir(high_dir)
+            )
+            l_labels, l_means, l_sems, l_embed, _l_embed_sem, n_low = (
+                load_mean_vector_from_experiment_dir(low_dir)
+            )
+        except (OSError, ValueError, FileNotFoundError) as exc:
+            logging.warning("Skipping %s: failed to load means (%s).", high_dir, exc)
+            continue
+        if h_labels != l_labels:
+            if set(h_labels) != set(l_labels):
+                logging.warning("Skipping %s: high/low label sets differ.", high_dir)
+                continue
+            l_index = {lab: i for i, lab in enumerate(l_labels)}
+            l_means = np.array([l_means[l_index[lab]] for lab in h_labels], dtype=np.float32)
+            l_sems = np.array([l_sems[l_index[lab]] for lab in h_labels], dtype=np.float32)
+        gran, n_layers, n_heads = infer_layout_from_labels(h_labels)
+        parent_name = high_dir.parent.name
+        position = parent_name if parent_name in {"pre_period", "post_period"} else parent_name
+        contrast_part = high_dir.name[: -len(f"__{gran}__high_conf")]
+        if not contrast_part:
+            contrast_part = high_dir.name.split("__")[0]
+        write_high_minus_low_outputs(
+            out_dir,
+            labels=h_labels,
+            high_means=h_means,
+            low_means=l_means,
+            high_sems=h_sems,
+            low_sems=l_sems,
+            position=position,
+            contrast_name=contrast_part,
+            granularity=gran,
+            n_layers=n_layers,
+            n_heads=n_heads,
+            bar_chart_top_k=bar_chart_top_k,
+            rounding_dp=rounding_dp,
+            embed_high=h_embed,
+            embed_low=l_embed,
+            n_high=n_high,
+            n_low=n_low,
+            method_label=method_label,
+        )
+        n_written += 1
+        logging.info("Wrote high-minus-low ranking to %s", out_dir)
+    return n_written
 
 
 # ---------------------------------------------------------------------------
@@ -2591,7 +2972,10 @@ def write_readme(path: Path) -> None:
         "When `--confidence_split` is enabled (default), each experiment is also run on "
         "high- and low-confidence example cohorts (`...__high_conf/`, `...__low_conf/`), "
         "capped independently at `--max_examples_for_mean`. Post-period high/low splits "
-        "also exclude verbalised_confidence 1.0. Disable with `--no-confidence_split`.\n",
+        "also exclude verbalised_confidence 1.0. Disable with `--no-confidence_split`.\n\n"
+        "When confidence splits are present, `{contrast}__{granularity}__high_minus_low/` "
+        "ranks components by signed (high_conf mean − low_conf mean), not |difference|, "
+        "with top-10 / bottom-10 lists (and a heatmap / bar chart of that difference).\n",
         encoding="utf-8",
     )
 
@@ -2750,18 +3134,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--model_name",
         type=str,
-        required=True,
+        required=False,
+        default=None,
         choices=list(SUPPORTED_MODEL_NAMES),
-        help="Must be one of the three supported models.",
+        help="Must be one of the three supported models (not required for --backfill_results_root).",
     )
     p.add_argument(
         "--input_h5",
         type=str,
-        required=True,
+        required=False,
+        default=None,
         help=(
             "Processed verbalised embeddings H5. Numeric runs must use "
             "extend_probability_span. Linguistic runs assume a variable-length "
-            "extended Confidence: span."
+            "extended Confidence: span. Not required for --backfill_results_root."
         ),
     )
     p.add_argument(
@@ -2870,12 +3256,45 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override auto-incremented results/<N>/ directory.",
     )
+    p.add_argument(
+        "--backfill_results_root",
+        type=str,
+        default=None,
+        help=(
+            "If set, skip DLA and write __high_minus_low rankings under this directory "
+            "from existing __high_conf / __low_conf experiment outputs."
+        ),
+    )
     return p
 
 
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
+
+    if args.backfill_results_root:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)-8s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        n_written = backfill_high_minus_low_results(
+            Path(args.backfill_results_root),
+            bar_chart_top_k=args.bar_chart_top_k,
+            rounding_dp=ANNOTATION_ROUNDING_DP,
+            method_label="DLA",
+        )
+        logging.info(
+            "Backfill finished: wrote %d high-minus-low experiment dirs under %s",
+            n_written,
+            args.backfill_results_root,
+        )
+        return
+
+    if not args.model_name:
+        raise ValueError("--model_name is required unless --backfill_results_root is set.")
+    if not args.input_h5:
+        raise ValueError("--input_h5 is required unless --backfill_results_root is set.")
 
     if args.max_examples_for_mean <= args.n_individual_examples:
         raise ValueError(
@@ -3262,6 +3681,9 @@ def main() -> None:
                     rounding_dp=ANNOTATION_ROUNDING_DP,
                 )
                 completeness_summaries[exp_name] = summary
+                cohort_results[dirname_suffix][
+                    (contrast.position, contrast.name, gran)
+                ] = result
                 logging.info(
                     "%s done: max completeness |residual|=%.3g "
                     "(head_resum_soft_fail=%d completeness_soft_fail=%d)",
@@ -3272,6 +3694,11 @@ def main() -> None:
                 )
 
     completeness_summaries: dict = {}
+    cohort_results: dict[str, dict[tuple[str, str, str], ExperimentResult]] = {
+        "": {},
+        "__high_conf": {},
+        "__low_conf": {},
+    }
     _run_cohort_experiments(
         cohort_examples=examples_all,
         post_period_examples=(
@@ -3300,6 +3727,31 @@ def main() -> None:
             dirname_suffix="__low_conf",
             cohort_label="low-confidence",
         )
+        for key, high_result in cohort_results["__high_conf"].items():
+            low_result = cohort_results["__low_conf"].get(key)
+            if low_result is None:
+                raise ValueError(
+                    f"High-conf result {key} has no matching low-conf experiment."
+                )
+            position, contrast_name, gran = key
+            leaf = f"{contrast_name}__{gran}__high_minus_low"
+            if args.linguistic_confidence_prompt:
+                exp_dir = run_root / leaf
+                exp_name = leaf
+            else:
+                exp_dir = run_root / position / leaf
+                exp_name = f"{position}/{leaf}"
+            logging.info("Writing high-minus-low ranking %s", exp_name)
+            write_high_minus_low_from_results(
+                exp_dir,
+                high_result,
+                low_result,
+                n_layers=adapter.n_layers,
+                n_heads=adapter.n_query_heads,
+                bar_chart_top_k=args.bar_chart_top_k,
+                rounding_dp=ANNOTATION_ROUNDING_DP,
+                method_label="DLA",
+            )
 
     if args.linguistic_confidence_prompt:
         logging.info(

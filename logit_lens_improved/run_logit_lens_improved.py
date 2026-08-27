@@ -3,8 +3,8 @@ Improved logit-lens runner over processed H5 embeddings.
 
 Supports:
 - selecting embedding families to include
-- per-example top-k tables for n examples
-- mean-embedding top-k tables over all examples
+- per-example top-k and bottom-k tables for n examples
+- mean-embedding top-k and bottom-k tables over all examples
 - optional high/low confidence split means
 - optional subblock mode (attn/mlp rows only)
 """
@@ -543,6 +543,16 @@ def _topn_for_distribution(dist: np.ndarray, top_k: int) -> tuple[np.ndarray, np
     return idx.astype(np.int64, copy=False), vals.astype(np.float32, copy=False)
 
 
+def _bottomn_for_distribution(dist: np.ndarray, bottom_k: int) -> tuple[np.ndarray, np.ndarray]:
+    if bottom_k >= dist.shape[0]:
+        idx = np.argsort(dist)
+    else:
+        idx = np.argpartition(dist, bottom_k - 1)[:bottom_k]
+        idx = idx[np.argsort(dist[idx])]
+    vals = dist[idx]
+    return idx.astype(np.int64, copy=False), vals.astype(np.float32, copy=False)
+
+
 def _format_token_decoded(tokenizer, token_id: int) -> str:
     token = tokenizer.decode([int(token_id)], clean_up_tokenization_spaces=False)
     return token if token else "<empty>"
@@ -725,13 +735,14 @@ def _save_topk_table_png(
     top_ids: np.ndarray,
     top_vals: np.ndarray,
     *,
+    rank_label: str = "Top",
     shade_body: bool = True,
 ) -> None:
     n_rows, top_k = top_ids.shape
     col_labels = ["Row"]
     for k in range(top_k):
-        col_labels.append(f"Top-{k + 1} token")
-        col_labels.append(f"Top-{k + 1} prob")
+        col_labels.append(f"{rank_label}-{k + 1} token")
+        col_labels.append(f"{rank_label}-{k + 1} prob")
 
     rows = []
     for row_idx in range(n_rows):
@@ -783,6 +794,8 @@ def _save_topk_table_png_subblocks(
     top_vals_attn: np.ndarray,
     top_ids_mlp: np.ndarray,
     top_vals_mlp: np.ndarray,
+    *,
+    rank_label: str = "Top",
 ) -> None:
     n_layers, top_k = top_ids_attn.shape
     if top_ids_mlp.shape != (n_layers, top_k):
@@ -790,8 +803,8 @@ def _save_topk_table_png_subblocks(
 
     col_labels = ["Row"]
     for k in range(top_k):
-        col_labels.append(f"Top-{k + 1} token")
-        col_labels.append(f"Top-{k + 1} prob")
+        col_labels.append(f"{rank_label}-{k + 1} token")
+        col_labels.append(f"{rank_label}-{k + 1} prob")
 
     rows = []
     row_types: list[str] = []
@@ -856,7 +869,7 @@ def _compute_topk(
     norm_weight: torch.Tensor,
     norm_eps: float,
     softcap: float | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     hidden_t = torch.as_tensor(hidden, dtype=torch.float32, device=device)
     with torch.no_grad():
         probs = _probs_from_hidden(
@@ -871,11 +884,16 @@ def _compute_topk(
     n_rows = probs.shape[0]
     top_ids = np.zeros((n_rows, top_k), dtype=np.int64)
     top_vals = np.zeros((n_rows, top_k), dtype=np.float32)
+    bottom_ids = np.zeros((n_rows, top_k), dtype=np.int64)
+    bottom_vals = np.zeros((n_rows, top_k), dtype=np.float32)
     for i in range(n_rows):
         ids_i, vals_i = _topn_for_distribution(probs[i], top_k)
         top_ids[i] = ids_i
         top_vals[i] = vals_i
-    return top_ids, top_vals
+        bot_ids_i, bot_vals_i = _bottomn_for_distribution(probs[i], top_k)
+        bottom_ids[i] = bot_ids_i
+        bottom_vals[i] = bot_vals_i
+    return top_ids, top_vals, bottom_ids, bottom_vals
 
 
 def _write_config_txt(
@@ -902,6 +920,7 @@ def _write_config_txt(
         f"Output dir: {run_dir}",
         f"n_examples: {args.n_examples}",
         f"top_k: {args.top_k}",
+        "bottom_k: same as top_k (bottom-k tables always written)",
         f"include_embeddings: {','.join(args.include_embeddings)}",
         f"expected_guess_tokens: {args.expected_guess_tokens}",
         f"expected_probability_tokens: {args.expected_probability_tokens}",
@@ -1251,9 +1270,10 @@ def main():
             )
 
     def write_tables_for_store(store: dict[str, dict[str, np.ndarray]], out_dir: Path, prefix: str) -> None:
+        bottom_prefix = prefix.replace("topk_table", "bottomk_table", 1)
         if args.subblock_mode:
             for label in token_labels:
-                top_ids_attn, top_vals_attn = _compute_topk(
+                top_ids_attn, top_vals_attn, bottom_ids_attn, bottom_vals_attn = _compute_topk(
                     store["attn"][label],
                     top_k=args.top_k,
                     device=device,
@@ -1263,7 +1283,7 @@ def main():
                     norm_eps=norm_eps,
                     softcap=softcap,
                 )
-                top_ids_mlp, top_vals_mlp = _compute_topk(
+                top_ids_mlp, top_vals_mlp, bottom_ids_mlp, bottom_vals_mlp = _compute_topk(
                     store["mlp"][label],
                     top_k=args.top_k,
                     device=device,
@@ -1282,9 +1302,19 @@ def main():
                     top_ids_mlp=top_ids_mlp,
                     top_vals_mlp=top_vals_mlp,
                 )
+                bottom_path = out_dir / f"{bottom_prefix}_{label}.png"
+                _save_topk_table_png_subblocks(
+                    bottom_path,
+                    tokenizer=tokenizer,
+                    top_ids_attn=bottom_ids_attn,
+                    top_vals_attn=bottom_vals_attn,
+                    top_ids_mlp=bottom_ids_mlp,
+                    top_vals_mlp=bottom_vals_mlp,
+                    rank_label="Bottom",
+                )
         else:
             for label in token_labels:
-                top_ids, top_vals = _compute_topk(
+                top_ids, top_vals, bottom_ids, bottom_vals = _compute_topk(
                     store["res"][label],
                     top_k=args.top_k,
                     device=device,
@@ -1300,6 +1330,15 @@ def main():
                     tokenizer=tokenizer,
                     top_ids=top_ids,
                     top_vals=top_vals,
+                )
+                bottom_path = out_dir / f"{bottom_prefix}_{label}.png"
+                _save_topk_table_png(
+                    bottom_path,
+                    tokenizer=tokenizer,
+                    top_ids=bottom_ids,
+                    top_vals=bottom_vals,
+                    rank_label="Bottom",
+                    shade_body=False,
                 )
 
     def write_per_example_tables(

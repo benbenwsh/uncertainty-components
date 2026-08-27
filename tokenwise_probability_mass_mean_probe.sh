@@ -18,10 +18,10 @@ uptime
 # Tokenwise direction steering across all layers (layer x token grid):
 python3 ./tokenwise_probability_mass_mean_probe/run_tokenwise_probability_mass_mean_probe.py \
   --model_name mistralai/Mistral-7B-Instruct-v0.1 \
-  --input_h5 ./process_generations/processed_generations_more_h5/mistral/2_200_9_prob_toks/train_verbalised_embeddings.h5 \
-  --dataset trivia_qa \
+  --input_h5 ./process_generations/processed_generations_more_h5/3_math_mistral_extended_with_concat_train/train_verbalised_embeddings.h5 \
+  --dataset math \
   --no-enable_brief \
-  --num_samples 22 \
+  --num_samples 30 \
   --device cuda:0 \
   --dtype bfloat16 \
   --new_h5_format \
@@ -30,8 +30,9 @@ python3 ./tokenwise_probability_mass_mean_probe/run_tokenwise_probability_mass_m
   --expected_guess_tokens 5 \
   --expected_probability_tokens 7 \
   --extend_probability_span \
-  --low_conf_threshold 0.1 \
-  --high_conf_threshold 0.9 \
+  --low_conf_threshold 0.0 \
+  --high_conf_threshold 1.0 \
+  --no-mean_from_low_confidence
 
 # Low-confidence cohort (uncomment to steer low-conf examples toward higher confidence):
 # python3 ./tokenwise_probability_mass_mean_probe/run_tokenwise_probability_mass_mean_probe.py \

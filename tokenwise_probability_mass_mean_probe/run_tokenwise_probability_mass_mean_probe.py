@@ -30,12 +30,14 @@ if str(REPO_ROOT) not in sys.path:
 
 from layerwise_mean_ablation.run_mean_ablation import (
     BRIEF_PROMPTS,
+    LAYER_INDEXING_NOTE,
     _completion_token_index_to_abs_pos,
     _greedy_extend_with_fwd_hooks,
     collect_confidence_group_ids,
     construct_fewshot_prompt_from_indices,
     encode_example_id,
     greedy_generate,
+    hook_name_for_display_layer,
     load_examples_h5,
     load_hooked_transformer,
     load_eval_dataset,
@@ -57,6 +59,14 @@ from mass_mean_probe.run_mass_mean_probe import (
 
 TRAIN_RATIO = 0.9
 MODULE_NAME = "tokenwise_probability_mass_mean_probe"
+
+
+def _display_layers(
+    n_layers: int, ablate_layers: Sequence[int], *, individual_layers: bool
+) -> List[int]:
+    if individual_layers:
+        return list(range(n_layers + 1))
+    return [int(layer) for layer in ablate_layers]
 
 
 def _derive_steering_params(mean_from_low_confidence: bool) -> Tuple[str, float]:
@@ -242,7 +252,7 @@ def build_single_token_probability_direction_hooks(
 
             return hook_fn
 
-        hooks.append((f"blocks.{layer_idx}.hook_resid_post", _make_hook()))
+        hooks.append((hook_name_for_display_layer(layer_idx), _make_hook()))
     return hooks
 
 
@@ -567,6 +577,7 @@ def write_config_txt(
         f"dtype={args.dtype}",
         f"model_n_layers={model_n_layers}",
         f"run_layers={','.join(str(x) for x in run_layers)}",
+        f"layer_indexing={LAYER_INDEXING_NOTE}",
         f"individual_layers={args.individual_layers}",
         "",
         "[Sampling]",
@@ -717,6 +728,33 @@ def _directed_deviation_from_baseline(
     return max(0.0, diff)
 
 
+def _grid_input_output_tick_labels(token_labels: Sequence[str], n_cols: int) -> Tuple[List[str], List[str]]:
+    output_labels = [f"{i}:{_render_token_label(tok)}" for i, tok in enumerate(token_labels)]
+    if len(output_labels) < n_cols:
+        output_labels.extend([""] * (n_cols - len(output_labels)))
+    output_labels = output_labels[:n_cols]
+    input_labels = ["<last_answer_token>"] + output_labels[:-1]
+    if len(input_labels) < n_cols:
+        input_labels.extend([""] * (n_cols - len(input_labels)))
+    return input_labels[:n_cols], output_labels
+
+
+def _apply_input_output_token_axes(ax, *, n_cols: int, token_labels: Sequence[str]):
+    input_labels, output_labels = _grid_input_output_tick_labels(token_labels, n_cols)
+    ax.set_xticks(np.arange(n_cols))
+    ax.set_xticklabels(output_labels, rotation=30, ha="right")
+    ax.tick_params(axis="x", which="major", bottom=True, top=False, labelbottom=True, labeltop=False)
+    ax.xaxis.set_label_position("bottom")
+    ax.set_xlabel("Output tokens")
+
+    ax_top = ax.twiny()
+    ax_top.set_xlim(ax.get_xlim())
+    ax_top.set_xticks(np.arange(n_cols))
+    ax_top.set_xticklabels(input_labels, rotation=30, ha="left")
+    ax_top.set_xlabel("Input tokens")
+    return ax_top
+
+
 def write_layer_token_grid_plot(
     *,
     path: str,
@@ -727,6 +765,7 @@ def write_layer_token_grid_plot(
     mean_from_low_confidence: bool,
     linguistic_confidence_prompt: bool = False,
 ) -> None:
+    del linguistic_confidence_prompt
     n_rows, n_cols = matrix_values.shape
     max_dev = (
         float(np.nanmax(matrix_deviation_desired))
@@ -756,21 +795,12 @@ def write_layer_token_grid_plot(
 
     ax.set_yticks(np.arange(n_rows))
     ax.set_yticklabels([str(layer) for layer in run_layers])
-    ax.set_xticks(np.arange(n_cols))
-    ax.set_xticklabels(
-        [f"{i}:{_render_token_label(tok)}" for i, tok in enumerate(token_labels)],
-        rotation=30,
-        ha="left",
-    )
-    ax.xaxis.tick_top()
-    ax.xaxis.set_label_position("top")
-    xlabel = "Confidence token position" if linguistic_confidence_prompt else "Probability token position"
-    ax.set_xlabel(xlabel)
     ax.set_ylabel("Layer")
     direction = "below" if mean_from_low_confidence else "above"
     ax.set_title(
         f"Layer x token confidence (blue alpha = deviation {direction} baseline; opposite = 0)"
     )
+    _apply_input_output_token_axes(ax, n_cols=n_cols, token_labels=token_labels)
 
     ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
     ax.set_yticks(np.arange(-0.5, n_rows, 1), minor=True)
@@ -813,7 +843,10 @@ def main() -> None:
         "--ablate_layers",
         type=str,
         default="12-15",
-        help="Inclusive range '12-15' or comma list '12,13,14,15' (0-indexed).",
+        help=(
+            "Inclusive range '12-15' or comma list '12,13,14,15' (display indices: "
+            "0=embedding resid-pre, k>=1=resid-post of TL block k-1)."
+        ),
     )
     parser.add_argument("--low_conf_threshold", type=float, default=0.1)
     parser.add_argument("--high_conf_threshold", type=float, default=0.9)
@@ -874,8 +907,9 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "If true, ignore --ablate_layers and run one tokenwise sweep per layer, "
-            "then emit a layer x token grid."
+            "If true, ignore --ablate_layers and run one tokenwise sweep per display "
+            "layer (n_layers+1 rows: 0=embedding resid-pre, k>=1=resid-post of TL "
+            "block k-1), then emit a layer x token grid."
         ),
     )
     parser.add_argument(
@@ -932,8 +966,10 @@ def main() -> None:
 
     logging.info("Loading HookedTransformer: %s", args.model_name)
     model = load_hooked_transformer(args.model_name, device=device, torch_dtype=torch_dtype)
-    ablate_layers = parse_ablate_layers(args.ablate_layers, model.cfg.n_layers)
-    run_layers = list(range(model.cfg.n_layers)) if args.individual_layers else ablate_layers
+    ablate_layers = parse_ablate_layers(args.ablate_layers, model.cfg.n_layers + 1)
+    run_layers = _display_layers(
+        model.cfg.n_layers, ablate_layers, individual_layers=args.individual_layers
+    )
 
     examples_h5 = load_examples_h5(Path(args.input_h5))
     # Shared H5 helper accepts expected or expected+2 and truncates to the budget
@@ -951,6 +987,7 @@ def main() -> None:
         expected_probability_tokens=direction_prob_token_budget,
         expected_guess_tokens=args.expected_guess_tokens,
         new_h5_format=args.new_h5_format,
+        h5_res_indices=run_layers,
     )
     if args.normalize_span_directions:
         normalization_stats = normalize_direction_spans_to_unit_norm_budget(
@@ -1095,6 +1132,8 @@ def main() -> None:
 
         summary = {
             "run_root": run_root,
+            "run_layers": list(run_layers),
+            "layer_indexing": LAYER_INDEXING_NOTE,
             "steering_target": steering_target,
             "alpha": args.alpha,
             "baseline": {
@@ -1233,6 +1272,7 @@ def main() -> None:
         "run_root": run_root,
         "individual_layers": True,
         "run_layers": list(run_layers),
+        "layer_indexing": LAYER_INDEXING_NOTE,
         "steering_target": steering_target,
         "alpha": args.alpha,
         "baseline": {

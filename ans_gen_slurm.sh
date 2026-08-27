@@ -16,10 +16,12 @@ source /vol/cuda/13.0.0/setup.sh
 uptime
 
 python3 ./ans_gen/generate_answers_h5.py \
-  --model_name google/gemma-3-12b-it \
-  --num_samples 3000 \
+  --model_name mistralai/Mistral-7B-Instruct-v0.1 \
+  --num_samples 200 \
   --answerable_only \
   --collect_attn_block_embeddings \
   --collect_mlp_block_embeddings \
   --collect_qkvo_embeddings \
+  --collect_concat_embeddings \
+  --linguistic_confidence_prompt \
   --dataset trivia_qa

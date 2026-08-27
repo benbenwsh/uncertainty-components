@@ -984,8 +984,10 @@ def main() -> None:
     model_d_head = int(model.cfg.d_head)
     model_d_model = int(model.cfg.d_model)
     if model_n_heads * model_d_head != model_d_model:
-        raise ValueError(
-            f"Model shape mismatch: n_heads*d_head={model_n_heads * model_d_head}, d_model={model_d_model}."
+        logging.info(
+            "n_heads*d_head=%d != d_model=%d (expected for Gemma-style independent head_dim).",
+            model_n_heads * model_d_head,
+            model_d_model,
         )
 
     ablate_layers_from_flag = parse_ablate_layers(args.ablate_layers, model_n_layers)

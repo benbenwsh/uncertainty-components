@@ -15,28 +15,28 @@ source /vol/cuda/13.0.0/setup.sh
 /usr/bin/nvidia-smi
 uptime
 
-# for layer in $(seq 0 31); do
-#   python3 ./layerwise_mean_ablation/run_mean_ablation.py --input_h5 ./semantic_uncertainty/processed_generations_h5/3_train_200_samples_temp_0/train_verbalised_embeddings.h5 --num_samples 200 --device cuda:0 --ablate_layers "${layer}" --no-mean_from_low_confidence
-# done
-# python3 ./layerwise_mean_ablation/run_mean_ablation.py --input_h5 ./semantic_uncertainty/processed_generations_h5/3_train_200_samples_temp_0/train_verbalised_embeddings.h5 --num_samples 200 --device cuda:0 --ablate_layers 0-6 --no-mean_from_low_confidence
-
-# python3 ./layerwise_mean_ablation/run_mean_ablation.py \
+# Example with explicit unit selection (all listed heads/MLPs zeroed simultaneously
+# on both high- and low-confidence groups):
+# python3 ./headwise_zero_ablation/run_headwise_zero_ablation.py \
 #   --input_h5 ./process_generations/processed_generations_more_h5/2_200_concat/train_verbalised_embeddings.h5 \
 #   --no-enable_brief \
 #   --num_samples 200 \
 #   --device cuda:0 \
-#   --ablate_layers 10-16 \
-#   --new_h5_format \
-#   --ablation_mode none prompt_tokens_mean_replace sem_ans_tokens_during_gen \
+#   --ablate_heads a12.h3,a12.h7,a13.h2,m14 \
+#   --ablation_mode none probability_tokens_zero_ablate
 
-python3 ./layerwise_mean_ablation/run_mean_ablation.py \
+python3 ./headwise_zero_ablation/run_headwise_zero_ablation.py \
   --model_name google/gemma-3-12b-it \
   --input_h5 ./process_generations/processed_generations_more_h5/new_gemma/4_trivia_gemma_extended_with_concat_3000_train/balanced/train_verbalised_embeddings.h5 \
   --no-enable_brief \
   --num_samples 50 \
   --device cuda:0 \
-  --new_h5_format \
-  --individual_layers \
-  --ablation_mode none semantic_answer_mean_replace semantic_answer_including_first_prob_mean_replace
+  --dtype bfloat16 \
+  --ablate_heads a47.h5,a43.h5,a45.h1,a43.h4,a44.h11,a35.h10,a32.h10,a34.h11,a39.h13,a35.h7,a35.h6,a46.h9,a39.h9,a46.h13,m38,a41.h9,m45,a47.h6,a45.h2,a47.h9 \
+  --dataset trivia_qa \
+  --expected_guess_tokens 3 \
+  --expected_probability_tokens 5 \
+  --low_conf_threshold 0.2 \
+  --high_conf_threshold 0.8 \
+  --ablation_mode none probability_pre_and_post_period_digit_zero_ablate extended_probability_last_token_zero_ablate probability_last_token_zero_ablate
 
-  
