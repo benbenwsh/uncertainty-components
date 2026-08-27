@@ -523,14 +523,18 @@ class SiteInputCapture:
         self._attn_resum_warned: set[int] = set()
 
     def clear_captured(self) -> None:
-        self.q = [None] * self.n_layers
-        self.k = [None] * self.n_layers
-        self.v = [None] * self.n_layers
-        self.mlp = [None] * self.n_layers
-        self.z_last = [None] * self.n_layers
-        self.attn_heads = [None] * self.n_layers
-        self.attn_out = [None] * self.n_layers
-        self.mlp_out = [None] * self.n_layers
+        for seq in (
+            self.q,
+            self.k,
+            self.v,
+            self.mlp,
+            self.z_last,
+            self.attn_heads,
+            self.attn_out,
+            self.mlp_out,
+        ):
+            for i in range(len(seq)):
+                seq[i] = None
 
     def iter_tensors(self):
         sequences = [self.q, self.k, self.v, self.mlp]
@@ -552,11 +556,11 @@ class SiteInputCapture:
             if t.grad is not None:
                 t.grad = None
 
-    def _make_retain_hook(self, store: list[torch.Tensor | None], layer: int):
+    def _make_retain_hook(self, store_name: str, layer: int):
         def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
             del hook
             out = _retain_or_leaf(activation)
-            store[layer] = out
+            getattr(self, store_name)[layer] = out
             return out
 
         return hook_fn
@@ -580,7 +584,7 @@ class SiteInputCapture:
 
     def _make_attn_out_hook(self, layer: int):
         if not self.need_fine:
-            return self._make_retain_hook(self.attn_out, layer)
+            return self._make_retain_hook("attn_out", layer)
 
         def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
             del hook
@@ -673,16 +677,16 @@ class SiteInputCapture:
         hooks: list[tuple[str, object]] = [("hook_embed", self._embed_hook)]
         for layer in range(self.n_layers):
             hooks.append(
-                (f"blocks.{layer}.hook_q_input", self._make_retain_hook(self.q, layer))
+                (f"blocks.{layer}.hook_q_input", self._make_retain_hook("q", layer))
             )
             hooks.append(
-                (f"blocks.{layer}.hook_k_input", self._make_retain_hook(self.k, layer))
+                (f"blocks.{layer}.hook_k_input", self._make_retain_hook("k", layer))
             )
             hooks.append(
-                (f"blocks.{layer}.hook_v_input", self._make_retain_hook(self.v, layer))
+                (f"blocks.{layer}.hook_v_input", self._make_retain_hook("v", layer))
             )
             hooks.append(
-                (f"blocks.{layer}.hook_mlp_in", self._make_retain_hook(self.mlp, layer))
+                (f"blocks.{layer}.hook_mlp_in", self._make_retain_hook("mlp", layer))
             )
         return hooks
 
@@ -701,7 +705,7 @@ class SiteInputCapture:
             hooks.append(
                 (
                     f"blocks.{layer}.hook_mlp_out",
-                    self._make_retain_hook(self.mlp_out, layer),
+                    self._make_retain_hook("mlp_out", layer),
                 )
             )
         return hooks
@@ -1022,8 +1026,8 @@ def freeze_model(model) -> None:
 
 def enable_split_input_hooks(model) -> None:
     """Route residual copies through hook_q/k/v_input and MLP through hook_mlp_in."""
-    model.cfg.use_split_qkv_input = True
-    model.cfg.use_hook_mlp_in = True
+    model.set_use_split_qkv_input(True)
+    model.set_use_hook_mlp_in(True)
 
 
 def _score_site_pass(
