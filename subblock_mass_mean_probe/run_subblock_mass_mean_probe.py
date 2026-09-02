@@ -73,11 +73,14 @@ from mass_mean_probe.run_mass_mean_probe import (
     parse_mode_confidence_from_response,
     parse_semantic_answer_from_response,
     PROBABILITY_ROW_INDEX_MODES,
+    probability_row_indices_for_mode,
     split_answerable_indices,
+    SUPPORTED_MODEL_NAMES,
+    truncate_sorted_ids,
+    validate_last_a_panl_and_pc_mode,
 )
 
 
-TRAIN_RATIO = 0.9
 TARGET_COMPONENTS = ("attn", "mlp")
 REQUIRED_COMPONENTS = ("res", "attn", "mlp")
 REQUIRED_EMBEDDING_FIELDS = (
@@ -306,6 +309,7 @@ def normalize_component_direction_spans_to_unit_norm_budget(
 def _direction_mode_activation_applier_builder(
     mode: str,
     *,
+    model_name: str,
     expected_guess_tokens: int,
     expected_probability_tokens: int,
     expected_confidence_tokens: int,
@@ -352,7 +356,7 @@ def _direction_mode_activation_applier_builder(
             return _apply_probability_tokens_mean_replace
 
         if mode in PROBABILITY_ROW_INDEX_MODES:
-            row_indices = PROBABILITY_ROW_INDEX_MODES[mode]
+            row_indices = probability_row_indices_for_mode(mode, model_name)
 
             def _apply_probability_row_indices_mean_replace(
                 activation: torch.Tensor,
@@ -565,6 +569,7 @@ def build_subblock_direction_perturb_hooks(
     *,
     subblock: str,
     mode: str,
+    model_name: str,
     prompt_len: int,
     decoded_tokens_provider: Callable[[], List[str]],
     expected_guess_tokens: int,
@@ -576,6 +581,7 @@ def build_subblock_direction_perturb_hooks(
     hooks: List[Tuple[str, Callable]] = []
     activation_applier_builder = _direction_mode_activation_applier_builder(
         mode,
+        model_name=model_name,
         expected_guess_tokens=expected_guess_tokens,
         expected_probability_tokens=expected_probability_tokens,
         expected_confidence_tokens=expected_confidence_tokens,
@@ -608,6 +614,7 @@ def greedy_generate_direction_perturbed_subblock(
     layer_to_span_delta: Dict[int, Dict[str, torch.Tensor]],
     subblock: str,
     mode: str,
+    model_name: str,
     expected_guess_tokens: int,
     expected_probability_tokens: int,
     expected_confidence_tokens: int,
@@ -625,6 +632,7 @@ def greedy_generate_direction_perturbed_subblock(
         layer_to_span_delta=layer_to_span_delta,
         subblock=subblock,
         mode=mode,
+        model_name=model_name,
         prompt_len=prompt_len,
         decoded_tokens_provider=_decoded_tokens_provider,
         expected_guess_tokens=expected_guess_tokens,
@@ -1031,7 +1039,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Subblock-aware mass mean direction probe inference (TransformerLens)."
     )
-    parser.add_argument("--model_name", type=str, default="mistralai/Mistral-7B-Instruct-v0.1")
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="mistralai/Mistral-7B-Instruct-v0.1",
+        choices=list(SUPPORTED_MODEL_NAMES),
+    )
     parser.add_argument("--input_h5", type=str, required=True, help="Path to *_verbalised_embeddings.h5 file.")
     parser.add_argument(
         "--new_h5_format",
@@ -1048,7 +1061,12 @@ def main() -> None:
         default="trivia_qa",
         choices=["trivia_qa", "squad", "bioasq", "nq", "svamp", "gsm8k", "math"],
     )
-    parser.add_argument("--num_samples", type=int, default=400)
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=400,
+        help="Max examples per confidence group (sorted IDs, then truncated). No train/val ratio split.",
+    )
     parser.add_argument("--num_few_shot", type=int, default=0)
     parser.add_argument("--model_max_new_tokens", type=int, default=50)
     parser.add_argument("--brief_prompt", type=str, default="default", choices=["default", "chat"])
@@ -1068,9 +1086,11 @@ def main() -> None:
         default=[
             "none",
             "probability_tokens_mean_replace",
-            "probability_first_token_mean_replace",
-            "probability_first_two_tokens_mean_replace",
-            "probability_first_two_and_index6_tokens_mean_replace",
+            "last_a_mean_replace",
+            "last_a_and_panl_mean_replace",
+            "last_a_panl_and_pc_mean_replace",
+            "panl_mean_replace",
+            "pc_mean_replace",
             "all_pre_probability_tokens_mean_replace",
             "guess_tokens_mean_replace",
             "all_pre_guess_tokens_mean_replace",
@@ -1081,9 +1101,11 @@ def main() -> None:
         choices=[
             "none",
             "probability_tokens_mean_replace",
-            "probability_first_token_mean_replace",
-            "probability_first_two_tokens_mean_replace",
-            "probability_first_two_and_index6_tokens_mean_replace",
+            "last_a_mean_replace",
+            "last_a_and_panl_mean_replace",
+            "last_a_panl_and_pc_mean_replace",
+            "panl_mean_replace",
+            "pc_mean_replace",
             "all_pre_probability_tokens_mean_replace",
             "guess_tokens_mean_replace",
             "all_pre_guess_tokens_mean_replace",
@@ -1182,6 +1204,7 @@ def main() -> None:
         )
     if len(set(args.ablation_mode)) != len(args.ablation_mode):
         raise ValueError(f"Duplicate ablation modes are not allowed: {args.ablation_mode}")
+    validate_last_a_panl_and_pc_mode(args.model_name, args.ablation_mode)
     if "none" not in args.ablation_mode:
         raise ValueError("Please include 'none' in --ablation_mode for baseline comparisons.")
     if any(m in WHOLE_SEQUENCE_MODES for m in args.ablation_mode):
@@ -1284,6 +1307,17 @@ def main() -> None:
         args.ablate_subblocks,
         list(args.alpha),
     )
+    eval_low_ids = set(truncate_sorted_ids(low_ids, args.num_samples))
+    eval_high_ids = set(truncate_sorted_ids(high_ids, args.num_samples))
+    eval_ids = eval_low_ids | eval_high_ids
+    logging.info(
+        "Eval sample cap num_samples=%d: eval_low=%d eval_high=%d (from full low=%d high=%d)",
+        args.num_samples,
+        len(eval_low_ids),
+        len(eval_high_ids),
+        len(low_ids),
+        len(high_ids),
+    )
 
     out_path = resolve_output_json_path(args.output_json)
 
@@ -1340,15 +1374,8 @@ def main() -> None:
     non_none_modes = [m for m in args.ablation_mode if m != "none"]
 
     for split_name, eval_ds in [("train", train_ds), ("validation", val_ds)]:
-        split_target = (
-            round(args.num_samples * TRAIN_RATIO)
-            if split_name == "train"
-            else round(args.num_samples * (1 - TRAIN_RATIO))
-        )
         id_to_index = {encode_example_id(ex["id"]): i for i, ex in enumerate(eval_ds)}
-        target_union_ids: set[str] = set(low_ids) | set(high_ids)
-        split_target_ids = sorted(ex_id for ex_id in target_union_ids if ex_id in id_to_index)
-        selected_ids = split_target_ids[: min(split_target, len(split_target_ids))]
+        selected_ids = sorted(ex_id for ex_id in eval_ids if ex_id in id_to_index)
         logging.info("Generating for %d examples (%s split).", len(selected_ids), split_name)
 
         for i, ex_id in enumerate(selected_ids):
@@ -1443,6 +1470,7 @@ def main() -> None:
                                 layer_to_span_delta=layer_to_span_delta,
                                 subblock=subblock,
                                 mode=mode,
+                                model_name=args.model_name,
                                 expected_guess_tokens=args.expected_guess_tokens,
                                 expected_probability_tokens=args.expected_probability_tokens,
                                 expected_confidence_tokens=args.expected_confidence_tokens,

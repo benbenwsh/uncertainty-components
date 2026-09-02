@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Simultaneous component-input mean ablation on high- and low-confidence groups.
+"""Simultaneous componentwise mean ablation on high- and low-confidence groups.
 
-Mean-replaces selected attention-head Q/K/V (post W_Q/W_K/W_V) and/or MLP
-subblock RMSNorm inputs at mode-dependent token spans during greedy decoding.
+Mean-replaces selected attention heads, whole attention blocks, and/or MLP
+subblocks at mode-dependent token spans during greedy decoding.
+--intervention_site selects the patch location: input (Q/K/V post W_Q/W_K/W_V,
+attn ln1 from H5 res, and MLP RMSNorm in) or output (hook_z / concat,
+hook_attn_out from H5 attn after ln1_post on sandwich Gemma, and hook_mlp_out).
 
 Means are computed separately for high- and low-confidence H5 examples, then
 applied cross-group: high-confidence generations receive the low-confidence
@@ -12,7 +15,7 @@ mean, and vice versa. All units listed in --ablate_heads are patched together.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager
 from datetime import datetime
 import gc
 import json
@@ -41,6 +44,7 @@ from blockwise_zero_ablation.run_blockwise_zero_ablation import (
     _absolute_prob_except_last_token_positions,
     _absolute_prob_last_token_only_positions,
     _absolute_prob_positions,
+    _absolute_prob_positions_at_row_indices,
     construct_fewshot_prompt_from_indices,
     greedy_generate,
     load_eval_dataset,
@@ -74,10 +78,13 @@ from headwise_zero_ablation.run_headwise_zero_ablation import (
     parse_ablate_units,
 )
 from layerwise_mean_ablation.run_mean_ablation import (
+    PROBABILITY_ROW_INDEX_MODES,
     _absolute_probability_value_start_position,
     _as_layer_hidden,
     _is_expected_or_plus_two,
     load_hooked_transformer,
+    probability_row_indices_for_mode,
+    validate_last_a_panl_and_pc_mode,
 )
 
 
@@ -95,6 +102,7 @@ SOURCE_TO_FIELD = {
     "probability": "embeddings_probability",
     "probability_value_mean": "embeddings_mean_prob_val",
 }
+INTERVENTION_SITES = ("input", "output")
 ABLATION_MODES_DEFAULT = [
     "none",
     "probability_tokens_mean_replace",
@@ -102,6 +110,11 @@ ABLATION_MODES_DEFAULT = [
     "extended_probability_last_token_mean_replace",
     "probability_pre_and_post_period_digit_mean_replace",
     "probability_span_except_last_token_mean_replace",
+    "last_a_mean_replace",
+    "last_a_and_panl_mean_replace",
+    "last_a_panl_and_pc_mean_replace",
+    "panl_mean_replace",
+    "pc_mean_replace",
     "all_pre_probability_tokens_mean_replace",
     "guess_tokens_mean_replace",
     "all_pre_guess_tokens_mean_replace",
@@ -121,7 +134,7 @@ def resolve_output_json_path(cli_output_path: Optional[str]) -> str:
     if cli_output_path:
         out_path = os.path.abspath(cli_output_path)
     else:
-        base = Path("componentwise_input_mean_ablation") / "results"
+        base = Path("componentwise_mean_ablation") / "results"
         base.mkdir(parents=True, exist_ok=True)
         run_id = 1
         while (base / str(run_id)).exists():
@@ -280,6 +293,56 @@ def _mlp_input_row(res_hidden: np.ndarray, attn_hidden: np.ndarray, *, layer: in
     return np.asarray(res_row, dtype=np.float32) + np.asarray(attn_row, dtype=np.float32)
 
 
+def _d_model_row(
+    hidden: np.ndarray, *, layer: int, d_model: int, component: str
+) -> np.ndarray:
+    if hidden.ndim != 2:
+        raise ValueError(f"Expected 2D {component}, got {hidden.shape}.")
+    if int(hidden.shape[0]) <= int(layer):
+        raise ValueError(
+            f"{component} embeddings have {hidden.shape[0]} layers; need index {layer}."
+        )
+    row = hidden[int(layer)]
+    if int(row.size) != int(d_model):
+        raise ValueError(
+            f"{component} hidden dim mismatch at layer {layer}: "
+            f"{component}={row.size} d_model={d_model}."
+        )
+    return np.asarray(row, dtype=np.float32)
+
+
+def _split_source_token_list(
+    raw,
+    *,
+    source_name: str,
+    field_name: str,
+    component: str,
+    expected_guess_tokens: int,
+    expected_probability_tokens: int,
+) -> Tuple[List[np.ndarray], Optional[List[np.ndarray]]]:
+    extra_tokens: Optional[List[np.ndarray]] = None
+    if source_name == "guess":
+        if not isinstance(raw, list) or len(raw) != expected_guess_tokens:
+            raise ValueError(
+                f"{field_name}/{component} len={0 if not isinstance(raw, list) else len(raw)}; "
+                f"expected {expected_guess_tokens}."
+            )
+        return raw, None
+    if source_name == "probability":
+        if not isinstance(raw, list) or not _is_expected_or_plus_two(
+            len(raw), expected_probability_tokens
+        ):
+            raise ValueError(
+                f"{field_name}/{component} len={0 if not isinstance(raw, list) else len(raw)}; "
+                f"expected {expected_probability_tokens} or {expected_probability_tokens + 2}."
+            )
+        tokens = raw[:expected_probability_tokens]
+        if len(raw) == expected_probability_tokens + 2:
+            extra_tokens = raw[expected_probability_tokens:]
+        return tokens, extra_tokens
+    return [raw], None
+
+
 def _extract_qkv_source_arrays(
     r0: h5py.Group,
     *,
@@ -379,6 +442,83 @@ def _extract_qkv_source_arrays(
     return q_out, k_out, v_out, extra
 
 
+def _extract_z_source_arrays(
+    r0: h5py.Group,
+    *,
+    source_name: str,
+    selected_heads_by_layer: Dict[int, Sequence[int]],
+    n_heads: int,
+    d_head: int,
+    expected_guess_tokens: int,
+    expected_probability_tokens: int,
+) -> Tuple[Dict[int, np.ndarray], Optional[Dict[int, np.ndarray]]]:
+    field_name = SOURCE_TO_FIELD[source_name]
+    expect_list = source_name in LIST_SOURCES
+    z_raw = _read_field_component(r0, field_name, "concat", expect_list=expect_list)
+    z_tokens, extra_tokens = _split_source_token_list(
+        z_raw,
+        source_name=source_name,
+        field_name=field_name,
+        component="concat",
+        expected_guess_tokens=expected_guess_tokens,
+        expected_probability_tokens=expected_probability_tokens,
+    )
+    extra: Optional[Dict[int, np.ndarray]] = None if extra_tokens is None else {}
+    z_out: Dict[int, np.ndarray] = {}
+    for layer, heads in selected_heads_by_layer.items():
+        head_idx = np.asarray(list(heads), dtype=np.int64)
+        z_sel = [
+            _reshape_q_row(tok, layer=layer, n_heads=n_heads, d_head=d_head)[head_idx]
+            for tok in z_tokens
+        ]
+        z_out[int(layer)] = np.stack(z_sel, axis=1) if source_name in LIST_SOURCES else z_sel[0]
+        if extra is not None and extra_tokens is not None:
+            extra_sel = [
+                _reshape_q_row(tok, layer=layer, n_heads=n_heads, d_head=d_head)[head_idx]
+                for tok in extra_tokens
+            ]
+            extra[int(layer)] = np.stack(extra_sel, axis=1)
+    return z_out, extra
+
+
+def _extract_d_model_source_arrays(
+    r0: h5py.Group,
+    *,
+    source_name: str,
+    layers: Sequence[int],
+    d_model: int,
+    expected_guess_tokens: int,
+    expected_probability_tokens: int,
+    component: str,
+) -> Tuple[Dict[int, np.ndarray], Optional[Dict[int, np.ndarray]]]:
+    field_name = SOURCE_TO_FIELD[source_name]
+    expect_list = source_name in LIST_SOURCES
+    raw = _read_field_component(r0, field_name, component, expect_list=expect_list)
+    tokens, extra_tokens = _split_source_token_list(
+        raw,
+        source_name=source_name,
+        field_name=field_name,
+        component=component,
+        expected_guess_tokens=expected_guess_tokens,
+        expected_probability_tokens=expected_probability_tokens,
+    )
+    extra: Optional[Dict[int, np.ndarray]] = None if extra_tokens is None else {}
+    out: Dict[int, np.ndarray] = {}
+    for layer in layers:
+        rows = [
+            _d_model_row(tok, layer=int(layer), d_model=d_model, component=component)
+            for tok in tokens
+        ]
+        out[int(layer)] = np.stack(rows, axis=0) if source_name in LIST_SOURCES else rows[0]
+        if extra is not None and extra_tokens is not None:
+            extra_rows = [
+                _d_model_row(tok, layer=int(layer), d_model=d_model, component=component)
+                for tok in extra_tokens
+            ]
+            extra[int(layer)] = np.stack(extra_rows, axis=0)
+    return out, extra
+
+
 def _extract_mlp_source_arrays(
     r0: h5py.Group,
     *,
@@ -387,13 +527,25 @@ def _extract_mlp_source_arrays(
     d_model: int,
     expected_guess_tokens: int,
     expected_probability_tokens: int,
+    intervention_site: str = "input",
 ) -> Tuple[Dict[int, np.ndarray], Optional[Dict[int, np.ndarray]]]:
     field_name = SOURCE_TO_FIELD[source_name]
     expect_list = source_name in LIST_SOURCES
+    if intervention_site == "output":
+        return _extract_d_model_source_arrays(
+            r0,
+            source_name=source_name,
+            layers=mlp_layers,
+            d_model=d_model,
+            expected_guess_tokens=expected_guess_tokens,
+            expected_probability_tokens=expected_probability_tokens,
+            component="mlp",
+        )
+
     res_raw = _read_field_component(r0, field_name, "res", expect_list=expect_list)
     attn_raw = _read_field_component(r0, field_name, "attn", expect_list=expect_list)
 
-    extra: Optional[Dict[int, np.ndarray]] = None
+    extra = None
     extra_res: List[np.ndarray] = []
     extra_attn: List[np.ndarray] = []
     if source_name == "guess":
@@ -426,7 +578,7 @@ def _extract_mlp_source_arrays(
     else:
         res_tokens, attn_tokens = [res_raw], [attn_raw]
 
-    out: Dict[int, np.ndarray] = {}
+    out = {}
     for layer in mlp_layers:
         rows = [
             _mlp_input_row(res_tok, attn_tok, layer=int(layer), d_model=d_model)
@@ -447,6 +599,7 @@ def stream_group_means_and_eval_ids(
     *,
     selected_heads_by_layer: Dict[int, Sequence[int]],
     mlp_layers: Sequence[int],
+    attn_block_layers: Sequence[int] = (),
     n_heads: int,
     n_kv_heads: int,
     d_head: int,
@@ -457,17 +610,23 @@ def stream_group_means_and_eval_ids(
     high_conf_threshold: float,
     split_id_to_index: Dict[str, Dict[str, int]],
     split_targets: Dict[str, int],
+    intervention_site: str = "input",
     log_every: int = 100,
 ) -> Tuple[
     Dict[str, Dict[str, object]],
     Dict[str, Dict[str, List[str]]],
     int,
 ]:
-    """Stream H5: accumulate per-group input means and collect eval IDs.
+    """Stream H5: accumulate per-group means at the chosen intervention site.
 
     Means use every high/low example with usable embeddings. Eval IDs are capped
     at the usual train/validation targets, matching headwise zero ablation.
     """
+    if intervention_site not in INTERVENTION_SITES:
+        raise ValueError(
+            f"Unknown intervention_site {intervention_site!r}; expected one of {INTERVENTION_SITES}."
+        )
+    site_is_output = intervention_site == "output"
     selected_ids: Dict[str, Dict[str, List[str]]] = {
         group_name: {split_name: [] for split_name in split_targets} for group_name in CONFIDENCE_GROUPS
     }
@@ -483,13 +642,21 @@ def stream_group_means_and_eval_ids(
         group: {comp: {int(layer): {} for layer in selected_heads_by_layer} for comp in ("q", "k", "v")}
         for group in CONFIDENCE_GROUPS
     }
+    z_sums: Dict[str, Dict[int, Dict[str, np.ndarray]]] = {
+        group: {int(layer): {} for layer in selected_heads_by_layer} for group in CONFIDENCE_GROUPS
+    }
     mlp_sums: Dict[str, Dict[int, Dict[str, np.ndarray]]] = {
         group: {int(layer): {} for layer in mlp_layers} for group in CONFIDENCE_GROUPS
     }
+    attn_block_sums: Dict[str, Dict[int, Dict[str, np.ndarray]]] = {
+        group: {int(layer): {} for layer in attn_block_layers} for group in CONFIDENCE_GROUPS
+    }
     qkv_counts = {group: 0 for group in CONFIDENCE_GROUPS}
     mlp_counts = {group: 0 for group in CONFIDENCE_GROUPS}
+    attn_block_counts = {group: 0 for group in CONFIDENCE_GROUPS}
     qkv_extra_counts = {group: 0 for group in CONFIDENCE_GROUPS}
     mlp_extra_counts = {group: 0 for group in CONFIDENCE_GROUPS}
+    attn_block_extra_counts = {group: 0 for group in CONFIDENCE_GROUPS}
     seen_low = False
     seen_high = False
     skipped_bad = 0
@@ -500,9 +667,10 @@ def stream_group_means_and_eval_ids(
         examples_group = h5_file["examples"]
         h5_example_count = int(len(examples_group))
         logging.info(
-            "Streaming %d examples from %s for cross-group input means.",
+            "Streaming %d examples from %s for cross-group %s means.",
             h5_example_count,
             path,
+            intervention_site,
         )
         for i, example_id in enumerate(examples_group.keys()):
             ex_id = str(example_id)
@@ -555,8 +723,30 @@ def stream_group_means_and_eval_ids(
                 continue
 
             qkv_payload = None
+            z_payload = None
             mlp_payload = None
-            if selected_heads_by_layer:
+            attn_block_payload = None
+            if selected_heads_by_layer and site_is_output:
+                try:
+                    z_by_source: Dict[str, Dict[int, np.ndarray]] = {}
+                    extra_z = None
+                    for source_name in ALL_SOURCES:
+                        z_out, extra = _extract_z_source_arrays(
+                            r0,
+                            source_name=source_name,
+                            selected_heads_by_layer=selected_heads_by_layer,
+                            n_heads=n_heads,
+                            d_head=d_head,
+                            expected_guess_tokens=expected_guess_tokens,
+                            expected_probability_tokens=expected_probability_tokens,
+                        )
+                        z_by_source[source_name] = z_out
+                        if extra is not None:
+                            extra_z = extra
+                    z_payload = (z_by_source, extra_z)
+                except ValueError as exc:
+                    logging.warning("Skipping concat/hook_z means for example %s: %s", ex_id, exc)
+            elif selected_heads_by_layer:
                 try:
                     q_by_source: Dict[str, Dict[int, np.ndarray]] = {}
                     k_by_source: Dict[str, Dict[int, np.ndarray]] = {}
@@ -595,15 +785,59 @@ def stream_group_means_and_eval_ids(
                             d_model=d_model,
                             expected_guess_tokens=expected_guess_tokens,
                             expected_probability_tokens=expected_probability_tokens,
+                            intervention_site=intervention_site,
                         )
                         mlp_by_source[source_name] = mlp_out
                         if extra is not None:
                             extra_mlp = extra
                     mlp_payload = (mlp_by_source, extra_mlp)
                 except ValueError as exc:
-                    logging.warning("Skipping MLP-input means for example %s: %s", ex_id, exc)
+                    mlp_label = "MLP-output" if site_is_output else "MLP-input"
+                    logging.warning("Skipping %s means for example %s: %s", mlp_label, ex_id, exc)
+
+            if attn_block_layers:
+                attn_block_component = "attn" if site_is_output else "res"
+                attn_block_label = (
+                    "attn-block-output (H5 attn / hook_attn_out)"
+                    if site_is_output
+                    else "attn-block-input (H5 res / ln1)"
+                )
+                try:
+                    attn_block_by_source: Dict[str, Dict[int, np.ndarray]] = {}
+                    extra_attn_block = None
+                    for source_name in ALL_SOURCES:
+                        attn_out, extra = _extract_d_model_source_arrays(
+                            r0,
+                            source_name=source_name,
+                            layers=attn_block_layers,
+                            d_model=d_model,
+                            expected_guess_tokens=expected_guess_tokens,
+                            expected_probability_tokens=expected_probability_tokens,
+                            component=attn_block_component,
+                        )
+                        attn_block_by_source[source_name] = attn_out
+                        if extra is not None:
+                            extra_attn_block = extra
+                    attn_block_payload = (attn_block_by_source, extra_attn_block)
+                except ValueError as exc:
+                    logging.warning(
+                        "Skipping %s means for example %s: %s",
+                        attn_block_label,
+                        ex_id,
+                        exc,
+                    )
 
             for group_name in groups_for_example:
+                if z_payload is not None:
+                    z_by_source, extra_z = z_payload
+                    for source_name in ALL_SOURCES:
+                        for layer in selected_heads_by_layer:
+                            _add_sum(z_sums[group_name][int(layer)], source_name, z_by_source[source_name][int(layer)])
+                    if extra_z is not None:
+                        for layer in selected_heads_by_layer:
+                            _add_sum(z_sums[group_name][int(layer)], "probability_extra", extra_z[int(layer)])
+                        qkv_extra_counts[group_name] += 1
+                    qkv_counts[group_name] += 1
                 if qkv_payload is not None:
                     q_by_source, k_by_source, v_by_source, extra_qkv = qkv_payload
                     for source_name in ALL_SOURCES:
@@ -628,14 +862,33 @@ def stream_group_means_and_eval_ids(
                             _add_sum(mlp_sums[group_name][int(layer)], "probability_extra", extra_mlp[int(layer)])
                         mlp_extra_counts[group_name] += 1
                     mlp_counts[group_name] += 1
+                if attn_block_payload is not None:
+                    attn_block_by_source, extra_attn_block = attn_block_payload
+                    for source_name in ALL_SOURCES:
+                        for layer in attn_block_layers:
+                            _add_sum(
+                                attn_block_sums[group_name][int(layer)],
+                                source_name,
+                                attn_block_by_source[source_name][int(layer)],
+                            )
+                    if extra_attn_block is not None:
+                        for layer in attn_block_layers:
+                            _add_sum(
+                                attn_block_sums[group_name][int(layer)],
+                                "probability_extra",
+                                extra_attn_block[int(layer)],
+                            )
+                        attn_block_extra_counts[group_name] += 1
+                    attn_block_counts[group_name] += 1
 
             if log_every > 0 and (i + 1) % log_every == 0:
                 logging.info(
-                    "Progress %d/%d examples (qkv_counts=%s mlp_counts=%s bad=%d).",
+                    "Progress %d/%d examples (qkv_counts=%s mlp_counts=%s attn_block_counts=%s bad=%d).",
                     i + 1,
                     h5_example_count,
                     qkv_counts,
                     mlp_counts,
+                    attn_block_counts,
                     skipped_bad,
                 )
 
@@ -646,11 +899,25 @@ def stream_group_means_and_eval_ids(
     if selected_heads_by_layer:
         for group_name in CONFIDENCE_GROUPS:
             if qkv_counts[group_name] == 0:
+                if site_is_output:
+                    raise ValueError(f"No usable concat/hook_z embeddings for {group_name} means.")
                 raise ValueError(f"No usable Q/K/V embeddings for {group_name} means.")
     if mlp_layers:
         for group_name in CONFIDENCE_GROUPS:
             if mlp_counts[group_name] == 0:
-                raise ValueError(f"No usable res/attn embeddings for {group_name} MLP-input means.")
+                mlp_label = "mlp" if site_is_output else "res/attn"
+                mlp_site = "MLP-output" if site_is_output else "MLP-input"
+                raise ValueError(
+                    f"No usable {mlp_label} embeddings for {group_name} {mlp_site} means."
+                )
+    if attn_block_layers:
+        attn_block_component = "attn" if site_is_output else "res"
+        attn_block_site = "attn-block-output" if site_is_output else "attn-block-input"
+        for group_name in CONFIDENCE_GROUPS:
+            if attn_block_counts[group_name] == 0:
+                raise ValueError(
+                    f"No usable {attn_block_component} embeddings for {group_name} {attn_block_site} means."
+                )
     if not _selected_groups_filled(selected_ids, split_targets):
         logging.warning(
             "Eval ID targets were not fully filled: %s",
@@ -667,79 +934,134 @@ def stream_group_means_and_eval_ids(
         q_means: Dict[int, Dict[int, Dict[str, np.ndarray]]] = {}
         k_means: Dict[int, Dict[int, Dict[str, np.ndarray]]] = {}
         v_means: Dict[int, Dict[int, Dict[str, np.ndarray]]] = {}
+        z_means: Dict[int, Dict[int, Dict[str, np.ndarray]]] = {}
         if selected_heads_by_layer:
             n = qkv_counts[group_name]
             n_extra = qkv_extra_counts[group_name]
-            for layer, heads in selected_heads_by_layer.items():
-                q_layer = qkv_sums[group_name]["q"][int(layer)]
-                k_layer = qkv_sums[group_name]["k"][int(layer)]
-                v_layer = qkv_sums[group_name]["v"][int(layer)]
-                kv_heads = list(kv_heads_map[int(layer)])
-                q_means[int(layer)] = {}
-                for local_i, head_idx in enumerate(heads):
-                    entry: Dict[str, np.ndarray] = {}
-                    for source_name in ALL_SOURCES:
-                        arr = _mean_or_none(q_layer.get(source_name), n)
-                        if arr is None:
-                            raise ValueError(f"Missing Q mean for {group_name} layer {layer} {source_name}.")
-                        entry[source_name] = arr[local_i]
-                    extra_arr = _mean_or_none(q_layer.get("probability_extra"), n_extra)
-                    if extra_arr is not None:
-                        entry["probability_extra"] = extra_arr[local_i]
-                    q_means[int(layer)][int(head_idx)] = entry
-                k_means[int(layer)] = {}
-                v_means[int(layer)] = {}
-                for local_i, kv_head in enumerate(kv_heads):
-                    k_entry: Dict[str, np.ndarray] = {}
-                    v_entry: Dict[str, np.ndarray] = {}
-                    for source_name in ALL_SOURCES:
-                        k_arr = _mean_or_none(k_layer.get(source_name), n)
-                        v_arr = _mean_or_none(v_layer.get(source_name), n)
-                        if k_arr is None or v_arr is None:
-                            raise ValueError(f"Missing K/V mean for {group_name} layer {layer} {source_name}.")
-                        k_entry[source_name] = k_arr[local_i]
-                        v_entry[source_name] = v_arr[local_i]
-                    k_extra = _mean_or_none(k_layer.get("probability_extra"), n_extra)
-                    v_extra = _mean_or_none(v_layer.get("probability_extra"), n_extra)
-                    if k_extra is not None:
-                        k_entry["probability_extra"] = k_extra[local_i]
-                    if v_extra is not None:
-                        v_entry["probability_extra"] = v_extra[local_i]
-                    k_means[int(layer)][int(kv_head)] = k_entry
-                    v_means[int(layer)][int(kv_head)] = v_entry
+            if site_is_output:
+                for layer, heads in selected_heads_by_layer.items():
+                    z_layer = z_sums[group_name][int(layer)]
+                    z_means[int(layer)] = {}
+                    for local_i, head_idx in enumerate(heads):
+                        entry: Dict[str, np.ndarray] = {}
+                        for source_name in ALL_SOURCES:
+                            arr = _mean_or_none(z_layer.get(source_name), n)
+                            if arr is None:
+                                raise ValueError(
+                                    f"Missing concat/hook_z mean for {group_name} layer {layer} {source_name}."
+                                )
+                            entry[source_name] = arr[local_i]
+                        extra_arr = _mean_or_none(z_layer.get("probability_extra"), n_extra)
+                        if extra_arr is not None:
+                            entry["probability_extra"] = extra_arr[local_i]
+                        z_means[int(layer)][int(head_idx)] = entry
+            else:
+                for layer, heads in selected_heads_by_layer.items():
+                    q_layer = qkv_sums[group_name]["q"][int(layer)]
+                    k_layer = qkv_sums[group_name]["k"][int(layer)]
+                    v_layer = qkv_sums[group_name]["v"][int(layer)]
+                    kv_heads = list(kv_heads_map[int(layer)])
+                    q_means[int(layer)] = {}
+                    for local_i, head_idx in enumerate(heads):
+                        entry = {}
+                        for source_name in ALL_SOURCES:
+                            arr = _mean_or_none(q_layer.get(source_name), n)
+                            if arr is None:
+                                raise ValueError(f"Missing Q mean for {group_name} layer {layer} {source_name}.")
+                            entry[source_name] = arr[local_i]
+                        extra_arr = _mean_or_none(q_layer.get("probability_extra"), n_extra)
+                        if extra_arr is not None:
+                            entry["probability_extra"] = extra_arr[local_i]
+                        q_means[int(layer)][int(head_idx)] = entry
+                    k_means[int(layer)] = {}
+                    v_means[int(layer)] = {}
+                    for local_i, kv_head in enumerate(kv_heads):
+                        k_entry: Dict[str, np.ndarray] = {}
+                        v_entry: Dict[str, np.ndarray] = {}
+                        for source_name in ALL_SOURCES:
+                            k_arr = _mean_or_none(k_layer.get(source_name), n)
+                            v_arr = _mean_or_none(v_layer.get(source_name), n)
+                            if k_arr is None or v_arr is None:
+                                raise ValueError(f"Missing K/V mean for {group_name} layer {layer} {source_name}.")
+                            k_entry[source_name] = k_arr[local_i]
+                            v_entry[source_name] = v_arr[local_i]
+                        k_extra = _mean_or_none(k_layer.get("probability_extra"), n_extra)
+                        v_extra = _mean_or_none(v_layer.get("probability_extra"), n_extra)
+                        if k_extra is not None:
+                            k_entry["probability_extra"] = k_extra[local_i]
+                        if v_extra is not None:
+                            v_entry["probability_extra"] = v_extra[local_i]
+                        k_means[int(layer)][int(kv_head)] = k_entry
+                        v_means[int(layer)][int(kv_head)] = v_entry
         mlp_means: Dict[int, Dict[str, np.ndarray]] = {}
         if mlp_layers:
             n = mlp_counts[group_name]
             n_extra = mlp_extra_counts[group_name]
+            mlp_label = "MLP-output" if site_is_output else "MLP-input"
             for layer in mlp_layers:
                 layer_sums = mlp_sums[group_name][int(layer)]
                 entry = {}
                 for source_name in ALL_SOURCES:
                     arr = _mean_or_none(layer_sums.get(source_name), n)
                     if arr is None:
-                        raise ValueError(f"Missing MLP-input mean for {group_name} layer {layer} {source_name}.")
+                        raise ValueError(
+                            f"Missing {mlp_label} mean for {group_name} layer {layer} {source_name}."
+                        )
                     entry[source_name] = arr
                 extra_arr = _mean_or_none(layer_sums.get("probability_extra"), n_extra)
                 if extra_arr is not None:
                     entry["probability_extra"] = extra_arr
                 mlp_means[int(layer)] = entry
-        packed[group_name] = {
-            "q": q_means,
-            "k": k_means,
-            "v": v_means,
+        attn_block_means: Dict[int, Dict[str, np.ndarray]] = {}
+        if attn_block_layers:
+            n = attn_block_counts[group_name]
+            n_extra = attn_block_extra_counts[group_name]
+            attn_block_label = "attn-block-output" if site_is_output else "attn-block-input"
+            for layer in attn_block_layers:
+                layer_sums = attn_block_sums[group_name][int(layer)]
+                entry = {}
+                for source_name in ALL_SOURCES:
+                    arr = _mean_or_none(layer_sums.get(source_name), n)
+                    if arr is None:
+                        raise ValueError(
+                            f"Missing {attn_block_label} mean for {group_name} layer {layer} {source_name}."
+                        )
+                    entry[source_name] = arr
+                extra_arr = _mean_or_none(layer_sums.get("probability_extra"), n_extra)
+                if extra_arr is not None:
+                    entry["probability_extra"] = extra_arr
+                attn_block_means[int(layer)] = entry
+        packed_group: Dict[str, object] = {
             "mlp": mlp_means,
-            "qkv_count": int(qkv_counts[group_name]),
             "mlp_count": int(mlp_counts[group_name]),
-            "qkv_extra_count": int(qkv_extra_counts[group_name]),
             "mlp_extra_count": int(mlp_extra_counts[group_name]),
+            "attn_block": attn_block_means,
+            "attn_block_count": int(attn_block_counts[group_name]),
+            "attn_block_extra_count": int(attn_block_extra_counts[group_name]),
+            "intervention_site": intervention_site,
         }
+        if site_is_output:
+            packed_group["z"] = z_means
+            packed_group["z_count"] = int(qkv_counts[group_name])
+            packed_group["z_extra_count"] = int(qkv_extra_counts[group_name])
+        else:
+            packed_group["q"] = q_means
+            packed_group["k"] = k_means
+            packed_group["v"] = v_means
+            packed_group["qkv_count"] = int(qkv_counts[group_name])
+            packed_group["qkv_extra_count"] = int(qkv_extra_counts[group_name])
+        packed[group_name] = packed_group
     logging.info(
-        "Finished streaming means. qkv_counts=%s mlp_counts=%s extra_qkv=%s extra_mlp=%s skipped_bad=%d",
+        "Finished streaming means. attn_counts=%s mlp_counts=%s attn_block_counts=%s "
+        "extra_attn=%s extra_mlp=%s extra_attn_block=%s skipped_bad=%d site=%s",
         qkv_counts,
         mlp_counts,
+        attn_block_counts,
         qkv_extra_counts,
         mlp_extra_counts,
+        attn_block_extra_counts,
         skipped_bad,
+        intervention_site,
     )
     return packed, selected_ids, h5_example_count
 
@@ -774,21 +1096,32 @@ def _to_torch_means(
             }
         return out
 
-    return {
-        "q": _convert_head_map(packed_group["q"]),  # type: ignore[arg-type]
-        "k": _convert_head_map(packed_group["k"]),  # type: ignore[arg-type]
-        "v": _convert_head_map(packed_group["v"]),  # type: ignore[arg-type]
+    converted = {
         "mlp": _convert_mlp_map(packed_group["mlp"]),  # type: ignore[arg-type]
-        "qkv_count": packed_group["qkv_count"],
         "mlp_count": packed_group["mlp_count"],
-        "qkv_extra_count": packed_group["qkv_extra_count"],
         "mlp_extra_count": packed_group["mlp_extra_count"],
+        "attn_block": _convert_mlp_map(packed_group.get("attn_block", {}) or {}),  # type: ignore[arg-type]
+        "attn_block_count": packed_group.get("attn_block_count", 0),
+        "attn_block_extra_count": packed_group.get("attn_block_extra_count", 0),
+        "intervention_site": packed_group.get("intervention_site", "input"),
     }
+    if "z" in packed_group:
+        converted["z"] = _convert_head_map(packed_group["z"])  # type: ignore[arg-type]
+        converted["z_count"] = packed_group["z_count"]
+        converted["z_extra_count"] = packed_group["z_extra_count"]
+        return converted
+    converted["q"] = _convert_head_map(packed_group["q"])  # type: ignore[arg-type]
+    converted["k"] = _convert_head_map(packed_group["k"])  # type: ignore[arg-type]
+    converted["v"] = _convert_head_map(packed_group["v"])  # type: ignore[arg-type]
+    converted["qkv_count"] = packed_group["qkv_count"]
+    converted["qkv_extra_count"] = packed_group["qkv_extra_count"]
+    return converted
 
 
 def _positions_and_replacements_for_mode(
     *,
     mode: str,
+    model_name: str,
     prompt_len: int,
     decoded_tokens: List[str],
     source_means: Dict[str, torch.Tensor],
@@ -808,6 +1141,18 @@ def _positions_and_replacements_for_mode(
         )
         n = min(len(positions), int(probability.shape[0]))
         return positions[:n], [probability[i] for i in range(n)]
+
+    if mode in PROBABILITY_ROW_INDEX_MODES:
+        row_indices = probability_row_indices_for_mode(mode, model_name)
+        positions = _absolute_prob_positions_at_row_indices(
+            prompt_len,
+            decoded_tokens,
+            row_indices,
+            expected_probability_tokens=expected_probability_tokens,
+        )
+        if not positions:
+            return [], []
+        return positions, [probability[i] for i in row_indices]
 
     if mode == "probability_last_token_mean_replace":
         positions = _absolute_prob_last_token_only_positions(
@@ -950,6 +1295,7 @@ def _positions_and_replacements_for_mode(
 def build_qkv_input_mean_replace_hooks(
     *,
     mode: str,
+    model_name: str,
     prompt_len: int,
     decoded_tokens_provider: Callable[[], List[str]],
     selected_heads_by_layer: Dict[int, Sequence[int]],
@@ -990,6 +1336,7 @@ def build_qkv_input_mean_replace_hooks(
                     )
                 positions, vectors = _positions_and_replacements_for_mode(
                     mode=mode,
+                    model_name=model_name,
                     prompt_len=prompt_len,
                     decoded_tokens=decoded_tokens,
                     source_means=head_means,
@@ -1064,12 +1411,24 @@ def _mlp_input_norm_module(model, layer: int):
     return block.ln2
 
 
+def _attn_input_norm_module(model, layer: int):
+    block = model.blocks[int(layer)]
+    if not hasattr(block, "ln1"):
+        raise ValueError(
+            f"Model block {layer} has no ln1 pre-attention RMSNorm. "
+            "Supported models expose TransformerLens ln1 "
+            "(HF input_layernorm on Mistral/Qwen/Gemma-3)."
+        )
+    return block.ln1
+
+
 @contextmanager
 def mlp_input_mean_replace_pre_hooks(
     model,
     *,
     mlp_layers: Sequence[int],
     mode: str,
+    model_name: str,
     prompt_len: int,
     decoded_tokens_provider: Callable[[], List[str]],
     mlp_means: Dict[int, Dict[str, torch.Tensor]],
@@ -1086,6 +1445,7 @@ def mlp_input_mean_replace_pre_hooks(
             x = args[0]
             positions, vectors = _positions_and_replacements_for_mode(
                 mode=mode,
+                model_name=model_name,
                 prompt_len=prompt_len,
                 decoded_tokens=decoded_tokens_provider(),
                 source_means=layer_means,
@@ -1122,15 +1482,267 @@ def mlp_input_mean_replace_pre_hooks(
             handle.remove()
 
 
-def greedy_generate_componentwise_input_mean_ablated(
+@contextmanager
+def attn_input_mean_replace_pre_hooks(
+    model,
+    *,
+    attn_block_layers: Sequence[int],
+    mode: str,
+    model_name: str,
+    prompt_len: int,
+    decoded_tokens_provider: Callable[[], List[str]],
+    attn_block_means: Dict[int, Dict[str, torch.Tensor]],
+    expected_guess_tokens: int,
+    expected_probability_tokens: int,
+) -> Iterator[None]:
+    handles = []
+
+    def _make_pre_hook(layer_means: Dict[str, torch.Tensor], local_layer: int) -> Callable:
+        def pre_hook(module, args):
+            del module
+            if not args:
+                return None
+            x = args[0]
+            positions, vectors = _positions_and_replacements_for_mode(
+                mode=mode,
+                model_name=model_name,
+                prompt_len=prompt_len,
+                decoded_tokens=decoded_tokens_provider(),
+                source_means=layer_means,
+                expected_guess_tokens=expected_guess_tokens,
+                expected_probability_tokens=expected_probability_tokens,
+            )
+            if not positions:
+                return None
+            x = x.clone()
+            for abs_pos, vector in zip(positions, vectors):
+                if 0 <= abs_pos < x.shape[1]:
+                    if int(vector.numel()) != int(x.shape[-1]):
+                        raise ValueError(
+                            f"Attn-block-input replacement size {vector.numel()} != d_model {x.shape[-1]} "
+                            f"at layer {local_layer}."
+                        )
+                    x[:, abs_pos, :] = vector.to(device=x.device, dtype=x.dtype)
+            if len(args) == 1:
+                return (x,)
+            return (x, *args[1:])
+
+        return pre_hook
+
+    try:
+        for layer in attn_block_layers:
+            module = _attn_input_norm_module(model, int(layer))
+            layer_means = attn_block_means.get(int(layer))
+            if layer_means is None:
+                raise ValueError(f"Missing attn-block-input means for layer {layer}.")
+            handles.append(module.register_forward_pre_hook(_make_pre_hook(layer_means, int(layer))))
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+def build_z_output_mean_replace_hooks(
+    *,
+    mode: str,
+    model_name: str,
+    prompt_len: int,
+    decoded_tokens_provider: Callable[[], List[str]],
+    selected_heads_by_layer: Dict[int, Sequence[int]],
+    z_means: Dict[int, Dict[int, Dict[str, torch.Tensor]]],
+    expected_guess_tokens: int,
+    expected_probability_tokens: int,
+) -> List[Tuple[str, Callable]]:
+    hooks: List[Tuple[str, Callable]] = []
+
+    def _make_z_hook(
+        *,
+        local_means: Dict[int, Dict[str, torch.Tensor]],
+        heads: List[int],
+        local_layer: int,
+    ) -> Callable:
+        def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
+            del hook
+            if activation.ndim != 4:
+                raise ValueError(
+                    "Expected hook_z activation with shape "
+                    f"[batch, seq, heads, d_head], got {tuple(activation.shape)}."
+                )
+            decoded_tokens = decoded_tokens_provider()
+            for head_idx in heads:
+                if not (0 <= head_idx < int(activation.shape[2])):
+                    raise ValueError(
+                        f"Z head index {head_idx} out of range for layer {local_layer} "
+                        f"with {int(activation.shape[2])} heads."
+                    )
+                head_means = local_means.get(head_idx)
+                if head_means is None:
+                    raise ValueError(
+                        f"Missing concat/hook_z means for layer {local_layer}, head {head_idx}."
+                    )
+                positions, vectors = _positions_and_replacements_for_mode(
+                    mode=mode,
+                    model_name=model_name,
+                    prompt_len=prompt_len,
+                    decoded_tokens=decoded_tokens,
+                    source_means=head_means,
+                    expected_guess_tokens=expected_guess_tokens,
+                    expected_probability_tokens=expected_probability_tokens,
+                )
+                for abs_pos, vector in zip(positions, vectors):
+                    if 0 <= abs_pos < activation.shape[1]:
+                        if int(vector.numel()) != int(activation.shape[3]):
+                            raise ValueError(
+                                f"hook_z replacement size {vector.numel()} != d_head {activation.shape[3]} "
+                                f"at layer {local_layer} head {head_idx}."
+                            )
+                        activation[:, abs_pos, head_idx, :] = vector.to(
+                            device=activation.device, dtype=activation.dtype
+                        )
+            return activation
+
+        return hook_fn
+
+    for layer, heads in selected_heads_by_layer.items():
+        z_heads = [int(h) for h in heads]
+        if not z_heads:
+            continue
+        layer_means = z_means.get(int(layer))
+        if layer_means is None:
+            raise ValueError(f"Missing concat/hook_z means for layer {layer}.")
+        hooks.append(
+            (
+                f"blocks.{int(layer)}.attn.hook_z",
+                _make_z_hook(
+                    local_means=layer_means,
+                    heads=z_heads,
+                    local_layer=int(layer),
+                ),
+            )
+        )
+    return hooks
+
+
+def build_mlp_output_mean_replace_hooks(
+    *,
+    mode: str,
+    model_name: str,
+    prompt_len: int,
+    decoded_tokens_provider: Callable[[], List[str]],
+    mlp_layers: Sequence[int],
+    mlp_means: Dict[int, Dict[str, torch.Tensor]],
+    expected_guess_tokens: int,
+    expected_probability_tokens: int,
+) -> List[Tuple[str, Callable]]:
+    hooks: List[Tuple[str, Callable]] = []
+
+    def _make_mlp_out_hook(layer_means: Dict[str, torch.Tensor], local_layer: int) -> Callable:
+        def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
+            del hook
+            positions, vectors = _positions_and_replacements_for_mode(
+                mode=mode,
+                model_name=model_name,
+                prompt_len=prompt_len,
+                decoded_tokens=decoded_tokens_provider(),
+                source_means=layer_means,
+                expected_guess_tokens=expected_guess_tokens,
+                expected_probability_tokens=expected_probability_tokens,
+            )
+            if not positions:
+                return activation
+            for abs_pos, vector in zip(positions, vectors):
+                if 0 <= abs_pos < activation.shape[1]:
+                    if int(vector.numel()) != int(activation.shape[-1]):
+                        raise ValueError(
+                            f"MLP-output replacement size {vector.numel()} != d_model {activation.shape[-1]} "
+                            f"at layer {local_layer}."
+                        )
+                    activation[:, abs_pos, :] = vector.to(
+                        device=activation.device, dtype=activation.dtype
+                    )
+            return activation
+
+        return hook_fn
+
+    for layer in mlp_layers:
+        layer_means = mlp_means.get(int(layer))
+        if layer_means is None:
+            raise ValueError(f"Missing MLP-output means for layer {layer}.")
+        hooks.append(
+            (
+                f"blocks.{int(layer)}.hook_mlp_out",
+                _make_mlp_out_hook(layer_means, int(layer)),
+            )
+        )
+    return hooks
+
+
+def build_attn_output_mean_replace_hooks(
+    *,
+    mode: str,
+    model_name: str,
+    prompt_len: int,
+    decoded_tokens_provider: Callable[[], List[str]],
+    attn_block_layers: Sequence[int],
+    attn_block_means: Dict[int, Dict[str, torch.Tensor]],
+    expected_guess_tokens: int,
+    expected_probability_tokens: int,
+) -> List[Tuple[str, Callable]]:
+    hooks: List[Tuple[str, Callable]] = []
+
+    def _make_attn_out_hook(layer_means: Dict[str, torch.Tensor], local_layer: int) -> Callable:
+        def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
+            del hook
+            positions, vectors = _positions_and_replacements_for_mode(
+                mode=mode,
+                model_name=model_name,
+                prompt_len=prompt_len,
+                decoded_tokens=decoded_tokens_provider(),
+                source_means=layer_means,
+                expected_guess_tokens=expected_guess_tokens,
+                expected_probability_tokens=expected_probability_tokens,
+            )
+            if not positions:
+                return activation
+            for abs_pos, vector in zip(positions, vectors):
+                if 0 <= abs_pos < activation.shape[1]:
+                    if int(vector.numel()) != int(activation.shape[-1]):
+                        raise ValueError(
+                            f"Attn-block-output replacement size {vector.numel()} != d_model "
+                            f"{activation.shape[-1]} at layer {local_layer}."
+                        )
+                    activation[:, abs_pos, :] = vector.to(
+                        device=activation.device, dtype=activation.dtype
+                    )
+            return activation
+
+        return hook_fn
+
+    for layer in attn_block_layers:
+        layer_means = attn_block_means.get(int(layer))
+        if layer_means is None:
+            raise ValueError(f"Missing attn-block-output means for layer {layer}.")
+        hooks.append(
+            (
+                f"blocks.{int(layer)}.hook_attn_out",
+                _make_attn_out_hook(layer_means, int(layer)),
+            )
+        )
+    return hooks
+
+
+def greedy_generate_componentwise_mean_ablated(
     model,
     local_prompt: str,
     max_new_tokens: int,
     *,
     mode: str,
+    model_name: str,
+    intervention_site: str,
     selected_heads_by_layer: Dict[int, Sequence[int]],
     selected_kv_heads: Dict[int, Sequence[int]],
     mlp_layers: Sequence[int],
+    attn_block_layers: Sequence[int],
     source_means: Dict[str, object],
     expected_guess_tokens: int,
     expected_probability_tokens: int,
@@ -1143,10 +1755,64 @@ def greedy_generate_componentwise_input_mean_ablated(
         return decoded_tokens
 
     hooks: List[Tuple[str, Callable]] = []
+    if intervention_site == "output":
+        if selected_heads_by_layer:
+            hooks.extend(
+                build_z_output_mean_replace_hooks(
+                    mode=mode,
+                    model_name=model_name,
+                    prompt_len=prompt_len,
+                    decoded_tokens_provider=_decoded_tokens_provider,
+                    selected_heads_by_layer=selected_heads_by_layer,
+                    z_means=source_means["z"],  # type: ignore[arg-type]
+                    expected_guess_tokens=expected_guess_tokens,
+                    expected_probability_tokens=expected_probability_tokens,
+                )
+            )
+        if attn_block_layers:
+            hooks.extend(
+                build_attn_output_mean_replace_hooks(
+                    mode=mode,
+                    model_name=model_name,
+                    prompt_len=prompt_len,
+                    decoded_tokens_provider=_decoded_tokens_provider,
+                    attn_block_layers=attn_block_layers,
+                    attn_block_means=source_means["attn_block"],  # type: ignore[arg-type]
+                    expected_guess_tokens=expected_guess_tokens,
+                    expected_probability_tokens=expected_probability_tokens,
+                )
+            )
+        if mlp_layers:
+            hooks.extend(
+                build_mlp_output_mean_replace_hooks(
+                    mode=mode,
+                    model_name=model_name,
+                    prompt_len=prompt_len,
+                    decoded_tokens_provider=_decoded_tokens_provider,
+                    mlp_layers=mlp_layers,
+                    mlp_means=source_means["mlp"],  # type: ignore[arg-type]
+                    expected_guess_tokens=expected_guess_tokens,
+                    expected_probability_tokens=expected_probability_tokens,
+                )
+            )
+        if not hooks:
+            raise ValueError(
+                "No attention heads, attention blocks, or MLP layers selected for "
+                "componentwise mean ablation."
+            )
+        return greedy_generate(
+            model=model,
+            local_prompt=local_prompt,
+            max_new_tokens=max_new_tokens,
+            fwd_hooks=hooks,
+            decoded_tokens_buffer=decoded_tokens,
+        )
+
     if selected_heads_by_layer:
         hooks.extend(
             build_qkv_input_mean_replace_hooks(
                 mode=mode,
+                model_name=model_name,
                 prompt_len=prompt_len,
                 decoded_tokens_provider=_decoded_tokens_provider,
                 selected_heads_by_layer=selected_heads_by_layer,
@@ -1158,23 +1824,40 @@ def greedy_generate_componentwise_input_mean_ablated(
                 expected_probability_tokens=expected_probability_tokens,
             )
         )
-    mlp_cm = (
-        mlp_input_mean_replace_pre_hooks(
-            model,
-            mlp_layers=mlp_layers,
-            mode=mode,
-            prompt_len=prompt_len,
-            decoded_tokens_provider=_decoded_tokens_provider,
-            mlp_means=source_means["mlp"],  # type: ignore[arg-type]
-            expected_guess_tokens=expected_guess_tokens,
-            expected_probability_tokens=expected_probability_tokens,
+    if not hooks and not mlp_layers and not attn_block_layers:
+        raise ValueError(
+            "No attention heads, attention blocks, or MLP layers selected for "
+            "componentwise mean ablation."
         )
-        if mlp_layers
-        else nullcontext()
-    )
-    if not hooks and not mlp_layers:
-        raise ValueError("No attention heads or MLP layers selected for input mean ablation.")
-    with mlp_cm:
+    with ExitStack() as stack:
+        if attn_block_layers:
+            stack.enter_context(
+                attn_input_mean_replace_pre_hooks(
+                    model,
+                    attn_block_layers=attn_block_layers,
+                    mode=mode,
+                    model_name=model_name,
+                    prompt_len=prompt_len,
+                    decoded_tokens_provider=_decoded_tokens_provider,
+                    attn_block_means=source_means["attn_block"],  # type: ignore[arg-type]
+                    expected_guess_tokens=expected_guess_tokens,
+                    expected_probability_tokens=expected_probability_tokens,
+                )
+            )
+        if mlp_layers:
+            stack.enter_context(
+                mlp_input_mean_replace_pre_hooks(
+                    model,
+                    mlp_layers=mlp_layers,
+                    mode=mode,
+                    model_name=model_name,
+                    prompt_len=prompt_len,
+                    decoded_tokens_provider=_decoded_tokens_provider,
+                    mlp_means=source_means["mlp"],  # type: ignore[arg-type]
+                    expected_guess_tokens=expected_guess_tokens,
+                    expected_probability_tokens=expected_probability_tokens,
+                )
+            )
         return greedy_generate(
             model=model,
             local_prompt=local_prompt,
@@ -1196,6 +1879,7 @@ def write_config_txt(
     ablate_layers: Sequence[int],
     selected_heads_by_layer: Dict[int, Sequence[int]],
     mlp_layers: Sequence[int],
+    attn_block_layers: Sequence[int],
     num_selected_layer_head_pairs: int,
     prompt_indices: Sequence[int],
     low_conf_count: int,
@@ -1205,6 +1889,8 @@ def write_config_txt(
     mlp_mean_counts: Dict[str, int],
     qkv_extra_counts: Dict[str, int],
     mlp_extra_counts: Dict[str, int],
+    attn_block_mean_counts: Dict[str, int],
+    attn_block_extra_counts: Dict[str, int],
     evaluated_counts: Dict[str, int],
     skipped_one_confidence: Dict[str, int],
     mode_confidence: Dict[str, Dict[str, RunningMean]],
@@ -1214,8 +1900,8 @@ def write_config_txt(
     finished_at: str,
 ) -> None:
     lines = [
-        "Componentwise Input Mean Ablation Configuration",
-        "==============================================",
+        "Componentwise Mean Ablation Configuration",
+        "========================================",
         "",
         "[Model]",
         f"model_name={args.model_name}",
@@ -1243,6 +1929,7 @@ def write_config_txt(
         f"use_context={args.use_context}",
         "",
         "[Ablation]",
+        f"intervention_site={args.intervention_site}",
         "mean_protocol=cross_group",
         "mean_source_for_low_confidence=high_confidence",
         "mean_source_for_high_confidence=low_confidence",
@@ -1250,10 +1937,11 @@ def write_config_txt(
         f"ablate_layers_spec={args.ablate_layers}",
         f"ablate_layers_resolved={','.join(str(layer) for layer in ablate_layers)}",
         f"ablate_heads_spec={args.ablate_heads}",
-        f"ablate_heads_resolved={format_ablate_units(selected_heads_by_layer, mlp_layers)}",
+        f"ablate_heads_resolved={format_ablate_units(selected_heads_by_layer, mlp_layers, attn_block_layers)}",
         f"num_ablated_layers={len(ablate_layers)}",
         f"num_ablated_layer_head_pairs={num_selected_layer_head_pairs}",
         f"num_ablated_mlp_layers={len(mlp_layers)}",
+        f"num_ablated_attn_blocks={len(attn_block_layers)}",
         f"ablation_unit={ABLATION_UNIT_KEY}",
         f"skip_one_confidence={args.skip_one_confidence}",
         f"expected_probability_tokens={args.expected_probability_tokens}",
@@ -1274,10 +1962,14 @@ def write_config_txt(
         f"high_conf_qkv_extra_mean_count={qkv_extra_counts.get('high_confidence', 0)}",
         f"low_conf_mlp_extra_mean_count={mlp_extra_counts.get('low_confidence', 0)}",
         f"high_conf_mlp_extra_mean_count={mlp_extra_counts.get('high_confidence', 0)}",
+        f"low_conf_attn_block_mean_count={attn_block_mean_counts.get('low_confidence', 0)}",
+        f"high_conf_attn_block_mean_count={attn_block_mean_counts.get('high_confidence', 0)}",
+        f"low_conf_attn_block_extra_mean_count={attn_block_extra_counts.get('low_confidence', 0)}",
+        f"high_conf_attn_block_extra_mean_count={attn_block_extra_counts.get('high_confidence', 0)}",
         "",
         "[Mode Confidence Metrics]",
         "Values below are running-mean verbalised confidence per group.",
-        "Ablated generations use the opposite group's component-input mean.",
+        "Ablated generations use the opposite group's component mean at intervention_site.",
         "Additional sections split each group by none-mode verbalised confidence",
         "(eq_1: exactly 1.0; lt_1: parsed and < 1.0).",
         "",
@@ -1323,12 +2015,14 @@ def build_summary(
     ablate_layers: Sequence[int],
     selected_heads_by_layer: Dict[int, Sequence[int]],
     mlp_layers: Sequence[int],
+    attn_block_layers: Sequence[int],
     num_selected_layer_head_pairs: int,
     low_conf_count: int,
     high_conf_count: int,
     h5_example_count: int,
     qkv_mean_counts: Dict[str, int],
     mlp_mean_counts: Dict[str, int],
+    attn_block_mean_counts: Dict[str, int],
     evaluated_counts: Dict[str, int],
     skipped_one_confidence: Dict[str, int],
     mode_confidence: Dict[str, Dict[str, RunningMean]],
@@ -1366,6 +2060,7 @@ def build_summary(
             "skipped_one_confidence_count": int(skipped_one_confidence.get(group_name, 0)),
             "qkv_mean_count": int(qkv_mean_counts.get(group_name, 0)),
             "mlp_mean_count": int(mlp_mean_counts.get(group_name, 0)),
+            "attn_block_mean_count": int(attn_block_mean_counts.get(group_name, 0)),
             "mean_source_group": OPPOSITE_GROUP[group_name],
             "modes": modes_out,
             "by_none_mode_confidence": none_mode_buckets,
@@ -1375,12 +2070,15 @@ def build_summary(
         "dataset": args.dataset,
         "input_h5": args.input_h5,
         "h5_example_count": h5_example_count,
+        "intervention_site": args.intervention_site,
         "mean_protocol": "cross_group",
         "ablate_layers": list(ablate_layers),
-        "ablate_heads": format_ablate_units(selected_heads_by_layer, mlp_layers),
+        "ablate_heads": format_ablate_units(selected_heads_by_layer, mlp_layers, attn_block_layers),
         "ablate_mlp_layers": list(mlp_layers),
+        "ablate_attn_block_layers": list(attn_block_layers),
         "num_ablated_layer_head_pairs": num_selected_layer_head_pairs,
         "num_ablated_mlp_layers": len(mlp_layers),
+        "num_ablated_attn_blocks": len(attn_block_layers),
         "ablation_modes": list(args.ablation_mode),
         "skip_one_confidence": bool(args.skip_one_confidence),
         "low_conf_threshold": args.low_conf_threshold,
@@ -1392,8 +2090,9 @@ def build_summary(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Simultaneous component-input mean ablation: patch selected head Q/K/V and/or "
-            "MLP RMSNorm inputs with the opposite confidence group's mean."
+            "Simultaneous componentwise mean ablation: patch selected head Q/K/V or hook_z, "
+            "whole attention blocks (ln1 / hook_attn_out), and/or MLP RMSNorm inputs or "
+            "hook_mlp_out with the opposite confidence group's mean."
         )
     )
     parser.add_argument("--model_name", type=str, default="mistralai/Mistral-7B-Instruct-v0.1")
@@ -1402,8 +2101,9 @@ def main() -> None:
         type=str,
         required=True,
         help=(
-            "Path to processed verbalised embedding H5 with q/k/v and res/attn fields "
-            "under embeddings_*."
+            "Path to processed verbalised embedding H5. Input site uses q/k/v, res (whole attn), "
+            "and res+attn (MLP); output site uses concat (hook_z), attn (hook_attn_out), "
+            "and mlp under embeddings_*."
         ),
     )
     parser.add_argument("--device", type=str, default=None)
@@ -1429,8 +2129,11 @@ def main() -> None:
         default=None,
         help=(
             "Optional comma-separated unit list. Attention heads use a<layer>.h<head> "
-            "(e.g. a24.h5); MLP subblocks use m<layer> (e.g. m30). "
-            "All listed units are mean-ablated simultaneously at their inputs. "
+            "(e.g. a24.h5); whole attention blocks use a<layer> (e.g. a24); "
+            "MLP subblocks use m<layer> (e.g. m30). "
+            "Whole-block a<layer> patches ln1 with H5 res (input) or hook_attn_out with H5 attn "
+            "(output; after ln1_post on sandwich Gemma). "
+            "All listed units are mean-ablated simultaneously at --intervention_site. "
             "When set, this selection takes precedence and --ablate_layers is ignored."
         ),
     )
@@ -1440,6 +2143,16 @@ def main() -> None:
         nargs="+",
         default=ABLATION_MODES_DEFAULT,
         choices=ABLATION_MODES_DEFAULT,
+    )
+    parser.add_argument(
+        "--intervention_site",
+        type=str,
+        default="input",
+        choices=list(INTERVENTION_SITES),
+        help=(
+            "Patch component inputs (Q/K/V, attn ln1 from H5 res, and MLP RMSNorm in) or outputs "
+            "(hook_z, hook_attn_out from H5 attn, and hook_mlp_out)."
+        ),
     )
     parser.add_argument("--low_conf_threshold", type=float, default=0.1)
     parser.add_argument("--high_conf_threshold", type=float, default=0.9)
@@ -1464,6 +2177,7 @@ def main() -> None:
         raise ValueError("Please include 'none' in --ablation_mode for baseline comparison.")
     if args.skip_one_confidence and "none" not in args.ablation_mode:
         raise ValueError("--skip_one_confidence requires 'none' in --ablation_mode.")
+    validate_last_a_panl_and_pc_mode(args.model_name, args.ablation_mode)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -1524,10 +2238,12 @@ def main() -> None:
         raise ValueError("No layers selected via --ablate_layers.")
 
     if args.ablate_heads:
-        selected_heads_by_layer, mlp_layers = parse_ablate_units(
+        selected_heads_by_layer, mlp_layers, attn_block_layers = parse_ablate_units(
             args.ablate_heads, n_layers=model_n_layers, n_heads=model_n_heads
         )
-        run_layers = sorted(set(selected_heads_by_layer.keys()) | set(mlp_layers))
+        run_layers = sorted(
+            set(selected_heads_by_layer.keys()) | set(mlp_layers) | set(attn_block_layers)
+        )
         if not run_layers:
             raise ValueError("No units selected via --ablate_heads.")
         logging.info(
@@ -1538,6 +2254,7 @@ def main() -> None:
         run_layers = sorted(ablate_layers_from_flag)
         selected_heads_by_layer = {layer: list(range(model_n_heads)) for layer in run_layers}
         mlp_layers = []
+        attn_block_layers = []
         logging.info(
             "No --ablate_heads provided; using all heads across --ablate_layers=%s.",
             args.ablate_layers,
@@ -1549,8 +2266,11 @@ def main() -> None:
             "No selected heads provided for layers in this run: "
             + ",".join(str(layer) for layer in missing_layer_heads)
         )
-    if not selected_heads_by_layer and not mlp_layers:
-        raise ValueError("No attention heads or MLP layers selected for input mean ablation.")
+    if not selected_heads_by_layer and not mlp_layers and not attn_block_layers:
+        raise ValueError(
+            "No attention heads, attention blocks, or MLP layers selected for "
+            "componentwise mean ablation."
+        )
 
     selected_kv_heads = (
         selected_kv_heads_by_layer(
@@ -1561,12 +2281,14 @@ def main() -> None:
         else {}
     )
     num_selected_layer_head_pairs = sum(len(heads) for heads in selected_heads_by_layer.values())
-    resolved_units = format_ablate_units(selected_heads_by_layer, mlp_layers)
+    resolved_units = format_ablate_units(selected_heads_by_layer, mlp_layers, attn_block_layers)
     logging.info(
-        "Ablating units=%s (%d layer-head pairs, %d mlp layers) at component inputs.",
+        "Ablating units=%s (%d layer-head pairs, %d attn blocks, %d mlp layers) at component %ss.",
         resolved_units,
         num_selected_layer_head_pairs,
+        len(attn_block_layers),
         len(mlp_layers),
+        args.intervention_site,
     )
     if MODES_NEEDING_PROBABILITY_EXTRA.intersection(args.ablation_mode):
         logging.info(
@@ -1578,6 +2300,7 @@ def main() -> None:
         args.input_h5,
         selected_heads_by_layer=selected_heads_by_layer,
         mlp_layers=mlp_layers,
+        attn_block_layers=attn_block_layers,
         n_heads=model_n_heads,
         n_kv_heads=model_n_kv_heads,
         d_head=model_d_head,
@@ -1588,6 +2311,7 @@ def main() -> None:
         high_conf_threshold=args.high_conf_threshold,
         split_id_to_index=split_id_to_index,
         split_targets=split_targets,
+        intervention_site=args.intervention_site,
     )
     used_ids = {
         ex_id
@@ -1602,20 +2326,36 @@ def main() -> None:
     low_conf_count = sum(len(ids) for ids in selected_ids_by_group["low_confidence"].values())
     high_conf_count = sum(len(ids) for ids in selected_ids_by_group["high_confidence"].values())
     qkv_mean_counts = {
-        group_name: int(packed_means[group_name]["qkv_count"]) for group_name in CONFIDENCE_GROUPS
+        group_name: int(
+            packed_means[group_name].get("z_count", packed_means[group_name].get("qkv_count", 0))
+        )
+        for group_name in CONFIDENCE_GROUPS
     }
     mlp_mean_counts = {
         group_name: int(packed_means[group_name]["mlp_count"]) for group_name in CONFIDENCE_GROUPS
     }
     qkv_extra_counts = {
-        group_name: int(packed_means[group_name]["qkv_extra_count"]) for group_name in CONFIDENCE_GROUPS
+        group_name: int(
+            packed_means[group_name].get(
+                "z_extra_count", packed_means[group_name].get("qkv_extra_count", 0)
+            )
+        )
+        for group_name in CONFIDENCE_GROUPS
     }
     mlp_extra_counts = {
         group_name: int(packed_means[group_name]["mlp_extra_count"]) for group_name in CONFIDENCE_GROUPS
     }
+    attn_block_mean_counts = {
+        group_name: int(packed_means[group_name].get("attn_block_count", 0))
+        for group_name in CONFIDENCE_GROUPS
+    }
+    attn_block_extra_counts = {
+        group_name: int(packed_means[group_name].get("attn_block_extra_count", 0))
+        for group_name in CONFIDENCE_GROUPS
+    }
     logging.info(
         "H5 has %d examples. selected low_conf=%d (<=%.3f), high_conf=%d (>=%.3f). "
-        "QKV mean n=%s MLP-input mean n=%s.",
+        "QKV/concat mean n=%s MLP mean n=%s attn_block mean n=%s site=%s.",
         h5_example_count,
         low_conf_count,
         args.low_conf_threshold,
@@ -1623,6 +2363,8 @@ def main() -> None:
         args.high_conf_threshold,
         qkv_mean_counts,
         mlp_mean_counts,
+        attn_block_mean_counts,
+        args.intervention_site,
     )
     group_torch_means = {
         group_name: _to_torch_means(packed_means[group_name], device=device, torch_dtype=torch_dtype)
@@ -1641,12 +2383,14 @@ def main() -> None:
         source_group = OPPOSITE_GROUP[group_name]
         source_means = group_torch_means[source_group]
         logging.info(
-            "Ablating group=%s (%d selected H5 ids) with %s input means; "
-            "%d heads and %d MLP layers patched simultaneously.",
+            "Ablating group=%s (%d selected H5 ids) with %s %s means; "
+            "%d heads, %d attn blocks, and %d MLP layers patched simultaneously.",
             group_name,
             sum(len(ids) for ids in selected_ids_by_group[group_name].values()),
             source_group,
+            args.intervention_site,
             num_selected_layer_head_pairs,
+            len(attn_block_layers),
             len(mlp_layers),
         )
         for split_name, eval_ds in [("train", train_ds), ("validation", val_ds)]:
@@ -1722,14 +2466,17 @@ def main() -> None:
                     if skip_remaining_modes:
                         continue
 
-                    response, _ = greedy_generate_componentwise_input_mean_ablated(
+                    response, _ = greedy_generate_componentwise_mean_ablated(
                         model=model,
                         local_prompt=local_prompt,
                         max_new_tokens=args.model_max_new_tokens,
                         mode=mode_name,
+                        model_name=args.model_name,
+                        intervention_site=args.intervention_site,
                         selected_heads_by_layer=selected_heads_by_layer,
                         selected_kv_heads=selected_kv_heads,
                         mlp_layers=mlp_layers,
+                        attn_block_layers=attn_block_layers,
                         source_means=source_means,
                         expected_guess_tokens=args.expected_guess_tokens,
                         expected_probability_tokens=args.expected_probability_tokens,
@@ -1816,6 +2563,7 @@ def main() -> None:
         ablate_layers=run_layers,
         selected_heads_by_layer=selected_heads_by_layer,
         mlp_layers=mlp_layers,
+        attn_block_layers=attn_block_layers,
         num_selected_layer_head_pairs=num_selected_layer_head_pairs,
         prompt_indices=prompt_indices,
         low_conf_count=low_conf_count,
@@ -1825,6 +2573,8 @@ def main() -> None:
         mlp_mean_counts=mlp_mean_counts,
         qkv_extra_counts=qkv_extra_counts,
         mlp_extra_counts=mlp_extra_counts,
+        attn_block_mean_counts=attn_block_mean_counts,
+        attn_block_extra_counts=attn_block_extra_counts,
         evaluated_counts=evaluated_counts,
         skipped_one_confidence=skipped_one_confidence,
         mode_confidence=mode_confidence,
@@ -1842,12 +2592,14 @@ def main() -> None:
                 ablate_layers=run_layers,
                 selected_heads_by_layer=selected_heads_by_layer,
                 mlp_layers=mlp_layers,
+                attn_block_layers=attn_block_layers,
                 num_selected_layer_head_pairs=num_selected_layer_head_pairs,
                 low_conf_count=low_conf_count,
                 high_conf_count=high_conf_count,
                 h5_example_count=h5_example_count,
                 qkv_mean_counts=qkv_mean_counts,
                 mlp_mean_counts=mlp_mean_counts,
+                attn_block_mean_counts=attn_block_mean_counts,
                 evaluated_counts=evaluated_counts,
                 skipped_one_confidence=skipped_one_confidence,
                 mode_confidence=mode_confidence,

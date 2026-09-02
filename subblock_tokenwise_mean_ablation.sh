@@ -37,7 +37,7 @@ python3 ./subblock_tokenwise_mean_ablation/run_subblock_tokenwise_mean_ablation.
   --expected_guess_tokens 3 \
   --expected_probability_tokens 5 \
   --extend_probability_span \
-  --no-mean_from_low_confidence
+  --ablate_with_same_confidence \
 
 # N.B. num_samples refer to the max number of iterations to perform, not limiting
 # the mean vector computation

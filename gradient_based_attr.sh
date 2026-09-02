@@ -16,11 +16,11 @@ source /vol/cuda/13.0.0/setup.sh
 uptime
 
 python3 ./gradient_based_attr/run_gradient_based_attr.py \
-  --model_name google/gemma-3-12b-it \
-  --input_h5 ./process_generations/processed_generations_more_h5/new_gemma/4_trivia_gemma_extended_with_concat_3000_train/balanced/train_verbalised_embeddings.h5 \
+  --model_name mistralai/Mistral-7B-Instruct-v0.1 \
+  --input_h5 ./process_generations/processed_generations_more_h5/mistral/2_200_9_prob_toks/train_verbalised_embeddings.h5 \
   --device cuda:0 \
   --dtype bfloat16 \
-  --expected_probability_tokens 5 \
+  --expected_probability_tokens 7 \
   --max_examples_for_mean 50 \
   --granularity coarse fine
 

@@ -70,6 +70,7 @@ NONE_MODE_CONFIDENCE_BUCKET_LABELS = {
 }
 ABLATION_UNIT_KEY = "selected_layer_heads"
 _ATTN_UNIT_RE = re.compile(r"^a(\d+)\.h(\d+)$")
+_ATTN_BLOCK_UNIT_RE = re.compile(r"^a(\d+)$")
 _MLP_UNIT_RE = re.compile(r"^m(\d+)$")
 _OLD_LAYER_HEAD_RE = re.compile(r"^\d+\.\d+$")
 ABLATION_MODES_DEFAULT = [
@@ -390,15 +391,16 @@ def _mode_positions_provider_builder(
 
 def parse_ablate_units(
     spec: str, *, n_layers: int, n_heads: int
-) -> Tuple[Dict[int, List[int]], List[int]]:
+) -> Tuple[Dict[int, List[int]], List[int], List[int]]:
     raw = (spec or "").strip()
     if not raw:
         raise ValueError(
             "--ablate_heads must be a non-empty comma-separated list of "
-            "a<layer>.h<head> and/or m<layer> tokens, e.g. 'a24.h5,m30'."
+            "a<layer>, a<layer>.h<head>, and/or m<layer> tokens, e.g. 'a24,a24.h5,m30'."
         )
     heads_by_layer: Dict[int, Set[int]] = {}
     mlp_layers: Set[int] = set()
+    attn_block_layers: Set[int] = set()
     for token in raw.split(","):
         item = token.strip()
         if not item:
@@ -407,10 +409,12 @@ def parse_ablate_units(
             layer_str, head_str = item.split(".", 1)
             raise ValueError(
                 f"Invalid unit {item!r}. The old <layer>.<head> format is no longer supported; "
-                f"use a<layer>.h<head> for attention heads (e.g. a{layer_str}.h{head_str}) "
+                f"use a<layer>.h<head> for attention heads (e.g. a{layer_str}.h{head_str}), "
+                f"a<layer> for whole attention blocks (e.g. a24), "
                 f"or m<layer> for MLP subblocks (e.g. m30)."
             )
         attn_match = _ATTN_UNIT_RE.fullmatch(item)
+        attn_block_match = _ATTN_BLOCK_UNIT_RE.fullmatch(item)
         mlp_match = _MLP_UNIT_RE.fullmatch(item)
         if attn_match:
             layer_idx = int(attn_match.group(1))
@@ -421,6 +425,12 @@ def parse_ablate_units(
                 raise ValueError(f"Head index {head_idx} out of range [0, {n_heads}).")
             heads_by_layer.setdefault(layer_idx, set()).add(head_idx)
             continue
+        if attn_block_match:
+            layer_idx = int(attn_block_match.group(1))
+            if layer_idx < 0 or layer_idx >= n_layers:
+                raise ValueError(f"Layer index {layer_idx} out of range [0, {n_layers}).")
+            attn_block_layers.add(layer_idx)
+            continue
         if mlp_match:
             layer_idx = int(mlp_match.group(1))
             if layer_idx < 0 or layer_idx >= n_layers:
@@ -428,22 +438,34 @@ def parse_ablate_units(
             mlp_layers.add(layer_idx)
             continue
         raise ValueError(
-            f"Invalid unit {item!r}. Expected a<layer>.h<head> (e.g. a24.h5) "
-            f"or m<layer> (e.g. m30)."
+            f"Invalid unit {item!r}. Expected a<layer> (e.g. a24), "
+            f"a<layer>.h<head> (e.g. a24.h5), or m<layer> (e.g. m30)."
         )
-    if not heads_by_layer and not mlp_layers:
-        raise ValueError("No valid a<layer>.h<head> or m<layer> entries found in --ablate_heads.")
+    overlap = sorted(set(attn_block_layers) & set(heads_by_layer))
+    if overlap:
+        raise ValueError(
+            "Cannot mix whole-attention-block a<layer> with per-head a<layer>.h<head> "
+            "on the same layer(s): " + ",".join(f"a{layer}" for layer in overlap) + "."
+        )
+    if not heads_by_layer and not mlp_layers and not attn_block_layers:
+        raise ValueError(
+            "No valid a<layer>, a<layer>.h<head>, or m<layer> entries found in --ablate_heads."
+        )
     return (
         {layer: sorted(heads) for layer, heads in sorted(heads_by_layer.items())},
         sorted(mlp_layers),
+        sorted(attn_block_layers),
     )
 
 
 def format_ablate_units(
     selected_heads_by_layer: Dict[int, Sequence[int]],
     mlp_layers: Sequence[int],
+    attn_block_layers: Sequence[int] = (),
 ) -> str:
     parts: List[str] = []
+    for layer_idx in sorted(set(int(layer) for layer in attn_block_layers)):
+        parts.append(f"a{layer_idx}")
     for layer_idx in sorted(selected_heads_by_layer):
         for head_idx in sorted(set(int(h) for h in selected_heads_by_layer[layer_idx])):
             parts.append(f"a{layer_idx}.h{head_idx}")
@@ -873,8 +895,10 @@ def main() -> None:
         default=None,
         help=(
             "Optional comma-separated unit list. Attention heads use a<layer>.h<head> "
-            "(e.g. a24.h5); MLP subblocks use m<layer> (e.g. m30). "
+            "(e.g. a24.h5); whole attention blocks use a<layer> (e.g. a24); "
+            "MLP subblocks use m<layer> (e.g. m30). "
             "All listed units are zero-ablated simultaneously. "
+            "Whole-block a<layer> units are not supported in this script. "
             "When set, this selection takes precedence and --ablate_layers is ignored."
         ),
     )
@@ -995,9 +1019,15 @@ def main() -> None:
         raise ValueError("No layers selected via --ablate_layers.")
 
     if args.ablate_heads:
-        selected_heads_by_layer, mlp_layers = parse_ablate_units(
+        selected_heads_by_layer, mlp_layers, attn_block_layers = parse_ablate_units(
             args.ablate_heads, n_layers=model_n_layers, n_heads=model_n_heads
         )
+        if attn_block_layers:
+            raise ValueError(
+                "Whole-attention-block units a<layer> (e.g. a24) are not supported in "
+                "headwise zero ablation; use a<layer>.h<head> for heads or m<layer> for MLP, "
+                "or run componentwise mean ablation / mass-mean shift for whole attn blocks."
+            )
         run_layers = sorted(set(selected_heads_by_layer.keys()) | set(mlp_layers))
         if not run_layers:
             raise ValueError("No units selected via --ablate_heads.")
@@ -1009,6 +1039,7 @@ def main() -> None:
         run_layers = sorted(ablate_layers_from_flag)
         selected_heads_by_layer = {layer: list(range(model_n_heads)) for layer in run_layers}
         mlp_layers = []
+        attn_block_layers = []
         logging.info(
             "No --ablate_heads provided; using all heads across --ablate_layers=%s.",
             args.ablate_layers,

@@ -20,10 +20,12 @@ post-attn RMSNorm on sandwich Gemma-3; ``o_proj`` out on Mistral/Qwen) and
 ``hook_mlp_out`` (H5 ``mlp[L]``; after ``ln2_post`` / post-FFN norm on sandwich
 Gemma-3). Fine attention reconstructs per-head addend pieces like
 ``gradient_based_attr`` (``z`` through ``W_O``, then a shared post-attn RMS
-scale on Gemma) and allocates H5 ``attn[L]`` across those pieces. That rebuild
-detaches ``hook_z``, so it cannot share a graph with ``hook_q/k/v_input``.
-Coarse ``L*_attn`` is ``⟨∇_addend, d_attn⟩``, equal to the sum of fine head
-scores. Those results nest under ``component_output/``.
+scale on Gemma) and scores each head with its own mass-mean direction
+``d_h`` (H5 concat through ``W_O``, sandwich ``ln1_post`` applied per
+example before averaging). That rebuild detaches ``hook_z``, so it cannot
+share a graph with ``hook_q/k/v_input``. Coarse ``L*_attn`` is
+``⟨∇_addend, d_attn⟩``; fine head ``h`` is ``⟨∇_post_h, d_h⟩``. Those
+results nest under ``component_output/``.
 
 Numeric runs use pre-period and post-period digits. Linguistic Confidence
 (``--linguistic_confidence_prompt``, Mistral only) uses the variable-length
@@ -59,7 +61,7 @@ from ans_gen.generate_answers_h5 import (
     CONFIDENCE_PROMPT,
     CONFIDENCE_PROMPT_LINGUISTIC,
 )
-from componentwise_input_mean_ablation.run_componentwise_input_mean_ablation import (
+from componentwise_mean_ablation.run_componentwise_mean_ablation import (
     _h5_node_type,
     _mlp_input_row,
     _read_layer_hidden_dataset,
@@ -98,7 +100,9 @@ from direct_logit_attribution.run_direct_logit_attribution import (
     component_labels_fine,
     high_low_digit_sets,
     linguistic_first_tokens_for_model,
+    invert_square_o_proj,
     parse_individual_ids,
+    recover_concat_from_o,
     resolve_all_digit_ids,
     resolve_linguistic_first_token_ids,
     resolve_single_piece_token_id,
@@ -110,7 +114,6 @@ from direct_logit_attribution.run_direct_logit_attribution import (
 L_VS_UN_SPAN_INDEX = 6
 COMPONENT_OUTPUT_SUBDIR = "component_output"
 ATTN_OUT_RESUM_ATOL = 5e-2
-ATTN_HEAD_ALLOC_EPS = 1e-8
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +129,21 @@ class SiteDirections:
     n_low: int
     attn_out: np.ndarray  # [n_layers, d_model] from H5 attn[L]
     mlp_out: np.ndarray  # [n_layers, d_model] from H5 mlp[L]
+    attn_heads: np.ndarray | None = None  # [n_layers, n_heads, d_model] post-norm writes
+
+
+@dataclass
+class AttnHeadWriteSpec:
+    """Per-layer W_O / optional sandwich RMSNorm for H5 concat → residual writes."""
+
+    n_heads: int
+    d_head: int
+    d_model: int
+    w_o: np.ndarray  # [n_heads, d_head, d_model]
+    b_o: np.ndarray | None
+    rms_weight: np.ndarray | None  # [d_model]; None if no ln1_post
+    rms_eps: float
+    rms_use_one_plus: bool
 
 
 def _probability_component_group(r0: h5py.Group, component: str) -> h5py.Group | None:
@@ -206,6 +224,163 @@ def _subblock_out_all_layers(
     return np.asarray(hidden[: int(n_layers)], dtype=np.float32)
 
 
+def _concat_all_layers(
+    hidden: np.ndarray, *, n_layers: int, concat_width: int, name: str
+) -> np.ndarray:
+    if hidden.ndim != 2:
+        raise ValueError(f"Expected {name} [layers, concat_width], got {hidden.shape}.")
+    if int(hidden.shape[0]) < int(n_layers):
+        raise ValueError(
+            f"{name} has {hidden.shape[0]} layer rows; need at least n_layers={n_layers}."
+        )
+    if int(hidden.shape[1]) != int(concat_width):
+        raise ValueError(
+            f"{name} width {hidden.shape[1]} != n_heads*d_head={concat_width}."
+        )
+    return np.asarray(hidden[: int(n_layers)], dtype=np.float32)
+
+
+def _try_read_probability_token_hidden(
+    r0: h5py.Group, component: str, span_index: int
+) -> np.ndarray | None:
+    if _probability_component_group(r0, component) is None:
+        return None
+    try:
+        return _read_probability_token_hidden(r0, component, span_index)
+    except (TypeError, ValueError, OSError, KeyError):
+        return None
+
+
+def _o_proj_weight_from_w_o(w_o: np.ndarray) -> np.ndarray:
+    """TL ``W_O`` ``[n_heads, d_head, d_model]`` → HF ``o_proj.weight`` ``[d_model, n_heads*d_head]``."""
+    n_heads, d_head, d_model = w_o.shape
+    return np.transpose(w_o.reshape(n_heads * d_head, d_model), (1, 0))
+
+
+def _maybe_invert_o_proj_weights(
+    specs: Sequence[AttnHeadWriteSpec],
+) -> list[np.ndarray]:
+    invs: list[np.ndarray] = []
+    for layer, spec in enumerate(specs):
+        w = _o_proj_weight_from_w_o(spec.w_o)
+        expected_in = int(spec.n_heads) * int(spec.d_head)
+        if int(spec.d_model) != expected_in:
+            raise ValueError(
+                "concat embeddings are missing; recovering concat from o requires "
+                "square W_O (d_model == n_heads*d_head), got "
+                f"d_model={spec.d_model}, n_heads*d_head={expected_in} at layer {layer}."
+            )
+        invs.append(invert_square_o_proj(w, layer_idx=layer))
+    return invs
+
+
+def numpy_post_heads_from_concat(
+    concat_layer: np.ndarray,
+    spec: AttnHeadWriteSpec,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Post-norm per-head residual writes and their reconstructed addend.
+
+    Matches the live ``hook_z`` rebuild: ``z_h @ W_O[h]``, shared ``ln1_post``
+    scale from ``sum_h write_h + b_O`` on sandwich Gemma, bias added only to the
+    total.
+    """
+    expected = int(spec.n_heads) * int(spec.d_head)
+    vec = np.asarray(concat_layer, dtype=np.float32)
+    if vec.ndim != 1 or int(vec.shape[0]) != expected:
+        raise ValueError(
+            f"concat width {None if vec.ndim != 1 else int(vec.shape[0])} "
+            f"!= n_heads*d_head={expected}."
+        )
+    z = vec.reshape(int(spec.n_heads), int(spec.d_head))
+    writes = np.einsum("hd,hde->he", z, spec.w_o.astype(np.float32, copy=False))
+    total_pre = writes.sum(axis=0)
+    if spec.b_o is not None:
+        total_pre = total_pre + spec.b_o.astype(np.float32, copy=False)
+    if spec.rms_weight is None:
+        return writes.astype(np.float32, copy=False), total_pre.astype(
+            np.float32, copy=False
+        )
+    total_f = total_pre.astype(np.float64, copy=False)
+    inv = 1.0 / np.sqrt(np.mean(np.square(total_f)) + float(spec.rms_eps))
+    w = spec.rms_weight.astype(np.float64, copy=False)
+    gamma = (1.0 + w) if spec.rms_use_one_plus else w
+    scale = (inv * gamma).astype(np.float32)
+    post_heads = writes * scale
+    total_post = post_heads.sum(axis=0)
+    if spec.b_o is not None:
+        total_post = total_post + spec.b_o.astype(np.float32, copy=False) * scale
+    return post_heads.astype(np.float32, copy=False), total_post.astype(
+        np.float32, copy=False
+    )
+
+
+def _read_concat_or_o_hidden(
+    r0: h5py.Group,
+    span_index: int,
+    specs: Sequence[AttnHeadWriteSpec],
+    *,
+    o_proj_invs: list[np.ndarray] | None,
+    used_o_fallback: list[bool],
+) -> np.ndarray | None:
+    n_layers = len(specs)
+    concat_width = int(specs[0].n_heads) * int(specs[0].d_head)
+    raw = _try_read_probability_token_hidden(r0, "concat", span_index)
+    if raw is not None:
+        return _concat_all_layers(
+            raw, n_layers=n_layers, concat_width=concat_width, name="concat"
+        )
+    o_raw = _try_read_probability_token_hidden(r0, "o", span_index)
+    if o_raw is None:
+        return None
+    if o_proj_invs is None:
+        return None
+    o_h = _subblock_out_all_layers(
+        o_raw, n_layers=n_layers, d_model=int(specs[0].d_model), name="o"
+    )
+    if not used_o_fallback[0]:
+        used_o_fallback[0] = True
+        logging.warning(
+            "concat embeddings missing; recovering concat from o via inv(W_O)."
+        )
+    rows = [
+        recover_concat_from_o(o_h[layer], o_proj_invs[layer])
+        for layer in range(n_layers)
+    ]
+    return np.stack(rows, axis=0).astype(np.float32, copy=False)
+
+
+def _post_heads_all_layers(
+    concat_hidden: np.ndarray,
+    attn_out: np.ndarray,
+    specs: Sequence[AttnHeadWriteSpec],
+    *,
+    resum_warned: set[int],
+    resum_fail_counts: dict[int, int],
+    context: str,
+) -> np.ndarray:
+    n_layers = len(specs)
+    n_heads = int(specs[0].n_heads)
+    d_model = int(specs[0].d_model)
+    out = np.zeros((n_layers, n_heads, d_model), dtype=np.float32)
+    for layer, spec in enumerate(specs):
+        heads, total = numpy_post_heads_from_concat(concat_hidden[layer], spec)
+        out[layer] = heads
+        delta = float(np.max(np.abs(total - attn_out[layer].astype(np.float32))))
+        if delta > ATTN_OUT_RESUM_ATOL:
+            resum_fail_counts[layer] = int(resum_fail_counts.get(layer, 0)) + 1
+            if layer not in resum_warned:
+                resum_warned.add(layer)
+                logging.warning(
+                    "Attn-addend H5 rebuild soft-fail %s layer=%d: "
+                    "max |sum_h post_h (+ scaled b_O) - attn|=%.6g > atol=%g.",
+                    context,
+                    layer,
+                    delta,
+                    ATTN_OUT_RESUM_ATOL,
+                )
+    return out
+
+
 def _token_is_l_or_un(decoded_tokens: Sequence[str], span_index: int) -> bool:
     parsed = parse_guess_and_probability_indices(
         list(decoded_tokens), linguistic_confidence_prompt=True
@@ -278,10 +453,29 @@ def compute_mass_mean_directions(
     low_conf_threshold: float,
     exclude_conf_one_positions: Sequence[str],
     require_l_or_un_positions: Sequence[str],
+    head_write_specs: Sequence[AttnHeadWriteSpec] | None = None,
 ) -> dict[str, SiteDirections]:
     """Stream all high/low H5 examples; d = high_mean - low_mean at each site."""
     exclude_one = set(exclude_conf_one_positions)
     require_lu = set(require_l_or_un_positions)
+    need_heads = head_write_specs is not None
+    if need_heads:
+        assert head_write_specs is not None
+        if len(head_write_specs) != int(n_layers):
+            raise ValueError(
+                f"head_write_specs has {len(head_write_specs)} layers; "
+                f"expected n_layers={n_layers}."
+            )
+        for spec in head_write_specs:
+            if int(spec.d_model) != int(d_model):
+                raise ValueError(
+                    f"Head-write spec d_model={spec.d_model} != d_model={d_model}."
+                )
+    o_proj_invs: list[np.ndarray] | None = None
+    used_o_fallback = [False]
+    resum_warned: set[int] = set()
+    resum_fail_counts: dict[int, int] = {}
+    skipped_no_head_src = 0
     sums: dict[str, dict[str, dict[str, np.ndarray]]] = {
         pos: {
             "high": {},
@@ -336,6 +530,44 @@ def compute_mass_mean_directions(
                         n_layers=n_layers,
                         d_model=d_model,
                     )
+                    attn_heads_ex: np.ndarray | None = None
+                    if head_write_specs is not None:
+                        concat_h = _read_concat_or_o_hidden(
+                            r0,
+                            span_index,
+                            head_write_specs,
+                            o_proj_invs=o_proj_invs,
+                            used_o_fallback=used_o_fallback,
+                        )
+                        if concat_h is None:
+                            if (
+                                o_proj_invs is None
+                                and _try_read_probability_token_hidden(
+                                    r0, "o", span_index
+                                )
+                                is not None
+                            ):
+                                o_proj_invs = _maybe_invert_o_proj_weights(
+                                    head_write_specs
+                                )
+                                concat_h = _read_concat_or_o_hidden(
+                                    r0,
+                                    span_index,
+                                    head_write_specs,
+                                    o_proj_invs=o_proj_invs,
+                                    used_o_fallback=used_o_fallback,
+                                )
+                        if concat_h is None:
+                            skipped_no_head_src += 1
+                            continue
+                        attn_heads_ex = _post_heads_all_layers(
+                            concat_h,
+                            attn_out,
+                            head_write_specs,
+                            resum_warned=resum_warned,
+                            resum_fail_counts=resum_fail_counts,
+                            context=f"ex={ex_id} pos={pos}",
+                        )
                 except (TypeError, ValueError, OSError, KeyError) as exc:
                     skipped_bad += 1
                     logging.debug("Skip direction example %s pos=%s: %s", ex_id, pos, exc)
@@ -347,11 +579,17 @@ def compute_mass_mean_directions(
                         bucket["mlp"] = np.array(mlp_in, dtype=np.float64, copy=True)
                         bucket["attn_out"] = np.array(attn_out, dtype=np.float64, copy=True)
                         bucket["mlp_out"] = np.array(mlp_out, dtype=np.float64, copy=True)
+                        if attn_heads_ex is not None:
+                            bucket["attn_heads"] = np.array(
+                                attn_heads_ex, dtype=np.float64, copy=True
+                            )
                     else:
                         bucket["resid_pre"] += resid_pre
                         bucket["mlp"] += mlp_in
                         bucket["attn_out"] += attn_out
                         bucket["mlp_out"] += mlp_out
+                        if attn_heads_ex is not None:
+                            bucket["attn_heads"] += attn_heads_ex
                     counts[pos][group] += 1
 
     out: dict[str, SiteDirections] = {}
@@ -359,9 +597,23 @@ def compute_mass_mean_directions(
         n_high = int(counts[pos]["high"])
         n_low = int(counts[pos]["low"])
         if n_high < 1:
-            raise ValueError(f"No high-confidence examples for mass-mean at {pos!r}.")
+            extra = (
+                f" ({skipped_no_head_src} examples lacked concat and o)"
+                if skipped_no_head_src
+                else ""
+            )
+            raise ValueError(
+                f"No high-confidence examples for mass-mean at {pos!r}.{extra}"
+            )
         if n_low < 1:
-            raise ValueError(f"No low-confidence examples for mass-mean at {pos!r}.")
+            extra = (
+                f" ({skipped_no_head_src} examples lacked concat and o)"
+                if skipped_no_head_src
+                else ""
+            )
+            raise ValueError(
+                f"No low-confidence examples for mass-mean at {pos!r}.{extra}"
+            )
         high = sums[pos]["high"]
         low = sums[pos]["low"]
         resid_pre = ((high["resid_pre"] / n_high) - (low["resid_pre"] / n_low)).astype(
@@ -374,6 +626,24 @@ def compute_mass_mean_directions(
         mlp_out = ((high["mlp_out"] / n_high) - (low["mlp_out"] / n_low)).astype(
             np.float32
         )
+        attn_heads = None
+        if need_heads:
+            if "attn_heads" not in high or "attn_heads" not in low:
+                raise ValueError(
+                    f"No per-head concat/o writes for mass-mean at {pos!r}."
+                )
+            attn_heads = (
+                (high["attn_heads"] / n_high) - (low["attn_heads"] / n_low)
+            ).astype(np.float32)
+            head_sum = attn_heads.sum(axis=1)
+            completeness = float(np.max(np.abs(head_sum - attn_out)))
+            logging.info(
+                "Mass-mean head completeness %s: max |sum_h d_h - d_attn|=%.6g "
+                "(n_heads=%d)",
+                pos,
+                completeness,
+                int(attn_heads.shape[1]),
+            )
         out[pos] = SiteDirections(
             resid_pre=resid_pre,
             mlp=mlp,
@@ -381,10 +651,11 @@ def compute_mass_mean_directions(
             n_low=n_low,
             attn_out=attn_out,
             mlp_out=mlp_out,
+            attn_heads=attn_heads,
         )
         logging.info(
             "Mass-mean direction %s: n_high=%d n_low=%d resid_pre=%s mlp=%s "
-            "attn_out=%s mlp_out=%s",
+            "attn_out=%s mlp_out=%s attn_heads=%s",
             pos,
             n_high,
             n_low,
@@ -392,9 +663,20 @@ def compute_mass_mean_directions(
             tuple(mlp.shape),
             tuple(attn_out.shape),
             tuple(mlp_out.shape),
+            None if attn_heads is None else tuple(attn_heads.shape),
         )
     if skipped_bad:
         logging.info("Direction stream skipped %d unreadable site rows.", skipped_bad)
+    if skipped_no_head_src:
+        logging.info(
+            "Direction stream skipped %d examples missing concat and o for head writes.",
+            skipped_no_head_src,
+        )
+    if resum_fail_counts:
+        logging.info(
+            "Attn-addend H5 rebuild soft-fail counts by layer: %s",
+            dict(sorted(resum_fail_counts.items())),
+        )
     del sums
     gc.collect()
     return out
@@ -409,6 +691,8 @@ def save_directions_npz(path: Path, directions: dict[str, SiteDirections]) -> No
         payload[f"{pos}__mlp_out"] = d.mlp_out
         payload[f"{pos}__n_high"] = np.asarray(d.n_high, dtype=np.int64)
         payload[f"{pos}__n_low"] = np.asarray(d.n_low, dtype=np.int64)
+        if d.attn_heads is not None:
+            payload[f"{pos}__attn_heads"] = d.attn_heads
     np.savez_compressed(path, **payload)
 
 
@@ -459,14 +743,19 @@ def _head_writes_from_z(
     return heads, total
 
 
-def _shared_rmsnorm_scale(x: torch.Tensor, norm) -> torch.Tensor:
-    """Per-token scale ``s`` such that ``norm(x) ≈ x * s`` (shared across heads)."""
+def _rms_norm_weight_eps(norm) -> tuple[torch.Tensor, float]:
     eps = float(getattr(norm, "eps", 1e-6))
     weight = getattr(norm, "w", None)
     if weight is None:
         weight = getattr(norm, "weight", None)
     if weight is None:
         raise ValueError("Post-attn RMSNorm has neither .w nor .weight.")
+    return weight, eps
+
+
+def _rms_norm_use_one_plus(
+    norm, x: torch.Tensor, *, weight: torch.Tensor, eps: float
+) -> bool:
     xf = x.float()
     inv = torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
     w = weight.float()
@@ -474,8 +763,78 @@ def _shared_rmsnorm_scale(x: torch.Tensor, norm) -> torch.Tensor:
         y = norm(x.detach()).float()
         pred_w = xf.detach() * (inv.detach() * w)
         pred_1pw = xf.detach() * (inv.detach() * (1.0 + w))
-        use_one_plus = (pred_1pw - y).abs().mean() <= (pred_w - y).abs().mean()
-    return inv * ((1.0 + w) if bool(use_one_plus) else w)
+        return bool((pred_1pw - y).abs().mean() <= (pred_w - y).abs().mean())
+
+
+def _shared_rmsnorm_scale(x: torch.Tensor, norm) -> torch.Tensor:
+    """Per-token scale ``s`` such that ``norm(x) ≈ x * s`` (shared across heads)."""
+    weight, eps = _rms_norm_weight_eps(norm)
+    xf = x.float()
+    inv = torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
+    w = weight.float()
+    use_one_plus = _rms_norm_use_one_plus(norm, x, weight=weight, eps=eps)
+    return inv * ((1.0 + w) if use_one_plus else w)
+
+
+def extract_attn_head_write_specs(model) -> list[AttnHeadWriteSpec]:
+    """Copy TL ``W_O`` / ``b_O`` / sandwich ``ln1_post`` into numpy for H5 concat."""
+    n_layers = int(model.cfg.n_layers)
+    n_heads = int(model.cfg.n_heads)
+    d_head = int(model.cfg.d_head)
+    d_model = int(model.cfg.d_model)
+    specs: list[AttnHeadWriteSpec] = []
+    n_sandwich = 0
+    for layer in range(n_layers):
+        attn = model.blocks[layer].attn
+        w_o = attn.W_O.detach().float().cpu().numpy()
+        if tuple(w_o.shape) != (n_heads, d_head, d_model):
+            raise ValueError(
+                f"Layer {layer} W_O shape {tuple(w_o.shape)} != "
+                f"(n_heads, d_head, d_model)=({n_heads}, {d_head}, {d_model})."
+            )
+        b_o_t = getattr(attn, "b_O", None)
+        b_o = None if b_o_t is None else b_o_t.detach().float().cpu().numpy()
+        ln1_post = getattr(model.blocks[layer], "ln1_post", None)
+        rms_weight = None
+        rms_eps = 1e-6
+        rms_use_one_plus = False
+        if ln1_post is not None:
+            n_sandwich += 1
+            weight, rms_eps = _rms_norm_weight_eps(ln1_post)
+            rms_weight = weight.detach().float().cpu().numpy()
+            dummy = torch.ones(
+                (1, d_model), device=weight.device, dtype=weight.dtype
+            )
+            rms_use_one_plus = _rms_norm_use_one_plus(
+                ln1_post, dummy, weight=weight, eps=rms_eps
+            )
+        specs.append(
+            AttnHeadWriteSpec(
+                n_heads=n_heads,
+                d_head=d_head,
+                d_model=d_model,
+                w_o=w_o,
+                b_o=b_o,
+                rms_weight=rms_weight,
+                rms_eps=rms_eps,
+                rms_use_one_plus=rms_use_one_plus,
+            )
+        )
+    if n_sandwich and n_sandwich != n_layers:
+        logging.warning(
+            "ln1_post present on %d/%d layers; sandwich RMS applied only where present.",
+            n_sandwich,
+            n_layers,
+        )
+    logging.info(
+        "Head-write specs: n_layers=%d n_heads=%d sandwich_ln1_post=%s "
+        "rms_use_one_plus=%s",
+        n_layers,
+        n_heads,
+        n_sandwich == n_layers,
+        specs[0].rms_use_one_plus if specs else False,
+    )
+    return specs
 
 
 class SiteInputCapture:
@@ -921,43 +1280,29 @@ def scores_from_capture(
     return row
 
 
-def _attn_head_allocated_dots(
+def _attn_head_mass_mean_dots(
     heads: list[torch.Tensor],
-    total: torch.Tensor,
-    d_attn: np.ndarray,
+    d_heads: np.ndarray,
     *,
     layer: int,
-    eps: float = ATTN_HEAD_ALLOC_EPS,
 ) -> np.ndarray:
-    """Fine scores ``⟨∇_post_h, (post_h / sum_h post_h) ⊙ d_attn⟩`` so they sum to coarse."""
-    del total
-    d = torch.as_tensor(d_attn, dtype=torch.float32)
-    if d.ndim != 1:
-        raise ValueError(f"Expected 1D attn-out direction, got {tuple(d.shape)}.")
-    total_act = heads[0].detach().float()
-    if total_act.ndim == 3:
-        total_act = total_act[:, -1]
-    total_act = total_act[0]
-    for ph in heads[1:]:
-        post = ph.detach().float()
-        if post.ndim == 3:
-            post = post[:, -1]
-        total_act = total_act + post[0]
-    d = d.to(device=total_act.device)
-    out = np.zeros(len(heads), dtype=np.float32)
+    """Fine scores ``⟨∇_post_h, d_h⟩`` with per-head mass-mean directions."""
+    n_heads = len(heads)
+    if d_heads.ndim != 2 or int(d_heads.shape[0]) != n_heads:
+        raise ValueError(
+            f"Layer {layer} head directions shape {tuple(d_heads.shape)} != "
+            f"(n_heads, d_model)=({n_heads}, ...)."
+        )
+    out = np.zeros(n_heads, dtype=np.float32)
     for h, ph in enumerate(heads):
         gh = _last_pos_grad(ph, name=f"attn_head_{h}", layer=layer)[0]
-        post = ph.detach().float()
-        if post.ndim == 3:
-            post = post[:, -1]
-        post = post[0]
-        d_h = post / (total_act + eps) * d
-        if gh.shape != d_h.shape:
+        d = torch.as_tensor(d_heads[h], device=gh.device, dtype=torch.float32)
+        if gh.shape != d.shape:
             raise ValueError(
                 f"Layer {layer} head {h} grad shape {tuple(gh.shape)} != "
-                f"allocated direction {tuple(d_h.shape)}."
+                f"mass-mean direction {tuple(d.shape)}."
             )
-        out[h] = float((gh * d_h).sum().detach().cpu().item())
+        out[h] = float((gh * d).sum().detach().cpu().item())
     return out
 
 
@@ -991,6 +1336,10 @@ def scores_from_output_capture(
         raise ValueError(f"Unknown granularity {granularity!r}")
     if not capture.need_fine:
         raise RuntimeError("Fine output-site scoring requires need_fine=True.")
+    if direction.attn_heads is None:
+        raise RuntimeError(
+            "Fine output-site scoring requires per-head mass-mean directions."
+        )
     labels_n = n_layers * (n_heads + 1)
     row = np.zeros(labels_n, dtype=np.float32)
     col = 0
@@ -1001,12 +1350,13 @@ def scores_from_output_capture(
                 f"Fine output attribution missing heads at layer {layer} "
                 f"(got {None if heads is None else len(heads)})."
             )
-        head_scores = _attn_head_allocated_dots(
-            heads,
-            capture.attn_out[layer],
-            direction.attn_out[layer],
-            layer=layer,
-        )
+        d_heads = direction.attn_heads[layer]
+        if tuple(d_heads.shape) != (n_heads, capture.d_model):
+            raise ValueError(
+                f"Layer {layer} attn_heads direction shape {tuple(d_heads.shape)} != "
+                f"(n_heads, d_model)=({n_heads}, {capture.d_model})."
+            )
+        head_scores = _attn_head_mass_mean_dots(heads, d_heads, layer=layer)
         mlp_s = _mlp_dot(
             _last_pos_grad(capture.mlp_out[layer], name="mlp_out", layer=layer),
             direction.mlp_out[layer],
@@ -1318,9 +1668,11 @@ def write_readme(path: Path) -> None:
         "(after `ln1_post` / HF `post_attention_layernorm` on sandwich Gemma-3; "
         "`o_proj` out on Mistral/Qwen). Fine heads are rebuilt from `hook_z` through "
         "`W_O` with a shared post-attn RMS scale on Gemma, matching "
-        "`gradient_based_attr`. The mixed H5 `attn[L]` direction is allocated across "
-        "those pieces so coarse `L*_attn` equals the sum of fine head scores "
-        "(`⟨∇_addend, d_attn⟩`). MLP is `hook_mlp_out` with H5 `mlp[L]`. "
+        "`gradient_based_attr`. Each fine head is scored with its own mass-mean "
+        "direction `d_h` (high−low mean of H5 concat through `W_O`; sandwich Gemma "
+        "applies that example's shared `ln1_post` scale before averaging). Coarse "
+        "`L*_attn` is `⟨∇_addend, d_attn⟩`; fine head `h` is `⟨∇_post_h, d_h⟩`. "
+        "MLP is `hook_mlp_out` with H5 `mlp[L]`. "
         "On sandwich Gemma-3, TransformerLens fires `hook_mlp_out` after "
         "`ln2_post` (HF `post_feedforward_layernorm`), matching "
         "`subblock_tokenwise_mean_ablation`. These two passes do not share an "
@@ -1399,7 +1751,7 @@ def write_config_txt(
         "output_sites=hook_attn_out,hook_mlp_out",
         "output_attn_direction=h5_attn[L] (hook_attn_out addend; after ln1_post / post_attention_layernorm on sandwich Gemma)",
         "output_mlp_direction=h5_mlp[L] (hook_mlp_out; after ln2_post / post_feedforward_layernorm on sandwich Gemma)",
-        "output_fine_head_score=GBA post-norm head split of d_attn (coarse attn = <grad_addend, d_attn> = sum of heads)",
+        "output_fine_head_score=<grad_post_h, d_h>; d_h = high_mean(post_h)-low_mean(post_h) from H5 concat (o fallback) through W_O; sandwich Gemma applies per-example shared ln1_post before averaging",
         f"output_results_subdir={COMPONENT_OUTPUT_SUBDIR}",
         "",
         f"expected_probability_tokens={args.expected_probability_tokens}",
@@ -1518,8 +1870,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "prefixes and logit differences in a second independent forward: "
             "attention addend at hook_attn_out (GBA-style per-head rebuild "
             "after ln1_post on sandwich Gemma-3; H5 attn) and hook_mlp_out "
-            "(H5 mlp; after ln2_post on sandwich Gemma-3). Written under "
-            "component_output/. If false, input-site pass only."
+            "(H5 mlp; after ln2_post on sandwich Gemma-3). Fine heads use "
+            "per-head mass-mean directions from H5 concat (o fallback). "
+            "Written under component_output/. If false, input-site pass only."
         ),
     )
     p.add_argument(
@@ -1740,6 +2093,10 @@ def main() -> None:
     }
     logging.info("Span indices: %s", span_index_by_position)
 
+    need_output_fine = bool(args.attribute_component_outputs) and "fine" in gran_list
+    head_write_specs = (
+        extract_attn_head_write_specs(model) if need_output_fine else None
+    )
     directions = compute_mass_mean_directions(
         input_h5,
         positions=positions,
@@ -1750,6 +2107,7 @@ def main() -> None:
         low_conf_threshold=args.low_conf_threshold,
         exclude_conf_one_positions=exclude_conf_one_positions,
         require_l_or_un_positions=require_l_or_un_positions,
+        head_write_specs=head_write_specs,
     )
     save_directions_npz(run_root / "directions.npz", directions)
     logging.info("Wrote %s", run_root / "directions.npz")

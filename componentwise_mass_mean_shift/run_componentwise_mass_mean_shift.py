@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Simultaneous component-input mass-mean steering on high- and low-confidence groups.
+"""Simultaneous componentwise mass-mean steering on high- and low-confidence groups.
 
-Computes direction = high_mean - low_mean of selected attention-head Q/K/V
-(post W_Q/W_K/W_V) and/or MLP subblock RMSNorm inputs, then additively steers
-those sites at mode-dependent token spans during greedy decoding.
+Computes direction = high_mean - low_mean of selected attention heads, whole
+attention blocks, and/or MLP subblocks, then additively steers those sites at
+mode-dependent token spans during greedy decoding. --intervention_site selects
+the patch location: input (Q/K/V post W_Q/W_K/W_V, attn ln1 from H5 res, and
+MLP RMSNorm in) or output (hook_z / concat, hook_attn_out from H5 attn after
+ln1_post on sandwich Gemma, and hook_mlp_out).
 
 All units listed in --ablate_heads are steered together. Low-confidence examples
 receive +alpha * direction; high-confidence examples receive -alpha * direction.
@@ -12,7 +15,7 @@ receive +alpha * direction; high-confidence examples receive -alpha * direction.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager
 from datetime import datetime
 import gc
 import json
@@ -40,10 +43,12 @@ from blockwise_zero_ablation.run_blockwise_zero_ablation import (
     parse_mode_confidence_from_response,
     split_answerable_indices,
 )
-from componentwise_input_mean_ablation.run_componentwise_input_mean_ablation import (
+from componentwise_mean_ablation.run_componentwise_mean_ablation import (
     ABLATION_MODES_DEFAULT,
+    INTERVENTION_SITES,
     MODES_NEEDING_PROBABILITY_EXTRA,
     _mlp_input_norm_module,
+    _attn_input_norm_module,
     _positions_and_replacements_for_mode,
     _to_torch_means,
     stream_group_means_and_eval_ids,
@@ -69,7 +74,10 @@ from headwise_zero_ablation.run_headwise_zero_ablation import (
     format_ablate_units,
     parse_ablate_units,
 )
-from layerwise_mean_ablation.run_mean_ablation import load_hooked_transformer
+from layerwise_mean_ablation.run_mean_ablation import (
+    load_hooked_transformer,
+    validate_last_a_panl_and_pc_mode,
+)
 from mass_mean_probe.run_mass_mean_probe import _format_alpha
 
 
@@ -83,7 +91,7 @@ def resolve_output_json_path(cli_output_path: Optional[str]) -> str:
     if cli_output_path:
         out_path = os.path.abspath(cli_output_path)
     else:
-        base = Path("componentwise_input_mass_mean_shift") / "results"
+        base = Path("componentwise_mass_mean_shift") / "results"
         base.mkdir(parents=True, exist_ok=True)
         run_id = 1
         while (base / str(run_id)).exists():
@@ -189,7 +197,7 @@ def _subtract_mlp_maps(
     out: Dict[int, Dict[str, np.ndarray]] = {}
     for layer, high_sources in high_map.items():
         if int(layer) not in low_map:
-            raise ValueError(f"Missing low-confidence MLP-input means for layer {layer}.")
+            raise ValueError(f"Missing low-confidence MLP means for layer {layer}.")
         low_sources = low_map[int(layer)]
         entry: Dict[str, np.ndarray] = {}
         for source_name, high_arr in high_sources.items():
@@ -199,12 +207,12 @@ def _subtract_mlp_maps(
             high_np = np.asarray(high_arr)
             if high_np.shape != low_arr.shape:
                 raise ValueError(
-                    f"MLP-input direction shape mismatch at layer {layer} source {source_name}: "
+                    f"MLP direction shape mismatch at layer {layer} source {source_name}: "
                     f"high={high_np.shape} low={low_arr.shape}."
                 )
             entry[source_name] = (high_np - low_arr).astype(np.float32)
         if not entry:
-            raise ValueError(f"No overlapping MLP-input sources for layer {layer}.")
+            raise ValueError(f"No overlapping MLP sources for layer {layer}.")
         out[int(layer)] = entry
     return out
 
@@ -214,25 +222,54 @@ def compute_high_minus_low_directions(
 ) -> Dict[str, object]:
     low_pack = packed_means["low_confidence"]
     high_pack = packed_means["high_confidence"]
+    mlp_dir = _subtract_mlp_maps(high_pack["mlp"], low_pack["mlp"])  # type: ignore[arg-type]
+    attn_block_dir = _subtract_mlp_maps(
+        high_pack.get("attn_block", {}) or {},  # type: ignore[arg-type]
+        low_pack.get("attn_block", {}) or {},  # type: ignore[arg-type]
+    )
+    if "z" in high_pack:
+        z_dir = _subtract_head_maps(high_pack["z"], low_pack["z"], component="z")  # type: ignore[arg-type]
+        return {
+            "z": z_dir,
+            "mlp": mlp_dir,
+            "attn_block": attn_block_dir,
+            "z_count": int(high_pack["z_count"]),
+            "mlp_count": int(high_pack["mlp_count"]),
+            "attn_block_count": int(high_pack.get("attn_block_count", 0)),
+            "z_extra_count": min(int(high_pack["z_extra_count"]), int(low_pack["z_extra_count"])),
+            "mlp_extra_count": min(int(high_pack["mlp_extra_count"]), int(low_pack["mlp_extra_count"])),
+            "attn_block_extra_count": min(
+                int(high_pack.get("attn_block_extra_count", 0)),
+                int(low_pack.get("attn_block_extra_count", 0)),
+            ),
+            "intervention_site": "output",
+        }
     q_dir = _subtract_head_maps(high_pack["q"], low_pack["q"], component="q")  # type: ignore[arg-type]
     k_dir = _subtract_head_maps(high_pack["k"], low_pack["k"], component="k")  # type: ignore[arg-type]
     v_dir = _subtract_head_maps(high_pack["v"], low_pack["v"], component="v")  # type: ignore[arg-type]
-    mlp_dir = _subtract_mlp_maps(high_pack["mlp"], low_pack["mlp"])  # type: ignore[arg-type]
     return {
         "q": q_dir,
         "k": k_dir,
         "v": v_dir,
         "mlp": mlp_dir,
+        "attn_block": attn_block_dir,
         "qkv_count": int(high_pack["qkv_count"]),
         "mlp_count": int(high_pack["mlp_count"]),
+        "attn_block_count": int(high_pack.get("attn_block_count", 0)),
         "qkv_extra_count": min(int(high_pack["qkv_extra_count"]), int(low_pack["qkv_extra_count"])),
         "mlp_extra_count": min(int(high_pack["mlp_extra_count"]), int(low_pack["mlp_extra_count"])),
+        "attn_block_extra_count": min(
+            int(high_pack.get("attn_block_extra_count", 0)),
+            int(low_pack.get("attn_block_extra_count", 0)),
+        ),
+        "intervention_site": "input",
     }
 
 
 def build_qkv_input_direction_shift_hooks(
     *,
     mode: str,
+    model_name: str,
     prompt_len: int,
     decoded_tokens_provider: Callable[[], List[str]],
     selected_heads_by_layer: Dict[int, Sequence[int]],
@@ -275,6 +312,7 @@ def build_qkv_input_direction_shift_hooks(
                     )
                 positions, vectors = _positions_and_replacements_for_mode(
                     mode=mode,
+                    model_name=model_name,
                     prompt_len=prompt_len,
                     decoded_tokens=decoded_tokens,
                     source_means=head_dirs,
@@ -344,6 +382,7 @@ def mlp_input_direction_shift_pre_hooks(
     *,
     mlp_layers: Sequence[int],
     mode: str,
+    model_name: str,
     prompt_len: int,
     decoded_tokens_provider: Callable[[], List[str]],
     mlp_directions: Dict[int, Dict[str, torch.Tensor]],
@@ -362,6 +401,7 @@ def mlp_input_direction_shift_pre_hooks(
             x = args[0]
             positions, vectors = _positions_and_replacements_for_mode(
                 mode=mode,
+                model_name=model_name,
                 prompt_len=prompt_len,
                 decoded_tokens=decoded_tokens_provider(),
                 source_means=layer_dirs,
@@ -400,15 +440,277 @@ def mlp_input_direction_shift_pre_hooks(
             handle.remove()
 
 
-def greedy_generate_componentwise_input_mass_mean_shifted(
+@contextmanager
+def attn_input_direction_shift_pre_hooks(
+    model,
+    *,
+    attn_block_layers: Sequence[int],
+    mode: str,
+    model_name: str,
+    prompt_len: int,
+    decoded_tokens_provider: Callable[[], List[str]],
+    attn_block_directions: Dict[int, Dict[str, torch.Tensor]],
+    expected_guess_tokens: int,
+    expected_probability_tokens: int,
+    signed_alpha: float,
+) -> Iterator[None]:
+    handles = []
+    scale = float(signed_alpha)
+
+    def _make_pre_hook(layer_dirs: Dict[str, torch.Tensor], local_layer: int) -> Callable:
+        def pre_hook(module, args):
+            del module
+            if not args:
+                return None
+            x = args[0]
+            positions, vectors = _positions_and_replacements_for_mode(
+                mode=mode,
+                model_name=model_name,
+                prompt_len=prompt_len,
+                decoded_tokens=decoded_tokens_provider(),
+                source_means=layer_dirs,
+                expected_guess_tokens=expected_guess_tokens,
+                expected_probability_tokens=expected_probability_tokens,
+            )
+            if not positions:
+                return None
+            x = x.clone()
+            for abs_pos, vector in zip(positions, vectors):
+                if 0 <= abs_pos < x.shape[1]:
+                    if int(vector.numel()) != int(x.shape[-1]):
+                        raise ValueError(
+                            f"Attn-block-input direction size {vector.numel()} != d_model {x.shape[-1]} "
+                            f"at layer {local_layer}."
+                        )
+                    x[:, abs_pos, :] = x[:, abs_pos, :] + (
+                        scale * vector.to(device=x.device, dtype=x.dtype)
+                    )
+            if len(args) == 1:
+                return (x,)
+            return (x, *args[1:])
+
+        return pre_hook
+
+    try:
+        for layer in attn_block_layers:
+            module = _attn_input_norm_module(model, int(layer))
+            layer_dirs = attn_block_directions.get(int(layer))
+            if layer_dirs is None:
+                raise ValueError(f"Missing attn-block-input direction for layer {layer}.")
+            handles.append(module.register_forward_pre_hook(_make_pre_hook(layer_dirs, int(layer))))
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+def build_z_output_direction_shift_hooks(
+    *,
+    mode: str,
+    model_name: str,
+    prompt_len: int,
+    decoded_tokens_provider: Callable[[], List[str]],
+    selected_heads_by_layer: Dict[int, Sequence[int]],
+    z_directions: Dict[int, Dict[int, Dict[str, torch.Tensor]]],
+    expected_guess_tokens: int,
+    expected_probability_tokens: int,
+    signed_alpha: float,
+) -> List[Tuple[str, Callable]]:
+    hooks: List[Tuple[str, Callable]] = []
+    scale = float(signed_alpha)
+
+    def _make_z_hook(
+        *,
+        local_dirs: Dict[int, Dict[str, torch.Tensor]],
+        heads: List[int],
+        local_layer: int,
+    ) -> Callable:
+        def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
+            del hook
+            if activation.ndim != 4:
+                raise ValueError(
+                    "Expected hook_z activation with shape "
+                    f"[batch, seq, heads, d_head], got {tuple(activation.shape)}."
+                )
+            decoded_tokens = decoded_tokens_provider()
+            for head_idx in heads:
+                if not (0 <= head_idx < int(activation.shape[2])):
+                    raise ValueError(
+                        f"Z head index {head_idx} out of range for layer {local_layer} "
+                        f"with {int(activation.shape[2])} heads."
+                    )
+                head_dirs = local_dirs.get(head_idx)
+                if head_dirs is None:
+                    raise ValueError(
+                        f"Missing concat/hook_z direction for layer {local_layer}, head {head_idx}."
+                    )
+                positions, vectors = _positions_and_replacements_for_mode(
+                    mode=mode,
+                    model_name=model_name,
+                    prompt_len=prompt_len,
+                    decoded_tokens=decoded_tokens,
+                    source_means=head_dirs,
+                    expected_guess_tokens=expected_guess_tokens,
+                    expected_probability_tokens=expected_probability_tokens,
+                )
+                for abs_pos, vector in zip(positions, vectors):
+                    if 0 <= abs_pos < activation.shape[1]:
+                        if int(vector.numel()) != int(activation.shape[3]):
+                            raise ValueError(
+                                f"hook_z direction size {vector.numel()} != d_head {activation.shape[3]} "
+                                f"at layer {local_layer} head {head_idx}."
+                            )
+                        activation[:, abs_pos, head_idx, :] = activation[:, abs_pos, head_idx, :] + (
+                            scale * vector.to(device=activation.device, dtype=activation.dtype)
+                        )
+            return activation
+
+        return hook_fn
+
+    for layer, heads in selected_heads_by_layer.items():
+        z_heads = [int(h) for h in heads]
+        if not z_heads:
+            continue
+        layer_dirs = z_directions.get(int(layer))
+        if layer_dirs is None:
+            raise ValueError(f"Missing concat/hook_z direction for layer {layer}.")
+        hooks.append(
+            (
+                f"blocks.{int(layer)}.attn.hook_z",
+                _make_z_hook(
+                    local_dirs=layer_dirs,
+                    heads=z_heads,
+                    local_layer=int(layer),
+                ),
+            )
+        )
+    return hooks
+
+
+def build_mlp_output_direction_shift_hooks(
+    *,
+    mode: str,
+    model_name: str,
+    prompt_len: int,
+    decoded_tokens_provider: Callable[[], List[str]],
+    mlp_layers: Sequence[int],
+    mlp_directions: Dict[int, Dict[str, torch.Tensor]],
+    expected_guess_tokens: int,
+    expected_probability_tokens: int,
+    signed_alpha: float,
+) -> List[Tuple[str, Callable]]:
+    hooks: List[Tuple[str, Callable]] = []
+    scale = float(signed_alpha)
+
+    def _make_mlp_out_hook(layer_dirs: Dict[str, torch.Tensor], local_layer: int) -> Callable:
+        def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
+            del hook
+            positions, vectors = _positions_and_replacements_for_mode(
+                mode=mode,
+                model_name=model_name,
+                prompt_len=prompt_len,
+                decoded_tokens=decoded_tokens_provider(),
+                source_means=layer_dirs,
+                expected_guess_tokens=expected_guess_tokens,
+                expected_probability_tokens=expected_probability_tokens,
+            )
+            if not positions:
+                return activation
+            for abs_pos, vector in zip(positions, vectors):
+                if 0 <= abs_pos < activation.shape[1]:
+                    if int(vector.numel()) != int(activation.shape[-1]):
+                        raise ValueError(
+                            f"MLP-output direction size {vector.numel()} != d_model {activation.shape[-1]} "
+                            f"at layer {local_layer}."
+                        )
+                    activation[:, abs_pos, :] = activation[:, abs_pos, :] + (
+                        scale * vector.to(device=activation.device, dtype=activation.dtype)
+                    )
+            return activation
+
+        return hook_fn
+
+    for layer in mlp_layers:
+        layer_dirs = mlp_directions.get(int(layer))
+        if layer_dirs is None:
+            raise ValueError(f"Missing MLP-output direction for layer {layer}.")
+        hooks.append(
+            (
+                f"blocks.{int(layer)}.hook_mlp_out",
+                _make_mlp_out_hook(layer_dirs, int(layer)),
+            )
+        )
+    return hooks
+
+
+def build_attn_output_direction_shift_hooks(
+    *,
+    mode: str,
+    model_name: str,
+    prompt_len: int,
+    decoded_tokens_provider: Callable[[], List[str]],
+    attn_block_layers: Sequence[int],
+    attn_block_directions: Dict[int, Dict[str, torch.Tensor]],
+    expected_guess_tokens: int,
+    expected_probability_tokens: int,
+    signed_alpha: float,
+) -> List[Tuple[str, Callable]]:
+    hooks: List[Tuple[str, Callable]] = []
+    scale = float(signed_alpha)
+
+    def _make_attn_out_hook(layer_dirs: Dict[str, torch.Tensor], local_layer: int) -> Callable:
+        def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
+            del hook
+            positions, vectors = _positions_and_replacements_for_mode(
+                mode=mode,
+                model_name=model_name,
+                prompt_len=prompt_len,
+                decoded_tokens=decoded_tokens_provider(),
+                source_means=layer_dirs,
+                expected_guess_tokens=expected_guess_tokens,
+                expected_probability_tokens=expected_probability_tokens,
+            )
+            if not positions:
+                return activation
+            for abs_pos, vector in zip(positions, vectors):
+                if 0 <= abs_pos < activation.shape[1]:
+                    if int(vector.numel()) != int(activation.shape[-1]):
+                        raise ValueError(
+                            f"Attn-block-output direction size {vector.numel()} != d_model "
+                            f"{activation.shape[-1]} at layer {local_layer}."
+                        )
+                    activation[:, abs_pos, :] = activation[:, abs_pos, :] + (
+                        scale * vector.to(device=activation.device, dtype=activation.dtype)
+                    )
+            return activation
+
+        return hook_fn
+
+    for layer in attn_block_layers:
+        layer_dirs = attn_block_directions.get(int(layer))
+        if layer_dirs is None:
+            raise ValueError(f"Missing attn-block-output direction for layer {layer}.")
+        hooks.append(
+            (
+                f"blocks.{int(layer)}.hook_attn_out",
+                _make_attn_out_hook(layer_dirs, int(layer)),
+            )
+        )
+    return hooks
+
+
+def greedy_generate_componentwise_mass_mean_shifted(
     model,
     local_prompt: str,
     max_new_tokens: int,
     *,
     mode: str,
+    model_name: str,
+    intervention_site: str,
     selected_heads_by_layer: Dict[int, Sequence[int]],
     selected_kv_heads: Dict[int, Sequence[int]],
     mlp_layers: Sequence[int],
+    attn_block_layers: Sequence[int],
     directions: Dict[str, object],
     expected_guess_tokens: int,
     expected_probability_tokens: int,
@@ -422,10 +724,67 @@ def greedy_generate_componentwise_input_mass_mean_shifted(
         return decoded_tokens
 
     hooks: List[Tuple[str, Callable]] = []
+    if intervention_site == "output":
+        if selected_heads_by_layer:
+            hooks.extend(
+                build_z_output_direction_shift_hooks(
+                    mode=mode,
+                    model_name=model_name,
+                    prompt_len=prompt_len,
+                    decoded_tokens_provider=_decoded_tokens_provider,
+                    selected_heads_by_layer=selected_heads_by_layer,
+                    z_directions=directions["z"],  # type: ignore[arg-type]
+                    expected_guess_tokens=expected_guess_tokens,
+                    expected_probability_tokens=expected_probability_tokens,
+                    signed_alpha=signed_alpha,
+                )
+            )
+        if attn_block_layers:
+            hooks.extend(
+                build_attn_output_direction_shift_hooks(
+                    mode=mode,
+                    model_name=model_name,
+                    prompt_len=prompt_len,
+                    decoded_tokens_provider=_decoded_tokens_provider,
+                    attn_block_layers=attn_block_layers,
+                    attn_block_directions=directions["attn_block"],  # type: ignore[arg-type]
+                    expected_guess_tokens=expected_guess_tokens,
+                    expected_probability_tokens=expected_probability_tokens,
+                    signed_alpha=signed_alpha,
+                )
+            )
+        if mlp_layers:
+            hooks.extend(
+                build_mlp_output_direction_shift_hooks(
+                    mode=mode,
+                    model_name=model_name,
+                    prompt_len=prompt_len,
+                    decoded_tokens_provider=_decoded_tokens_provider,
+                    mlp_layers=mlp_layers,
+                    mlp_directions=directions["mlp"],  # type: ignore[arg-type]
+                    expected_guess_tokens=expected_guess_tokens,
+                    expected_probability_tokens=expected_probability_tokens,
+                    signed_alpha=signed_alpha,
+                )
+            )
+        if not hooks:
+            raise ValueError(
+                "No attention heads, attention blocks, or MLP layers selected for "
+                "componentwise mass-mean shift."
+            )
+        return greedy_generate(
+            model=model,
+            local_prompt=local_prompt,
+            max_new_tokens=max_new_tokens,
+            fwd_hooks=hooks,
+            decoded_tokens_buffer=decoded_tokens,
+        )
+
     if selected_heads_by_layer:
         hooks.extend(
             build_qkv_input_direction_shift_hooks(
                 mode=mode,
+                model_name=model_name,
                 prompt_len=prompt_len,
                 decoded_tokens_provider=_decoded_tokens_provider,
                 selected_heads_by_layer=selected_heads_by_layer,
@@ -438,24 +797,42 @@ def greedy_generate_componentwise_input_mass_mean_shifted(
                 signed_alpha=signed_alpha,
             )
         )
-    mlp_cm = (
-        mlp_input_direction_shift_pre_hooks(
-            model,
-            mlp_layers=mlp_layers,
-            mode=mode,
-            prompt_len=prompt_len,
-            decoded_tokens_provider=_decoded_tokens_provider,
-            mlp_directions=directions["mlp"],  # type: ignore[arg-type]
-            expected_guess_tokens=expected_guess_tokens,
-            expected_probability_tokens=expected_probability_tokens,
-            signed_alpha=signed_alpha,
+    if not hooks and not mlp_layers and not attn_block_layers:
+        raise ValueError(
+            "No attention heads, attention blocks, or MLP layers selected for "
+            "componentwise mass-mean shift."
         )
-        if mlp_layers
-        else nullcontext()
-    )
-    if not hooks and not mlp_layers:
-        raise ValueError("No attention heads or MLP layers selected for input mass-mean shift.")
-    with mlp_cm:
+    with ExitStack() as stack:
+        if attn_block_layers:
+            stack.enter_context(
+                attn_input_direction_shift_pre_hooks(
+                    model,
+                    attn_block_layers=attn_block_layers,
+                    mode=mode,
+                    model_name=model_name,
+                    prompt_len=prompt_len,
+                    decoded_tokens_provider=_decoded_tokens_provider,
+                    attn_block_directions=directions["attn_block"],  # type: ignore[arg-type]
+                    expected_guess_tokens=expected_guess_tokens,
+                    expected_probability_tokens=expected_probability_tokens,
+                    signed_alpha=signed_alpha,
+                )
+            )
+        if mlp_layers:
+            stack.enter_context(
+                mlp_input_direction_shift_pre_hooks(
+                    model,
+                    mlp_layers=mlp_layers,
+                    mode=mode,
+                    model_name=model_name,
+                    prompt_len=prompt_len,
+                    decoded_tokens_provider=_decoded_tokens_provider,
+                    mlp_directions=directions["mlp"],  # type: ignore[arg-type]
+                    expected_guess_tokens=expected_guess_tokens,
+                    expected_probability_tokens=expected_probability_tokens,
+                    signed_alpha=signed_alpha,
+                )
+            )
         return greedy_generate(
             model=model,
             local_prompt=local_prompt,
@@ -477,6 +854,7 @@ def write_config_txt(
     ablate_layers: Sequence[int],
     selected_heads_by_layer: Dict[int, Sequence[int]],
     mlp_layers: Sequence[int],
+    attn_block_layers: Sequence[int],
     num_selected_layer_head_pairs: int,
     tracker_modes: Sequence[str],
     prompt_indices: Sequence[int],
@@ -487,6 +865,8 @@ def write_config_txt(
     mlp_mean_counts: Dict[str, int],
     qkv_extra_counts: Dict[str, int],
     mlp_extra_counts: Dict[str, int],
+    attn_block_mean_counts: Dict[str, int],
+    attn_block_extra_counts: Dict[str, int],
     evaluated_counts: Dict[str, int],
     skipped_one_confidence: Dict[str, int],
     mode_confidence: Dict[str, Dict[str, RunningMean]],
@@ -496,8 +876,8 @@ def write_config_txt(
     finished_at: str,
 ) -> None:
     lines = [
-        "Componentwise Input Mass-Mean Shift Configuration",
-        "================================================",
+        "Componentwise Mass-Mean Shift Configuration",
+        "==========================================",
         "",
         "[Model]",
         f"model_name={args.model_name}",
@@ -525,6 +905,7 @@ def write_config_txt(
         f"use_context={args.use_context}",
         "",
         "[Ablation]",
+        f"intervention_site={args.intervention_site}",
         "direction_definition=high_mean_minus_low_mean",
         "non_none_mode_behavior=additive_direction_perturbation",
         "confidence_direction_expectation_for_low_targets=perturbed_confidence_gt_none",
@@ -534,10 +915,11 @@ def write_config_txt(
         f"ablate_layers_spec={args.ablate_layers}",
         f"ablate_layers_resolved={','.join(str(layer) for layer in ablate_layers)}",
         f"ablate_heads_spec={args.ablate_heads}",
-        f"ablate_heads_resolved={format_ablate_units(selected_heads_by_layer, mlp_layers)}",
+        f"ablate_heads_resolved={format_ablate_units(selected_heads_by_layer, mlp_layers, attn_block_layers)}",
         f"num_ablated_layers={len(ablate_layers)}",
         f"num_ablated_layer_head_pairs={num_selected_layer_head_pairs}",
         f"num_ablated_mlp_layers={len(mlp_layers)}",
+        f"num_ablated_attn_blocks={len(attn_block_layers)}",
         f"ablation_unit={ABLATION_UNIT_KEY}",
         f"skip_one_confidence={args.skip_one_confidence}",
         f"expected_probability_tokens={args.expected_probability_tokens}",
@@ -558,6 +940,10 @@ def write_config_txt(
         f"high_conf_qkv_extra_mean_count={qkv_extra_counts.get('high_confidence', 0)}",
         f"low_conf_mlp_extra_mean_count={mlp_extra_counts.get('low_confidence', 0)}",
         f"high_conf_mlp_extra_mean_count={mlp_extra_counts.get('high_confidence', 0)}",
+        f"low_conf_attn_block_mean_count={attn_block_mean_counts.get('low_confidence', 0)}",
+        f"high_conf_attn_block_mean_count={attn_block_mean_counts.get('high_confidence', 0)}",
+        f"low_conf_attn_block_extra_mean_count={attn_block_extra_counts.get('low_confidence', 0)}",
+        f"high_conf_attn_block_extra_mean_count={attn_block_extra_counts.get('high_confidence', 0)}",
         "",
         "[Mode Confidence Metrics]",
         "Values below are running-mean verbalised confidence per group.",
@@ -608,6 +994,7 @@ def build_summary(
     ablate_layers: Sequence[int],
     selected_heads_by_layer: Dict[int, Sequence[int]],
     mlp_layers: Sequence[int],
+    attn_block_layers: Sequence[int],
     num_selected_layer_head_pairs: int,
     tracker_modes: Sequence[str],
     low_conf_count: int,
@@ -615,6 +1002,7 @@ def build_summary(
     h5_example_count: int,
     qkv_mean_counts: Dict[str, int],
     mlp_mean_counts: Dict[str, int],
+    attn_block_mean_counts: Dict[str, int],
     evaluated_counts: Dict[str, int],
     skipped_one_confidence: Dict[str, int],
     mode_confidence: Dict[str, Dict[str, RunningMean]],
@@ -652,6 +1040,7 @@ def build_summary(
             "skipped_one_confidence_count": int(skipped_one_confidence.get(group_name, 0)),
             "qkv_mean_count": int(qkv_mean_counts.get(group_name, 0)),
             "mlp_mean_count": int(mlp_mean_counts.get(group_name, 0)),
+            "attn_block_mean_count": int(attn_block_mean_counts.get(group_name, 0)),
             "steering_sign": float(GROUP_STEERING_SIGN[group_name]),
             "modes": modes_out,
             "by_none_mode_confidence": none_mode_buckets,
@@ -661,13 +1050,16 @@ def build_summary(
         "dataset": args.dataset,
         "input_h5": args.input_h5,
         "h5_example_count": h5_example_count,
+        "intervention_site": args.intervention_site,
         "direction_definition": "high_mean_minus_low_mean",
         "alpha": [float(a) for a in args.alpha],
         "ablate_layers": list(ablate_layers),
-        "ablate_heads": format_ablate_units(selected_heads_by_layer, mlp_layers),
+        "ablate_heads": format_ablate_units(selected_heads_by_layer, mlp_layers, attn_block_layers),
         "ablate_mlp_layers": list(mlp_layers),
+        "ablate_attn_block_layers": list(attn_block_layers),
         "num_ablated_layer_head_pairs": num_selected_layer_head_pairs,
         "num_ablated_mlp_layers": len(mlp_layers),
+        "num_ablated_attn_blocks": len(attn_block_layers),
         "ablation_modes": list(args.ablation_mode),
         "skip_one_confidence": bool(args.skip_one_confidence),
         "low_conf_threshold": args.low_conf_threshold,
@@ -679,8 +1071,9 @@ def build_summary(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Simultaneous component-input mass-mean shift: steer selected head Q/K/V and/or "
-            "MLP RMSNorm inputs along (high_mean - low_mean) with a list of alphas."
+            "Simultaneous componentwise mass-mean shift: steer selected head Q/K/V or hook_z, "
+            "whole attention blocks (ln1 / hook_attn_out), and/or MLP RMSNorm inputs or "
+            "hook_mlp_out along (high_mean - low_mean) with a list of alphas."
         )
     )
     parser.add_argument("--model_name", type=str, default="mistralai/Mistral-7B-Instruct-v0.1")
@@ -689,8 +1082,9 @@ def main() -> None:
         type=str,
         required=True,
         help=(
-            "Path to processed verbalised embedding H5 with q/k/v and res/attn fields "
-            "under embeddings_*."
+            "Path to processed verbalised embedding H5. Input site uses q/k/v, res (whole attn), "
+            "and res+attn (MLP); output site uses concat (hook_z), attn (hook_attn_out), "
+            "and mlp under embeddings_*."
         ),
     )
     parser.add_argument("--device", type=str, default=None)
@@ -716,8 +1110,11 @@ def main() -> None:
         default=None,
         help=(
             "Optional comma-separated unit list. Attention heads use a<layer>.h<head> "
-            "(e.g. a24.h5); MLP subblocks use m<layer> (e.g. m30). "
-            "All listed units are steered simultaneously at their inputs. "
+            "(e.g. a24.h5); whole attention blocks use a<layer> (e.g. a24); "
+            "MLP subblocks use m<layer> (e.g. m30). "
+            "Whole-block a<layer> steers ln1 with H5 res (input) or hook_attn_out with H5 attn "
+            "(output; after ln1_post on sandwich Gemma). "
+            "All listed units are steered simultaneously at --intervention_site. "
             "When set, this selection takes precedence and --ablate_layers is ignored."
         ),
     )
@@ -727,6 +1124,16 @@ def main() -> None:
         nargs="+",
         default=ABLATION_MODES_DEFAULT,
         choices=ABLATION_MODES_DEFAULT,
+    )
+    parser.add_argument(
+        "--intervention_site",
+        type=str,
+        default="input",
+        choices=list(INTERVENTION_SITES),
+        help=(
+            "Steer component inputs (Q/K/V, attn ln1 from H5 res, and MLP RMSNorm in) or outputs "
+            "(hook_z, hook_attn_out from H5 attn, and hook_mlp_out)."
+        ),
     )
     parser.add_argument(
         "--alpha",
@@ -760,6 +1167,7 @@ def main() -> None:
         raise ValueError("--skip_one_confidence requires 'none' in --ablation_mode.")
     if not args.alpha:
         raise ValueError("--alpha must include at least one scale factor.")
+    validate_last_a_panl_and_pc_mode(args.model_name, args.ablation_mode)
     formatted_alphas = [_format_alpha(float(a)) for a in args.alpha]
     if len(set(formatted_alphas)) != len(formatted_alphas):
         raise ValueError(f"Duplicate --alpha values are not allowed: {args.alpha}")
@@ -825,10 +1233,12 @@ def main() -> None:
         raise ValueError("No layers selected via --ablate_layers.")
 
     if args.ablate_heads:
-        selected_heads_by_layer, mlp_layers = parse_ablate_units(
+        selected_heads_by_layer, mlp_layers, attn_block_layers = parse_ablate_units(
             args.ablate_heads, n_layers=model_n_layers, n_heads=model_n_heads
         )
-        run_layers = sorted(set(selected_heads_by_layer.keys()) | set(mlp_layers))
+        run_layers = sorted(
+            set(selected_heads_by_layer.keys()) | set(mlp_layers) | set(attn_block_layers)
+        )
         if not run_layers:
             raise ValueError("No units selected via --ablate_heads.")
         logging.info(
@@ -839,6 +1249,7 @@ def main() -> None:
         run_layers = sorted(ablate_layers_from_flag)
         selected_heads_by_layer = {layer: list(range(model_n_heads)) for layer in run_layers}
         mlp_layers = []
+        attn_block_layers = []
         logging.info(
             "No --ablate_heads provided; using all heads across --ablate_layers=%s.",
             args.ablate_layers,
@@ -850,8 +1261,11 @@ def main() -> None:
             "No selected heads provided for layers in this run: "
             + ",".join(str(layer) for layer in missing_layer_heads)
         )
-    if not selected_heads_by_layer and not mlp_layers:
-        raise ValueError("No attention heads or MLP layers selected for input mass-mean shift.")
+    if not selected_heads_by_layer and not mlp_layers and not attn_block_layers:
+        raise ValueError(
+            "No attention heads, attention blocks, or MLP layers selected for "
+            "componentwise mass-mean shift."
+        )
 
     selected_kv_heads = (
         selected_kv_heads_by_layer(
@@ -862,12 +1276,14 @@ def main() -> None:
         else {}
     )
     num_selected_layer_head_pairs = sum(len(heads) for heads in selected_heads_by_layer.values())
-    resolved_units = format_ablate_units(selected_heads_by_layer, mlp_layers)
+    resolved_units = format_ablate_units(selected_heads_by_layer, mlp_layers, attn_block_layers)
     logging.info(
-        "Steering units=%s (%d layer-head pairs, %d mlp layers) at component inputs. alphas=%s",
+        "Steering units=%s (%d layer-head pairs, %d attn blocks, %d mlp layers) at component %ss. alphas=%s",
         resolved_units,
         num_selected_layer_head_pairs,
+        len(attn_block_layers),
         len(mlp_layers),
+        args.intervention_site,
         [float(a) for a in args.alpha],
     )
     if MODES_NEEDING_PROBABILITY_EXTRA.intersection(args.ablation_mode):
@@ -880,6 +1296,7 @@ def main() -> None:
         args.input_h5,
         selected_heads_by_layer=selected_heads_by_layer,
         mlp_layers=mlp_layers,
+        attn_block_layers=attn_block_layers,
         n_heads=model_n_heads,
         n_kv_heads=model_n_kv_heads,
         d_head=model_d_head,
@@ -890,6 +1307,7 @@ def main() -> None:
         high_conf_threshold=args.high_conf_threshold,
         split_id_to_index=split_id_to_index,
         split_targets=split_targets,
+        intervention_site=args.intervention_site,
     )
     used_ids = {
         ex_id
@@ -904,20 +1322,36 @@ def main() -> None:
     low_conf_count = sum(len(ids) for ids in selected_ids_by_group["low_confidence"].values())
     high_conf_count = sum(len(ids) for ids in selected_ids_by_group["high_confidence"].values())
     qkv_mean_counts = {
-        group_name: int(packed_means[group_name]["qkv_count"]) for group_name in CONFIDENCE_GROUPS
+        group_name: int(
+            packed_means[group_name].get("z_count", packed_means[group_name].get("qkv_count", 0))
+        )
+        for group_name in CONFIDENCE_GROUPS
     }
     mlp_mean_counts = {
         group_name: int(packed_means[group_name]["mlp_count"]) for group_name in CONFIDENCE_GROUPS
     }
     qkv_extra_counts = {
-        group_name: int(packed_means[group_name]["qkv_extra_count"]) for group_name in CONFIDENCE_GROUPS
+        group_name: int(
+            packed_means[group_name].get(
+                "z_extra_count", packed_means[group_name].get("qkv_extra_count", 0)
+            )
+        )
+        for group_name in CONFIDENCE_GROUPS
     }
     mlp_extra_counts = {
         group_name: int(packed_means[group_name]["mlp_extra_count"]) for group_name in CONFIDENCE_GROUPS
     }
+    attn_block_mean_counts = {
+        group_name: int(packed_means[group_name].get("attn_block_count", 0))
+        for group_name in CONFIDENCE_GROUPS
+    }
+    attn_block_extra_counts = {
+        group_name: int(packed_means[group_name].get("attn_block_extra_count", 0))
+        for group_name in CONFIDENCE_GROUPS
+    }
     logging.info(
         "H5 has %d examples. selected low_conf=%d (<=%.3f), high_conf=%d (>=%.3f). "
-        "QKV mean n=%s MLP-input mean n=%s.",
+        "QKV/concat mean n=%s MLP mean n=%s attn_block mean n=%s site=%s.",
         h5_example_count,
         low_conf_count,
         args.low_conf_threshold,
@@ -925,6 +1359,8 @@ def main() -> None:
         args.high_conf_threshold,
         qkv_mean_counts,
         mlp_mean_counts,
+        attn_block_mean_counts,
+        args.intervention_site,
     )
     direction_packed = compute_high_minus_low_directions(packed_means)
     direction_torch = _to_torch_means(direction_packed, device=device, torch_dtype=torch_dtype)
@@ -941,11 +1377,12 @@ def main() -> None:
         signed_base = float(GROUP_STEERING_SIGN[group_name])
         logging.info(
             "Steering group=%s (%d selected H5 ids) with sign=%+.1f * alpha * (high-low); "
-            "%d heads and %d MLP layers shifted simultaneously.",
+            "%d heads, %d attn blocks, and %d MLP layers shifted simultaneously.",
             group_name,
             sum(len(ids) for ids in selected_ids_by_group[group_name].values()),
             signed_base,
             num_selected_layer_head_pairs,
+            len(attn_block_layers),
             len(mlp_layers),
         )
         for split_name, eval_ds in [("train", train_ds), ("validation", val_ds)]:
@@ -1025,14 +1462,17 @@ def main() -> None:
                     for alpha in args.alpha:
                         signed_alpha = signed_base * float(alpha)
                         tracker_name = tracker_mode_name(mode_name, float(alpha))
-                        response, _ = greedy_generate_componentwise_input_mass_mean_shifted(
+                        response, _ = greedy_generate_componentwise_mass_mean_shifted(
                             model=model,
                             local_prompt=local_prompt,
                             max_new_tokens=args.model_max_new_tokens,
                             mode=mode_name,
+                            model_name=args.model_name,
+                            intervention_site=args.intervention_site,
                             selected_heads_by_layer=selected_heads_by_layer,
                             selected_kv_heads=selected_kv_heads,
                             mlp_layers=mlp_layers,
+                            attn_block_layers=attn_block_layers,
                             directions=direction_torch,
                             expected_guess_tokens=args.expected_guess_tokens,
                             expected_probability_tokens=args.expected_probability_tokens,
@@ -1122,6 +1562,7 @@ def main() -> None:
         ablate_layers=run_layers,
         selected_heads_by_layer=selected_heads_by_layer,
         mlp_layers=mlp_layers,
+        attn_block_layers=attn_block_layers,
         num_selected_layer_head_pairs=num_selected_layer_head_pairs,
         tracker_modes=tracker_modes,
         prompt_indices=prompt_indices,
@@ -1132,6 +1573,8 @@ def main() -> None:
         mlp_mean_counts=mlp_mean_counts,
         qkv_extra_counts=qkv_extra_counts,
         mlp_extra_counts=mlp_extra_counts,
+        attn_block_mean_counts=attn_block_mean_counts,
+        attn_block_extra_counts=attn_block_extra_counts,
         evaluated_counts=evaluated_counts,
         skipped_one_confidence=skipped_one_confidence,
         mode_confidence=mode_confidence,
@@ -1149,6 +1592,7 @@ def main() -> None:
                 ablate_layers=run_layers,
                 selected_heads_by_layer=selected_heads_by_layer,
                 mlp_layers=mlp_layers,
+                attn_block_layers=attn_block_layers,
                 num_selected_layer_head_pairs=num_selected_layer_head_pairs,
                 tracker_modes=tracker_modes,
                 low_conf_count=low_conf_count,
@@ -1156,6 +1600,7 @@ def main() -> None:
                 h5_example_count=h5_example_count,
                 qkv_mean_counts=qkv_mean_counts,
                 mlp_mean_counts=mlp_mean_counts,
+                attn_block_mean_counts=attn_block_mean_counts,
                 evaluated_counts=evaluated_counts,
                 skipped_one_confidence=skipped_one_confidence,
                 mode_confidence=mode_confidence,

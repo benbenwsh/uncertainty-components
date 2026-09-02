@@ -73,9 +73,8 @@ def parse_linguistic_confidence_from_response(response_str: str) -> float | None
     tail = matches[0].group(1)
     tail = tail.split("\n")[0].strip()
     tail_collapsed = " ".join(tail.split())
-    lowered = tail_collapsed.casefold()
     for phrase, prob in _LINGUISTIC_PHRASES_BY_LENGTH:
-        if phrase.casefold() in lowered:
+        if re.fullmatch(re.escape(phrase) + r"\.?", tail_collapsed, re.IGNORECASE):
             return float(prob)
     return None
 

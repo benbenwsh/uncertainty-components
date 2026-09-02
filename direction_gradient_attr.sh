@@ -25,27 +25,27 @@ uptime
 #   --granularity coarse fine
 
 # Mistral version (works)
-python3 ./direction_gradient_attr/run_direction_gradient_attr.py \
-  --model_name mistralai/Mistral-7B-Instruct-v0.1 \
-  --input_h5 ./process_generations/processed_generations_more_h5/mistral/2_200_9_prob_toks/train_verbalised_embeddings.h5 \
-  --device cuda:0 \
-  --dtype bfloat16 \
-  --expected_probability_tokens 7 \
-  --max_examples_for_mean 50 \
-  --granularity coarse fine
+# python3 ./direction_gradient_attr/run_direction_gradient_attr.py \
+#   --model_name mistralai/Mistral-7B-Instruct-v0.1 \
+#   --input_h5 ./process_generations/processed_generations_more_h5/mistral/2_200_9_prob_toks/train_verbalised_embeddings.h5 \
+#   --device cuda:0 \
+#   --dtype bfloat16 \
+#   --expected_probability_tokens 7 \
+#   --max_examples_for_mean 50 \
+#   --granularity coarse fine
 
 # Default --rerun_autoregressive greedy-decodes Guess:/Probability: from each H5 question.
 # Use --no-rerun_autoregressive to reconstruct the prefix from stored decoded_tokens.
 
 # Linguistic Confidence (Mistral only):
-# python3 ./direction_gradient_attr/run_direction_gradient_attr.py \
-#   --model_name mistralai/Mistral-7B-Instruct-v0.1 \
-#   --input_h5 ./process_generations/processed_generations_more_h5/5_trivia_mistral_linguistic_extended_train/balanced/train_verbalised_embeddings.h5 \
-#   --device cuda:0 \
-#   --dtype bfloat16 \
-#   --linguistic_confidence_prompt \
-#   --expected_confidence_tokens 5 \
-#   --high_conf_threshold 0.7 \
-#   --low_conf_threshold 0.3 \
-#   --max_examples_for_mean 50 \
-#   --granularity coarse fine
+python3 ./direction_gradient_attr/run_direction_gradient_attr.py \
+  --model_name mistralai/Mistral-7B-Instruct-v0.1 \
+  --input_h5 ./process_generations/processed_generations_more_h5/5_trivia_mistral_linguistic_extended_train/balanced/train_verbalised_embeddings.h5 \
+  --device cuda:0 \
+  --dtype bfloat16 \
+  --linguistic_confidence_prompt \
+  --expected_confidence_tokens 5 \
+  --high_conf_threshold 0.7 \
+  --low_conf_threshold 0.3 \
+  --max_examples_for_mean 50 \
+  --granularity coarse fine

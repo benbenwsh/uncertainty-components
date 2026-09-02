@@ -351,7 +351,11 @@ def _first_probability_value_char_span(full_str: str) -> tuple[int, int] | None:
 
 
 def _first_confidence_value_char_span(full_str: str) -> tuple[int, int] | None:
-    """Return [start,end] char span for the first linguistic phrase after ``Confidence:``."""
+    """Return [start,end] char span for the first linguistic phrase after ``Confidence:``.
+
+    Alignment helper for joined decoded tokens (Mistral omits the phrase space).
+    Label parsing uses the detokenized response and requires the spaced phrase.
+    """
     if not full_str:
         return None
     matches = list(
@@ -362,11 +366,16 @@ def _first_confidence_value_char_span(full_str: str) -> tuple[int, int] | None:
     match = matches[0]
     line = match.group(1).split("\n")[0]
     for phrase, _prob in _LINGUISTIC_PHRASES_BY_LENGTH:
-        found = re.search(re.escape(phrase), line, re.IGNORECASE)
-        if found:
-            abs_start = match.start(1) + found.start()
-            abs_end = match.start(1) + found.end() - 1
-            return abs_start, abs_end
+        candidates = (phrase,)
+        stripped = re.sub(r"\s+", "", phrase)
+        if stripped != phrase:
+            candidates = (phrase, stripped)
+        for candidate in candidates:
+            found = re.search(re.escape(candidate), line, re.IGNORECASE)
+            if found:
+                abs_start = match.start(1) + found.start()
+                abs_end = match.start(1) + found.end() - 1
+                return abs_start, abs_end
     return None
 
 
@@ -788,7 +797,7 @@ def process_example(
         return None
     full_str = "".join(decoded_tokens)
     if linguistic_confidence_prompt:
-        prob = parse_linguistic_confidence_from_response(full_str)
+        prob = parse_linguistic_confidence_from_response(response_str)
         if prob is None:
             logging.warning(
                 "Skipping example %s: could not parse linguistic confidence from response. response=%r",
@@ -821,7 +830,16 @@ def process_example(
         return None
     last_guess_token_index, first_prob_token_index, end_prob_token_index = indices
     if linguistic_confidence_prompt:
-        prob_value_token_span = _confidence_value_token_span(decoded_tokens, full_str)
+        matched_span = match_linguistic_phrase_tokens(decoded_tokens, end_prob_token_index)
+        if matched_span is not None:
+            _phrase, phrase_toks = matched_span
+            prob_value_token_span = (
+                end_prob_token_index,
+                end_prob_token_index + len(phrase_toks) - 1,
+            )
+        else:
+            # Alignment only: joined Mistral tokens omit the phrase space.
+            prob_value_token_span = _confidence_value_token_span(decoded_tokens, full_str)
     else:
         prob_value_token_span = _probability_value_token_span(decoded_tokens, full_str)
     if prob_value_token_span is None:

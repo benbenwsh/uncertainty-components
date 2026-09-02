@@ -15,18 +15,18 @@ source /vol/cuda/13.0.0/setup.sh
 /usr/bin/nvidia-smi
 uptime
 
-python3 ./componentwise_input_mass_mean_shift/run_componentwise_input_mass_mean_shift.py \
+python3 ./componentwise_mean_ablation/run_componentwise_mean_ablation.py \
   --model_name google/gemma-3-12b-it \
   --input_h5 ./process_generations/processed_generations_more_h5/new_gemma/4_trivia_gemma_extended_with_concat_3000_train/balanced/train_verbalised_embeddings.h5 \
   --no-enable_brief \
   --num_samples 30 \
   --device cuda:0 \
   --dtype bfloat16 \
-  --ablate_heads m42,m47,a45.h3,m44,m43,a47.h8,a47.h7,m33,m40,a43.h9
+  --ablate_heads m42,m47,a45.h3,m44,m43,a47.h8,a47.h7,m33,m40,a43.h9 \
   --dataset trivia_qa \
   --low_conf_threshold 0.2 \
   --high_conf_threshold 0.8 \
   --expected_guess_tokens 3 \
   --expected_probability_tokens 5 \
-  --alpha 0.5 1.0 1.5 \
+  --intervention_site output \
   --ablation_mode none probability_pre_and_post_period_digit_mean_replace extended_probability_last_token_mean_replace probability_last_token_mean_replace

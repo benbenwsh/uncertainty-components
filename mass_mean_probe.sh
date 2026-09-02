@@ -21,14 +21,18 @@ uptime
 # python3 ./layerwise_mean_ablation/run_mean_ablation.py --input_h5 ./semantic_uncertainty/processed_generations_h5/3_train_200_samples_temp_0/train_verbalised_embeddings.h5 --num_samples 200 --device cuda:0 --ablate_layers 0-6 --no-mean_from_low_confidence
 
 python3 ./mass_mean_probe/run_mass_mean_probe.py \
-  --input_h5 ./process_generations/processed_generations_more_h5/2_200_concat/train_verbalised_embeddings.h5 \
-  --num_samples 200 \
+  --model_name google/gemma-3-12b-it \
+  --input_h5 ./process_generations/processed_generations_more_h5/new_gemma/4_trivia_gemma_extended_with_concat_3000_train/balanced/train_verbalised_embeddings.h5 \
+  --num_samples 50 \
   --device cuda:0 \
-  --ablate_layers 14-24 \
-  --alpha 0.0 1.0 2.0 3.0 \
+  --ablate_layers 0-47 \
+  --dtype bfloat16 \
+  --alpha 0.0 0.25 0.5 1.0 2.0 \
   --ablation_targets low high \
-  --low_conf_threshold 0.1 \
-  --high_conf_threshold 0.9 \
+  --low_conf_threshold 0.2 \
+  --high_conf_threshold 0.8 \
+  --expected_guess_tokens 3 \
+  --expected_probability_tokens 5 \
   --new_h5_format \
   --no-enable_brief \
-  --ablation_mode none all_tokens_mean_replace generated_tokens_mean_replace
+  --ablation_mode none last_a_mean_replace last_a_and_panl_mean_replace last_a_panl_and_pc_mean_replace panl_mean_replace pc_mean_replace

@@ -755,26 +755,49 @@ def write_layer_token_grid_plot(
     run_layers: Sequence[int],
     token_labels: Sequence[str],
     matrix_values: np.ndarray,  # [n_layers, n_tokens], may include nan
-    matrix_deviation_desired: np.ndarray,  # [n_layers, n_tokens], >=0 in desired direction only
+    matrix_deviation_desired: np.ndarray,
     mean_from_low_confidence: bool,
+    ablate_with_same_confidence: bool = False,
 ) -> None:
     n_rows, n_cols = matrix_values.shape
-    max_dev = (
-        float(np.nanmax(matrix_deviation_desired))
-        if np.isfinite(matrix_deviation_desired).any()
-        else 0.0
-    )
-    if max_dev > 0:
-        alpha = np.clip(matrix_deviation_desired / max_dev, 0.0, 1.0)
-    else:
-        alpha = np.zeros_like(matrix_deviation_desired)
-    alpha = np.nan_to_num(alpha, nan=0.0)
-
     rgba = np.zeros((n_rows, n_cols, 4), dtype=np.float32)
-    rgba[:, :, 0] = 0.1
-    rgba[:, :, 1] = 0.3
-    rgba[:, :, 2] = 1.0
-    rgba[:, :, 3] = alpha
+    if ablate_with_same_confidence:
+        signed = np.asarray(matrix_deviation_desired, dtype=np.float32)
+        increases = np.maximum(signed, 0.0)
+        decreases = np.maximum(-signed, 0.0)
+        max_up = float(np.nanmax(increases)) if np.isfinite(increases).any() else 0.0
+        max_down = float(np.nanmax(decreases)) if np.isfinite(decreases).any() else 0.0
+        max_dev = max(max_up, max_down)
+        if max_dev > 0:
+            blue_alpha = np.clip(increases / max_dev, 0.0, 1.0)
+            red_alpha = np.clip(decreases / max_dev, 0.0, 1.0)
+        else:
+            blue_alpha = np.zeros_like(signed)
+            red_alpha = np.zeros_like(signed)
+        blue_alpha = np.nan_to_num(blue_alpha, nan=0.0)
+        red_alpha = np.nan_to_num(red_alpha, nan=0.0)
+        use_red = red_alpha > blue_alpha
+        rgba[:, :, 0] = np.where(use_red, 1.0, 0.1)
+        rgba[:, :, 1] = np.where(use_red, 0.1, 0.3)
+        rgba[:, :, 2] = np.where(use_red, 0.1, 1.0)
+        rgba[:, :, 3] = np.maximum(blue_alpha, red_alpha)
+        title = "Layer x token confidence (blue = above baseline, red = below)"
+    else:
+        max_dev = (
+            float(np.nanmax(matrix_deviation_desired))
+            if np.isfinite(matrix_deviation_desired).any()
+            else 0.0
+        )
+        if max_dev > 0:
+            alpha = np.clip(matrix_deviation_desired / max_dev, 0.0, 1.0)
+        else:
+            alpha = np.zeros_like(matrix_deviation_desired)
+        alpha = np.nan_to_num(alpha, nan=0.0)
+        rgba[:, :, 0] = 0.1
+        rgba[:, :, 1] = 0.3
+        rgba[:, :, 2] = 1.0
+        rgba[:, :, 3] = alpha
+        title = "Layer x token confidence (blue alpha = |deviation from baseline|)"
 
     fig, ax = plt.subplots(figsize=(max(9.0, 1.4 * n_cols), max(6.0, 0.35 * n_rows)))
     ax.imshow(rgba, aspect="auto", interpolation="nearest")
@@ -788,7 +811,7 @@ def write_layer_token_grid_plot(
     ax.set_yticks(np.arange(n_rows))
     ax.set_yticklabels([str(layer) for layer in run_layers])
     ax.set_ylabel("Layer")
-    ax.set_title("Layer x token confidence (blue alpha = |deviation from baseline|)")
+    ax.set_title(title)
     _apply_input_output_token_axes(ax, n_cols=n_cols, token_labels=token_labels)
 
     ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
@@ -1238,11 +1261,14 @@ def main() -> None:
                 continue
             matrix_values[r, c] = float(val)
             if baseline_mean is not None:
-                matrix_dev_desired[r, c] = _directed_deviation_from_baseline(
-                    float(val),
-                    float(baseline_mean),
-                    mean_from_low_confidence=args.mean_from_low_confidence,
-                )
+                if args.ablate_with_same_confidence:
+                    matrix_dev_desired[r, c] = float(val) - float(baseline_mean)
+                else:
+                    matrix_dev_desired[r, c] = _directed_deviation_from_baseline(
+                        float(val),
+                        float(baseline_mean),
+                        mean_from_low_confidence=args.mean_from_low_confidence,
+                    )
             else:
                 matrix_dev_desired[r, c] = np.nan
 
@@ -1341,6 +1367,7 @@ def main() -> None:
         matrix_values=matrix_values,
         matrix_deviation_desired=matrix_dev_desired,
         mean_from_low_confidence=args.mean_from_low_confidence,
+        ablate_with_same_confidence=args.ablate_with_same_confidence,
     )
     logging.info("Wrote %s", grid_path)
 

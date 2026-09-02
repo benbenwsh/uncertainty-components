@@ -33,10 +33,14 @@ python3 ./layerwise_mean_ablation/run_mean_ablation.py \
   --model_name google/gemma-3-12b-it \
   --input_h5 ./process_generations/processed_generations_more_h5/new_gemma/4_trivia_gemma_extended_with_concat_3000_train/balanced/train_verbalised_embeddings.h5 \
   --no-enable_brief \
-  --num_samples 50 \
+  --dtype bfloat16 \
+  --num_samples 30 \
   --device cuda:0 \
   --new_h5_format \
-  --individual_layers \
+  --ablate_layers 0 \
+  --expected_guess_tokens 3 \
+  --expected_probability_tokens 5 \
+  --all_confidence_group_pairs \
   --ablation_mode none semantic_answer_mean_replace semantic_answer_including_first_prob_mean_replace
 
   

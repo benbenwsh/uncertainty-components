@@ -45,6 +45,7 @@ from blockwise_zero_ablation.run_blockwise_zero_ablation import (
 )
 from layerwise_mean_ablation.run_mean_ablation import (
     PROBABILITY_ROW_INDEX_MODES,
+    SUPPORTED_MODEL_NAMES,
     _absolute_probability_value_start_position,
     _as_layer_hidden,
     _is_expected_or_plus_two,
@@ -54,6 +55,11 @@ from layerwise_mean_ablation.run_mean_ablation import (
     compute_verbalised_confidence_effect,
     load_sentence_transformer_for_metrics,
     parse_semantic_answer_from_response,
+    probability_row_indices_for_mode,
+    resolve_combo_target_ids,
+    resolve_confidence_groups,
+    truncate_sorted_ids,
+    validate_last_a_panl_and_pc_mode,
 )
 from mass_mean_probe.run_mass_mean_probe import (
     DEFAULT_SEMANTIC_SIMILARITY_MODEL,
@@ -61,7 +67,6 @@ from mass_mean_probe.run_mass_mean_probe import (
 )
 
 
-TRAIN_RATIO = 0.9
 REQUIRED_COMPONENTS = ("res", "attn", "mlp")
 TARGET_COMPONENTS = ("attn", "mlp")
 REQUIRED_EMBEDDING_FIELDS = (
@@ -125,8 +130,10 @@ def write_config_txt(
     mode_uncertainty_score_means: Optional[Dict[str, Dict[str, Optional[float]]]] = None,
     mode_uncertainty_score_counts: Optional[Dict[str, Dict[str, int]]] = None,
 ) -> None:
-    source_group = "low_confidence" if args.mean_from_low_confidence else "high_confidence"
-    target_group = "high_confidence" if args.mean_from_low_confidence else "low_confidence"
+    source_group, target_group = resolve_confidence_groups(
+        mean_from_low_confidence=args.mean_from_low_confidence,
+        ablate_with_same_confidence=args.ablate_with_same_confidence,
+    )
     lines = [
         "Blockwise Mean Ablation Configuration",
         "====================================",
@@ -158,6 +165,7 @@ def write_config_txt(
         f"generated_tokens_source={args.generated_tokens_source}",
         f"ablate_subblocks={args.ablate_subblocks}",
         f"mean_from_low_confidence={args.mean_from_low_confidence}",
+        f"ablate_with_same_confidence={args.ablate_with_same_confidence}",
         f"mean_source_group={source_group}",
         f"ablation_target_group={target_group}",
         f"ablate_layers_spec={args.ablate_layers}",
@@ -445,6 +453,7 @@ def _whole_sequence_positions_and_replacements(
 def _positions_and_replacements_for_mode(
     *,
     mode: str,
+    model_name: str,
     prompt_len: int,
     decoded_tokens: List[str],
     layer_means: Dict[str, torch.Tensor],
@@ -468,7 +477,7 @@ def _positions_and_replacements_for_mode(
         return positions[: len(vectors)], vectors
 
     if mode in PROBABILITY_ROW_INDEX_MODES:
-        row_indices = PROBABILITY_ROW_INDEX_MODES[mode]
+        row_indices = probability_row_indices_for_mode(mode, model_name)
         positions = _absolute_prob_positions_at_row_indices(
             prompt_len,
             decoded_tokens,
@@ -620,6 +629,7 @@ def build_subblock_mean_replace_hooks(
     *,
     subblock: str,
     mode: str,
+    model_name: str,
     prompt_len: int,
     decoded_tokens_provider: Callable[[], List[str]],
     layer_to_means: Dict[int, Dict[str, torch.Tensor]],
@@ -637,6 +647,7 @@ def build_subblock_mean_replace_hooks(
                 decoded_tokens = decoded_tokens_provider()
                 positions, vectors = _positions_and_replacements_for_mode(
                     mode=mode,
+                    model_name=model_name,
                     prompt_len=prompt_len,
                     decoded_tokens=decoded_tokens,
                     layer_means=local_layer_means,
@@ -664,6 +675,7 @@ def greedy_generate_mean_ablated(
     subblock: str,
     mode: str,
     layer_to_means: Dict[int, Dict[str, torch.Tensor]],
+    model_name: str,
     generated_tokens_source: str = "probability_prefix_last_token",
 ) -> Tuple[str, List[str]]:
     tokens = model.to_tokens(local_prompt)
@@ -677,6 +689,7 @@ def greedy_generate_mean_ablated(
         layer_indices=layer_indices,
         subblock=subblock,
         mode=mode,
+        model_name=model_name,
         prompt_len=prompt_len,
         decoded_tokens_provider=_decoded_tokens_provider,
         layer_to_means=layer_to_means,
@@ -693,7 +706,12 @@ def greedy_generate_mean_ablated(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default="mistralai/Mistral-7B-Instruct-v0.1")
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="mistralai/Mistral-7B-Instruct-v0.1",
+        choices=list(SUPPORTED_MODEL_NAMES),
+    )
     parser.add_argument(
         "--input_h5",
         type=str,
@@ -709,7 +727,12 @@ def main() -> None:
         default="trivia_qa",
         choices=["trivia_qa", "squad", "bioasq", "nq", "svamp", "gsm8k"],
     )
-    parser.add_argument("--num_samples", type=int, default=200)
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=200,
+        help="Max examples per confidence group (sorted IDs, then truncated). No train/val ratio split.",
+    )
     parser.add_argument("--num_few_shot", type=int, default=0)
     parser.add_argument("--model_max_new_tokens", type=int, default=30)
     parser.add_argument("--brief_prompt", type=str, default="default", choices=["default", "chat"])
@@ -724,9 +747,11 @@ def main() -> None:
         default=[
             "none",
             "probability_tokens_mean_replace",
-            "probability_first_token_mean_replace",
-            "probability_first_two_tokens_mean_replace",
-            "probability_first_two_and_index6_tokens_mean_replace",
+            "last_a_mean_replace",
+            "last_a_and_panl_mean_replace",
+            "last_a_panl_and_pc_mean_replace",
+            "panl_mean_replace",
+            "pc_mean_replace",
             "probability_last_token_mean_replace",
             "probability_span_except_last_token_mean_replace",
             "all_pre_probability_tokens_mean_replace",
@@ -741,9 +766,11 @@ def main() -> None:
         choices=[
             "none",
             "probability_tokens_mean_replace",
-            "probability_first_token_mean_replace",
-            "probability_first_two_tokens_mean_replace",
-            "probability_first_two_and_index6_tokens_mean_replace",
+            "last_a_mean_replace",
+            "last_a_and_panl_mean_replace",
+            "last_a_panl_and_pc_mean_replace",
+            "panl_mean_replace",
+            "pc_mean_replace",
             "probability_last_token_mean_replace",
             "probability_span_except_last_token_mean_replace",
             "all_pre_probability_tokens_mean_replace",
@@ -756,12 +783,16 @@ def main() -> None:
             "generated_tokens_mean_replace",
         ],
         help=(
-            "One or more ablation modes. probability_first_token_mean_replace: same gating as "
-            "probability_tokens_mean_replace but only H5 probability row 0. "
-            "probability_first_two_tokens_mean_replace: rows 0 and 1. "
-            "probability_first_two_and_index6_tokens_mean_replace: "
-            "same gating as probability_tokens_mean_replace but only H5 probability rows 0, 1, and 6 "
-            "(fixed index 6, not -1). probability_last_token_mean_replace: mean-replace only the "
+            "One or more ablation modes. last_a_mean_replace: same gating as "
+            "probability_tokens_mean_replace but only H5 probability row 0 (last answer token). "
+            "last_a_and_panl_mean_replace: rows 0 and 1 (last answer token and post-answer newline). "
+            "last_a_panl_and_pc_mean_replace: "
+            "same gating as probability_tokens_mean_replace but only H5 probability rows 0, 1, and "
+            "a model-specific pre-confidence index (Mistral 6, Gemma 3; unsupported for Qwen). "
+            "panl_mean_replace: only H5 probability row 1 (post-answer newline). "
+            "pc_mean_replace: only the model-specific pre-confidence index "
+            "(Mistral 6, Gemma 3; unsupported for Qwen). "
+            "probability_last_token_mean_replace: mean-replace only the "
             "last token of the H5 probability span (end_prob; first value digit). "
             "probability_span_except_last_token_mean_replace: mean-replace all probability-span tokens "
             "except that last token (all marker-span tokens before end_prob). "
@@ -793,7 +824,25 @@ def main() -> None:
     parser.add_argument("--ablate_subblocks", type=str, nargs="+", required=True, choices=["attn", "mlp"])
     parser.add_argument("--low_conf_threshold", type=float, default=0.1)
     parser.add_argument("--high_conf_threshold", type=float, default=0.9)
-    parser.add_argument("--mean_from_low_confidence", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--mean_from_low_confidence",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "If true (default), compute means from low-confidence examples and ablate high-confidence examples. "
+            "If false, reverse source and target groups. "
+            "When --ablate_with_same_confidence is set, targets match the mean-source group instead."
+        ),
+    )
+    parser.add_argument(
+        "--ablate_with_same_confidence",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If true, ablate examples from the same confidence group used for the mean "
+            "(within-group control). If false (default), ablate the opposite group."
+        ),
+    )
     parser.add_argument("--expected_probability_tokens", type=int, default=7)
     parser.add_argument("--expected_guess_tokens", type=int, default=5)
     parser.add_argument("--parse_mode_verbalised_confidence", action=argparse.BooleanOptionalAction, default=True)
@@ -804,6 +853,7 @@ def main() -> None:
 
     if len(set(args.ablation_mode)) != len(args.ablation_mode):
         raise ValueError(f"Duplicate ablation modes are not allowed: {args.ablation_mode}")
+    validate_last_a_panl_and_pc_mode(args.model_name, args.ablation_mode)
     if any(m in WHOLE_SEQUENCE_MODES for m in args.ablation_mode):
         if len(args.generated_tokens_source) != 1:
             raise ValueError(
@@ -899,12 +949,27 @@ def main() -> None:
     if low_ids_check != low_ids or high_ids_check != high_ids:
         raise ValueError("Confidence grouping mismatch between mean builder and collector.")
 
-    if args.mean_from_low_confidence:
-        ablation_target_ids = high_ids
-        target_group = "high_confidence"
-    else:
-        ablation_target_ids = low_ids
-        target_group = "low_confidence"
+    eval_low_ids = set(truncate_sorted_ids(low_ids, args.num_samples))
+    eval_high_ids = set(truncate_sorted_ids(high_ids, args.num_samples))
+    logging.info(
+        "Eval sample cap num_samples=%d: eval_low=%d eval_high=%d (from full low=%d high=%d)",
+        args.num_samples,
+        len(eval_low_ids),
+        len(eval_high_ids),
+        len(low_ids),
+        len(high_ids),
+    )
+
+    ablation_target_ids = resolve_combo_target_ids(
+        eval_low_ids,
+        eval_high_ids,
+        mean_from_low_confidence=args.mean_from_low_confidence,
+        ablate_with_same_confidence=args.ablate_with_same_confidence,
+    )
+    mean_source_group, target_group = resolve_confidence_groups(
+        mean_from_low_confidence=args.mean_from_low_confidence,
+        ablate_with_same_confidence=args.ablate_with_same_confidence,
+    )
     if not ablation_target_ids:
         raise ValueError(f"No examples available in ablation target group: {target_group}.")
 
@@ -915,11 +980,14 @@ def main() -> None:
         torch_dtype=torch_dtype,
     )
     logging.info(
-        "Loaded %d H5 examples. low_conf=%d high_conf=%d target_group=%s target_ids=%d layers=%s",
+        "Loaded %d H5 examples. low_conf=%d high_conf=%d mean_source=%s target_group=%s "
+        "ablate_with_same_confidence=%s target_ids=%d layers=%s",
         len(examples_h5),
         len(low_ids),
         len(high_ids),
+        mean_source_group,
         target_group,
+        args.ablate_with_same_confidence,
         len(ablation_target_ids),
         run_layers,
     )
@@ -974,15 +1042,11 @@ def main() -> None:
         used_none_cache: Dict[str, Dict[str, Dict[str, object]]] = {"train": {}, "validation": {}}
 
         for split_name, eval_ds in [("train", train_ds), ("validation", val_ds)]:
-            split_target = round(args.num_samples * TRAIN_RATIO) if split_name == "train" else round(
-                args.num_samples * (1 - TRAIN_RATIO)
-            )
             id_to_index = {encode_example_id(ex["id"]): i for i, ex in enumerate(eval_ds)}
-            split_target_ids = sorted(ex_id for ex_id in ablation_target_ids if ex_id in id_to_index)
-            if split_target > 0 and not split_target_ids:
+            selected_ids = sorted(ex_id for ex_id in ablation_target_ids if ex_id in id_to_index)
+            if not selected_ids:
                 logging.warning("No ablation target IDs available for %s split.", split_name)
                 continue
-            selected_ids = split_target_ids[: min(split_target, len(split_target_ids))]
             logging.info("Generating for %d examples (%s split).", len(selected_ids), split_name)
 
             for i, ex_id in enumerate(selected_ids):
@@ -1042,6 +1106,7 @@ def main() -> None:
                                 subblock=subblock,
                                 mode=mode,
                                 layer_to_means={layer: layer_means[subblock][layer] for layer in layer_subset},
+                                model_name=args.model_name,
                                 generated_tokens_source=generated_tokens_source,
                             )
                             mode_confidence = (
@@ -1221,12 +1286,8 @@ def main() -> None:
     def build_none_cache() -> Dict[str, Dict[str, Dict[str, object]]]:
         none_cache: Dict[str, Dict[str, Dict[str, object]]] = {"train": {}, "validation": {}}
         for split_name, eval_ds in [("train", train_ds), ("validation", val_ds)]:
-            split_target = round(args.num_samples * TRAIN_RATIO) if split_name == "train" else round(
-                args.num_samples * (1 - TRAIN_RATIO)
-            )
             id_to_index = {encode_example_id(ex["id"]): i for i, ex in enumerate(eval_ds)}
-            split_target_ids = sorted(ex_id for ex_id in ablation_target_ids if ex_id in id_to_index)
-            selected_ids = split_target_ids[: min(split_target, len(split_target_ids))]
+            selected_ids = sorted(ex_id for ex_id in ablation_target_ids if ex_id in id_to_index)
             for ex_id in selected_ids:
                 ds_idx = id_to_index.get(ex_id)
                 if ds_idx is None:

@@ -101,6 +101,12 @@ MISTRAL_PROBABILITY_PREFIX_TOKENS = [
     [""],  # space before number decodes as empty string
 ]
 
+SUPPORTED_MODEL_NAMES = (
+    "mistralai/Mistral-7B-Instruct-v0.1",
+    "google/gemma-3-12b-it",
+    "Qwen/Qwen2.5-32B-Instruct",
+)
+
 # Active tables; set via configure_prefix_tokens_for_model(model_name).
 GUESS_PREFIX_TOKENS: list[list[str]] = GEMMA_GUESS_PREFIX_TOKENS
 PROBABILITY_PREFIX_TOKENS: list[list[str]] = GEMMA_PROBABILITY_PREFIX_TOKENS
@@ -121,8 +127,7 @@ def configure_prefix_tokens_for_model(model_name: str) -> None:
     else:
         raise ValueError(
             f"Unsupported model_name for Guess/Probability token parsing: {model_name!r}. "
-            "Supported: 'google/gemma-3-12b-it', 'Qwen/Qwen2.5-32B-Instruct', "
-            "'mistralai/Mistral-7B-Instruct-v0.1'."
+            f"Supported: {list(SUPPORTED_MODEL_NAMES)}."
         )
 
 GUESS_SPAN_ABLATION_MODES = frozenset({
@@ -133,11 +138,56 @@ GUESS_SPAN_ABLATION_MODES = frozenset({
 
 DEFAULT_SEMANTIC_SIMILARITY_MODEL = "all-MiniLM-L6-v2"
 
-PROBABILITY_ROW_INDEX_MODES: Dict[str, Tuple[int, ...]] = {
-    "probability_first_token_mean_replace": (0,),
-    "probability_first_two_tokens_mean_replace": (0, 1),
-    "probability_first_two_and_index6_tokens_mean_replace": (0, 1, 6),
-}
+LAST_A_MODE = "last_a_mean_replace"
+LAST_A_AND_PANL_MODE = "last_a_and_panl_mean_replace"
+LAST_A_PANL_AND_PC_MODE = "last_a_panl_and_pc_mean_replace"
+PANL_MODE = "panl_mean_replace"
+PC_MODE = "pc_mean_replace"
+
+PROBABILITY_ROW_INDEX_MODES = frozenset({
+    LAST_A_MODE,
+    LAST_A_AND_PANL_MODE,
+    LAST_A_PANL_AND_PC_MODE,
+    PANL_MODE,
+    PC_MODE,
+})
+
+_PC_INDEX_MODES = frozenset({LAST_A_PANL_AND_PC_MODE, PC_MODE})
+
+
+def _pc_row_index(model_name: str) -> int:
+    if model_name == "mistralai/Mistral-7B-Instruct-v0.1":
+        return 6
+    if model_name == "google/gemma-3-12b-it":
+        return 3
+    if model_name == "Qwen/Qwen2.5-32B-Instruct":
+        raise ValueError(f"PC-index ablation modes are not defined for {model_name}")
+    raise ValueError(
+        f"PC-index ablation modes are not defined for {model_name!r}. "
+        f"Supported: {list(SUPPORTED_MODEL_NAMES)}."
+    )
+
+
+def probability_row_indices_for_mode(mode: str, model_name: str) -> Tuple[int, ...]:
+    if mode == LAST_A_MODE:
+        return (0,)
+    if mode == LAST_A_AND_PANL_MODE:
+        return (0, 1)
+    if mode == PANL_MODE:
+        return (1,)
+    if mode == LAST_A_PANL_AND_PC_MODE:
+        return (0, 1, _pc_row_index(model_name))
+    if mode == PC_MODE:
+        return (_pc_row_index(model_name),)
+    raise ValueError(f"Unknown probability-row-index ablation mode: {mode!r}")
+
+
+def validate_last_a_panl_and_pc_mode(model_name: str, ablation_modes: Sequence[str]) -> None:
+    requested_pc_modes = [mode for mode in ablation_modes if mode in _PC_INDEX_MODES]
+    if requested_pc_modes and model_name == "Qwen/Qwen2.5-32B-Instruct":
+        raise ValueError(
+            f"{', '.join(requested_pc_modes)} is not defined for {model_name}"
+        )
 
 
 def _match_token_prefix(
@@ -1022,6 +1072,10 @@ def collect_confidence_group_ids(
         if conf >= high_conf_threshold:
             high_ids.add(ex_id)
     return low_ids, high_ids
+
+
+def truncate_sorted_ids(ids: Sequence[str], num_samples: int) -> List[str]:
+    return sorted(ids)[: min(num_samples, len(ids))]
 
 
 def compute_verbalised_embedding_group_means(
@@ -2330,9 +2384,13 @@ def greedy_generate_sem_ans_tokens_during_gen(
 
 
 def main() -> None:
-    TRAIN_RATIO = 0.9
     parser = argparse.ArgumentParser(description="Layerwise mean activation replacement inference (TransformerLens).")
-    parser.add_argument("--model_name", type=str, default="google/gemma-3-12b-it")
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="google/gemma-3-12b-it",
+        choices=list(SUPPORTED_MODEL_NAMES),
+    )
     parser.add_argument("--input_h5", type=str, required=True, help="Path to *_verbalised_embeddings.h5 file.")
     parser.add_argument(
         "--new_h5_format",
@@ -2354,7 +2412,12 @@ def main() -> None:
         default="trivia_qa",
         choices=["trivia_qa", "squad", "bioasq", "nq", "svamp", "gsm8k"],
     )
-    parser.add_argument("--num_samples", type=int, default=400)
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=400,
+        help="Max examples per confidence group (sorted IDs, then truncated). No train/val ratio split.",
+    )
     parser.add_argument("--num_few_shot", type=int, default=0)
     parser.add_argument("--model_max_new_tokens", type=int, default=50)
     parser.add_argument("--brief_prompt", type=str, default="default", choices=["default", "chat"])
@@ -2383,9 +2446,11 @@ def main() -> None:
             "guess_then_guess_and_probability_tokens_mean_replace",
             "probability_last_token_mean_replace",
             "probability_span_except_last_token_mean_replace",
-            "probability_first_token_mean_replace",
-            "probability_first_two_tokens_mean_replace",
-            "probability_first_two_and_index6_tokens_mean_replace",
+            "last_a_mean_replace",
+            "last_a_and_panl_mean_replace",
+            "last_a_panl_and_pc_mean_replace",
+            "panl_mean_replace",
+            "pc_mean_replace",
             "probability_value_mean_replace",
             "semantic_answer_mean_replace",
             "semantic_answer_including_first_prob_mean_replace",
@@ -2401,9 +2466,11 @@ def main() -> None:
             "guess_then_guess_and_probability_tokens_mean_replace",
             "probability_last_token_mean_replace",
             "probability_span_except_last_token_mean_replace",
-            "probability_first_token_mean_replace",
-            "probability_first_two_tokens_mean_replace",
-            "probability_first_two_and_index6_tokens_mean_replace",
+            "last_a_mean_replace",
+            "last_a_and_panl_mean_replace",
+            "last_a_panl_and_pc_mean_replace",
+            "panl_mean_replace",
+            "pc_mean_replace",
             "probability_value_mean_replace",
             "semantic_answer_mean_replace",
             "semantic_answer_including_first_prob_mean_replace",
@@ -2415,9 +2482,14 @@ def main() -> None:
             "replace resid at H5 probability span. probability_last_token_mean_replace: "
             "same gating as probability_tokens_mean_replace but only the last marker-span token. "
             "probability_span_except_last_token_mean_replace: same gating but all marker-span "
-            "tokens except that last token. probability_first_token_mean_replace: same gating but "
-            "only H5 probability row 0. probability_first_two_tokens_mean_replace: rows 0 and 1. "
-            "probability_first_two_and_index6_tokens_mean_replace: rows 0, 1, and 6 (fixed index, not -1). "
+            "tokens except that last token. last_a_mean_replace: same gating but "
+            "only H5 probability row 0 (last answer token). last_a_and_panl_mean_replace: rows 0 and 1 "
+            "(last answer token and post-answer newline). "
+            "last_a_panl_and_pc_mean_replace: rows 0, 1, and a model-specific pre-confidence index "
+            "(Mistral 6, Gemma 3; unsupported for Qwen). "
+            "panl_mean_replace: only H5 probability row 1 (post-answer newline). "
+            "pc_mean_replace: only the model-specific pre-confidence index "
+            "(Mistral 6, Gemma 3; unsupported for Qwen). "
             "all_pre_probability_tokens_mean_replace: "
             "replace resid at prompt + Guess + semantic-answer + Probability marker positions. "
             "guess_tokens_mean_replace: replace resid only at the Guess: prefix span (per-position means). "
@@ -2512,6 +2584,7 @@ def main() -> None:
     configure_prefix_tokens_for_model(args.model_name)
     if len(set(args.ablation_mode)) != len(args.ablation_mode):
         raise ValueError(f"Duplicate ablation modes are not allowed: {args.ablation_mode}")
+    validate_last_a_panl_and_pc_mode(args.model_name, args.ablation_mode)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -2604,6 +2677,16 @@ def main() -> None:
 
     logging.info("Low-confidence example IDs: %s", low_ids)
     logging.info("High-confidence example IDs: %s", high_ids)
+    eval_low_ids = set(truncate_sorted_ids(low_ids, args.num_samples))
+    eval_high_ids = set(truncate_sorted_ids(high_ids, args.num_samples))
+    logging.info(
+        "Eval sample cap num_samples=%d: eval_low=%d eval_high=%d (from full low=%d high=%d)",
+        args.num_samples,
+        len(eval_low_ids),
+        len(eval_high_ids),
+        len(low_ids),
+        len(high_ids),
+    )
     logging.info(
         "Loaded %d H5 examples. low_conf=%d (<=%.3f), high_conf=%d (>=%.3f), layers=%s, "
         "all_confidence_group_pairs=%s, mean_from_low_confidence=%s, ablate_with_same_confidence=%s, "
@@ -2622,8 +2705,8 @@ def main() -> None:
     for combo_name, mean_from_low, same in combos:
         mean_source_ids = low_ids if mean_from_low else high_ids
         combo_target_ids = resolve_combo_target_ids(
-            low_ids,
-            high_ids,
+            eval_low_ids,
+            eval_high_ids,
             mean_from_low_confidence=mean_from_low,
             ablate_with_same_confidence=same,
         )
@@ -2714,13 +2797,10 @@ def main() -> None:
         used_none_cache: Dict[str, Dict[str, Dict[str, object]]] = {"train": {}, "validation": {}}
 
         for split_name, eval_ds in [("train", train_ds), ("validation", val_ds)]:
-            split_target = (
-                round(args.num_samples * TRAIN_RATIO) if split_name == "train" else round(args.num_samples * (1 - TRAIN_RATIO))
-            )
             id_to_index = {encode_example_id(ex["id"]): i for i, ex in enumerate(eval_ds)}
-            split_target_ids = sorted(ex_id for ex_id in ablation_target_ids if ex_id in id_to_index)
+            selected_ids = sorted(ex_id for ex_id in ablation_target_ids if ex_id in id_to_index)
 
-            if split_target > 0 and not split_target_ids:
+            if not selected_ids:
                 logging.warning(
                     "No ablation target IDs available for %s split (mean_from_low_confidence=%s).",
                     split_name,
@@ -2728,7 +2808,6 @@ def main() -> None:
                 )
                 continue
 
-            selected_ids = split_target_ids[: min(split_target, len(split_target_ids))]
             logging.info(
                 "Generating for %d examples (%s split, target confidence subset).",
                 len(selected_ids),
@@ -2837,7 +2916,7 @@ def main() -> None:
                             raise ValueError(
                                 f"Mode {mode} requested but probability means are unavailable."
                             )
-                        row_indices = PROBABILITY_ROW_INDEX_MODES[mode]
+                        row_indices = probability_row_indices_for_mode(mode, args.model_name)
                         layer_to_mean_vectors_eval = {
                             layer_idx: layer_to_verbalised_embedding_means_eval[layer_idx]["probability"]
                             for layer_idx in layer_to_verbalised_embedding_means_eval
@@ -3168,12 +3247,8 @@ def main() -> None:
     def build_none_cache(ablation_target_ids: set[str]) -> Dict[str, Dict[str, Dict[str, object]]]:
         none_cache: Dict[str, Dict[str, Dict[str, object]]] = {"train": {}, "validation": {}}
         for split_name, eval_ds in [("train", train_ds), ("validation", val_ds)]:
-            split_target = (
-                round(args.num_samples * TRAIN_RATIO) if split_name == "train" else round(args.num_samples * (1 - TRAIN_RATIO))
-            )
             id_to_index = {encode_example_id(ex["id"]): i for i, ex in enumerate(eval_ds)}
-            split_target_ids = sorted(ex_id for ex_id in ablation_target_ids if ex_id in id_to_index)
-            selected_ids = split_target_ids[: min(split_target, len(split_target_ids))]
+            selected_ids = sorted(ex_id for ex_id in ablation_target_ids if ex_id in id_to_index)
             for ex_id in selected_ids:
                 ds_idx = id_to_index.get(ex_id)
                 if ds_idx is None:
@@ -3224,8 +3299,8 @@ def main() -> None:
             if target_group in none_cache_by_target:
                 continue
             target_ids = resolve_combo_target_ids(
-                low_ids,
-                high_ids,
+                eval_low_ids,
+                eval_high_ids,
                 mean_from_low_confidence=mean_from_low,
                 ablate_with_same_confidence=same,
             )
@@ -3309,8 +3384,8 @@ def main() -> None:
                 ablate_with_same_confidence=same,
             )
             combo_target_ids = resolve_combo_target_ids(
-                low_ids,
-                high_ids,
+                eval_low_ids,
+                eval_high_ids,
                 mean_from_low_confidence=mean_from_low,
                 ablate_with_same_confidence=same,
             )
@@ -3379,8 +3454,8 @@ def main() -> None:
             ablate_with_same_confidence=same,
         )
         combo_target_ids = resolve_combo_target_ids(
-            low_ids,
-            high_ids,
+            eval_low_ids,
+            eval_high_ids,
             mean_from_low_confidence=mean_from_low,
             ablate_with_same_confidence=same,
         )

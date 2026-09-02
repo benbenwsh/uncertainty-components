@@ -63,7 +63,12 @@ from process_generations_more_embs_from_h5 import (  # noqa: E402
 )
 from layerwise_mean_ablation.run_mean_ablation import (  # noqa: E402
     LAYER_INDEXING_NOTE,
+    PROBABILITY_ROW_INDEX_MODES,
+    SUPPORTED_MODEL_NAMES,
     hook_name_for_display_layer,
+    probability_row_indices_for_mode,
+    truncate_sorted_ids,
+    validate_last_a_panl_and_pc_mode,
 )
 
 CONFIDENCE_PROMPT_NUMERIC = (
@@ -149,15 +154,8 @@ def configure_prefix_tokens_for_model(model_name: str) -> None:
     else:
         raise ValueError(
             f"Unsupported model_name for Guess/Probability token parsing: {model_name!r}. "
-            "Supported: 'google/gemma-3-12b-it', 'Qwen/Qwen2.5-32B-Instruct', "
-            "'mistralai/Mistral-7B-Instruct-v0.1'."
+            f"Supported: {list(SUPPORTED_MODEL_NAMES)}."
         )
-
-PROBABILITY_ROW_INDEX_MODES: Dict[str, Tuple[int, ...]] = {
-    "probability_first_token_mean_replace": (0,),
-    "probability_first_two_tokens_mean_replace": (0, 1),
-    "probability_first_two_and_index6_tokens_mean_replace": (0, 1, 6),
-}
 
 DEFAULT_SEMANTIC_SIMILARITY_MODEL = "all-MiniLM-L6-v2"
 
@@ -1328,6 +1326,7 @@ def _apply_steering_at_positions_with_generated_source(
 def _direction_mode_activation_applier_builder(
     mode: str,
     *,
+    model_name: str,
     expected_guess_tokens: int,
     expected_probability_tokens: int,
     expected_confidence_tokens: int,
@@ -1374,7 +1373,7 @@ def _direction_mode_activation_applier_builder(
             return _apply_probability_tokens_mean_replace
 
         if mode in PROBABILITY_ROW_INDEX_MODES:
-            row_indices = PROBABILITY_ROW_INDEX_MODES[mode]
+            row_indices = probability_row_indices_for_mode(mode, model_name)
 
             def _apply_probability_row_indices_mean_replace(
                 activation: torch.Tensor,
@@ -1742,6 +1741,7 @@ def build_direction_perturb_hooks(
     layer_to_span_delta: Dict[int, Dict[str, torch.Tensor]],
     *,
     mode: str,
+    model_name: str,
     prompt_len: int,
     decoded_tokens_provider: Callable[[], List[str]],
     expected_guess_tokens: int,
@@ -1753,6 +1753,7 @@ def build_direction_perturb_hooks(
     hooks: List[Tuple[str, Callable]] = []
     activation_applier_builder = _direction_mode_activation_applier_builder(
         mode,
+        model_name=model_name,
         expected_guess_tokens=expected_guess_tokens,
         expected_probability_tokens=expected_probability_tokens,
         expected_confidence_tokens=expected_confidence_tokens,
@@ -1782,6 +1783,7 @@ def greedy_generate_direction_perturbed(
     *,
     layer_to_span_delta: Dict[int, Dict[str, torch.Tensor]],
     mode: str,
+    model_name: str,
     expected_guess_tokens: int,
     expected_probability_tokens: int,
     expected_confidence_tokens: int,
@@ -1798,6 +1800,7 @@ def greedy_generate_direction_perturbed(
     hooks = build_direction_perturb_hooks(
         layer_to_span_delta=layer_to_span_delta,
         mode=mode,
+        model_name=model_name,
         prompt_len=prompt_len,
         decoded_tokens_provider=_decoded_tokens_provider,
         expected_guess_tokens=expected_guess_tokens,
@@ -2024,9 +2027,13 @@ def _dedupe_preserve_order(items: Sequence[str]) -> List[str]:
 
 
 def main() -> None:
-    TRAIN_RATIO = 0.9
     parser = argparse.ArgumentParser(description="Mass mean direction probe inference (TransformerLens).")
-    parser.add_argument("--model_name", type=str, default="google/gemma-3-12b-it")
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="google/gemma-3-12b-it",
+        choices=list(SUPPORTED_MODEL_NAMES),
+    )
     parser.add_argument("--input_h5", type=str, required=True, help="Path to *_verbalised_embeddings.h5 file.")
     parser.add_argument(
         "--new_h5_format",
@@ -2048,7 +2055,12 @@ def main() -> None:
         default="trivia_qa",
         choices=["trivia_qa", "squad", "bioasq", "nq", "svamp", "gsm8k"],
     )
-    parser.add_argument("--num_samples", type=int, default=400)
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=400,
+        help="Max examples per confidence group (sorted IDs, then truncated). No train/val ratio split.",
+    )
     parser.add_argument("--num_few_shot", type=int, default=0)
     parser.add_argument("--model_max_new_tokens", type=int, default=50)
     parser.add_argument("--brief_prompt", type=str, default="default", choices=["default", "chat"])
@@ -2083,9 +2095,11 @@ def main() -> None:
             "sem_ans_tokens_during_gen",
             "current_generated_token_mean_replace",
             "current_generated_window5_mean_replace",
-            "probability_first_token_mean_replace",
-            "probability_first_two_tokens_mean_replace",
-            "probability_first_two_and_index6_tokens_mean_replace",
+            "last_a_mean_replace",
+            "last_a_and_panl_mean_replace",
+            "last_a_panl_and_pc_mean_replace",
+            "panl_mean_replace",
+            "pc_mean_replace",
             "all_tokens_mean_replace",
             "generated_tokens_mean_replace",
         ],
@@ -2104,9 +2118,11 @@ def main() -> None:
             "sem_ans_tokens_during_gen",
             "current_generated_token_mean_replace",
             "current_generated_window5_mean_replace",
-            "probability_first_token_mean_replace",
-            "probability_first_two_tokens_mean_replace",
-            "probability_first_two_and_index6_tokens_mean_replace",
+            "last_a_mean_replace",
+            "last_a_and_panl_mean_replace",
+            "last_a_panl_and_pc_mean_replace",
+            "panl_mean_replace",
+            "pc_mean_replace",
             "all_tokens_mean_replace",
             "generated_tokens_mean_replace",
         ],
@@ -2119,10 +2135,15 @@ def main() -> None:
             "at each decode step using the probability-last direction. "
             "current_generated_window5_mean_replace: perturb the current last 5 sequence tokens "
             "at each decode step using the probability-last direction. "
-            "probability_first_token_mean_replace: same gating as probability_tokens_mean_replace but "
-            "only H5 probability row 0. probability_first_two_tokens_mean_replace: rows 0 and 1. "
-            "probability_first_two_and_index6_tokens_mean_replace: same gating as "
-            "probability_tokens_mean_replace but only H5 probability rows 0, 1, and 6 (fixed index 6, not -1). "
+            "last_a_mean_replace: same gating as probability_tokens_mean_replace but "
+            "only H5 probability row 0 (last answer token). last_a_and_panl_mean_replace: rows 0 and 1 "
+            "(last answer token and post-answer newline). "
+            "last_a_panl_and_pc_mean_replace: same gating as probability_tokens_mean_replace but only "
+            "H5 probability rows 0, 1, and a model-specific pre-confidence index "
+            "(Mistral 6, Gemma 3; unsupported for Qwen). "
+            "panl_mean_replace: only H5 probability row 1 (post-answer newline). "
+            "pc_mean_replace: only the model-specific pre-confidence index "
+            "(Mistral 6, Gemma 3; unsupported for Qwen). "
             "semantic_answer_mean_replace: no-op until Guess/Probability(or Confidence) parse "
             "succeeds, then perturb only semantic-answer tokens using the shared "
             "sem_answer_mean direction. "
@@ -2214,6 +2235,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     configure_prefix_tokens_for_model(args.model_name)
+    validate_last_a_panl_and_pc_mode(args.model_name, args.ablation_mode)
     if args.linguistic_confidence_prompt and not CONFIDENCE_PREFIX_TOKENS:
         raise ValueError(
             "--linguistic_confidence_prompt requires a non-empty Confidence: prefix table "
@@ -2334,6 +2356,17 @@ def main() -> None:
         direction_flat_head,
         list(args.alpha),
     )
+    eval_low_ids = set(truncate_sorted_ids(low_ids, args.num_samples))
+    eval_high_ids = set(truncate_sorted_ids(high_ids, args.num_samples))
+    eval_ids = eval_low_ids | eval_high_ids
+    logging.info(
+        "Eval sample cap num_samples=%d: eval_low=%d eval_high=%d (from full low=%d high=%d)",
+        args.num_samples,
+        len(eval_low_ids),
+        len(eval_high_ids),
+        len(low_ids),
+        len(high_ids),
+    )
 
     out_path = resolve_output_json_path(args.output_json)
 
@@ -2375,12 +2408,8 @@ def main() -> None:
     non_none_modes = [m for m in args.ablation_mode if m != "none"]
 
     for split_name, eval_ds in [("train", train_ds), ("validation", val_ds)]:
-        split_target = round(args.num_samples * TRAIN_RATIO) if split_name == "train" else round(args.num_samples * (1 - TRAIN_RATIO))
         id_to_index = {encode_example_id(ex["id"]): i for i, ex in enumerate(eval_ds)}
-        # Always include both confidence groups so high/low baselines are both available in summary/plots.
-        target_union_ids: set[str] = set(low_ids) | set(high_ids)
-        split_target_ids = sorted(ex_id for ex_id in target_union_ids if ex_id in id_to_index)
-        selected_ids = split_target_ids[: min(split_target, len(split_target_ids))]
+        selected_ids = sorted(ex_id for ex_id in eval_ids if ex_id in id_to_index)
         logging.info("Generating for %d examples (%s split).", len(selected_ids), split_name)
 
         for i, ex_id in enumerate(selected_ids):
@@ -2467,6 +2496,7 @@ def main() -> None:
                             max_new_tokens=args.model_max_new_tokens,
                             layer_to_span_delta=layer_to_span_delta,
                             mode=mode,
+                            model_name=args.model_name,
                             expected_guess_tokens=args.expected_guess_tokens,
                             expected_probability_tokens=args.expected_probability_tokens,
                             expected_confidence_tokens=args.expected_confidence_tokens,
