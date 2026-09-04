@@ -30,7 +30,7 @@ python3 ./subblock_tokenwise_mean_ablation/run_subblock_tokenwise_mean_ablation.
   --device cuda:0 \
   --dtype bfloat16 \
   --new_h5_format \
-  --ablate_subblocks mlp \
+  --ablate_subblocks attn \
   --low_conf_threshold 0.2 \
   --high_conf_threshold 0.8 \
   --individual_layers \
@@ -38,6 +38,7 @@ python3 ./subblock_tokenwise_mean_ablation/run_subblock_tokenwise_mean_ablation.
   --expected_probability_tokens 5 \
   --extend_probability_span \
   --ablate_with_same_confidence \
+  --no-mean_from_low_confidence
 
 # N.B. num_samples refer to the max number of iterations to perform, not limiting
 # the mean vector computation

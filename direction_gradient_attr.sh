@@ -40,12 +40,12 @@ uptime
 # Linguistic Confidence (Mistral only):
 python3 ./direction_gradient_attr/run_direction_gradient_attr.py \
   --model_name mistralai/Mistral-7B-Instruct-v0.1 \
-  --input_h5 ./process_generations/processed_generations_more_h5/5_trivia_mistral_linguistic_extended_train/balanced/train_verbalised_embeddings.h5 \
+  --input_h5 ./process_generations/processed_generations_more_h5/3_trivia_mistral_linguistic_train/balanced/train_verbalised_embeddings.h5 \
   --device cuda:0 \
   --dtype bfloat16 \
   --linguistic_confidence_prompt \
   --expected_confidence_tokens 5 \
-  --high_conf_threshold 0.7 \
-  --low_conf_threshold 0.3 \
+  --high_conf_threshold 0.9 \
+  --low_conf_threshold 0.1 \
   --max_examples_for_mean 50 \
   --granularity coarse fine

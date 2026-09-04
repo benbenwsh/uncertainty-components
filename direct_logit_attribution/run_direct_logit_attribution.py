@@ -2299,28 +2299,40 @@ def write_distribution_plot(
 
 _FINE_HEAD_LABEL_RE = re.compile(r"^L(\d+)_H(\d+)$")
 _FINE_MLP_LABEL_RE = re.compile(r"^L(\d+)_mlp_block$")
+_COARSE_ATTN_RE = re.compile(r"^L(\d+)_attn$")
+_COARSE_MLP_RE = re.compile(r"^L(\d+)_mlp$")
 
 
 def _dla_label_to_ablate_unit(label: str) -> Optional[str]:
-    """Map fine DLA labels to ablation-unit tokens (a<layer>.h<head> / m<layer>)."""
+    """Map DLA labels to ablation-unit tokens (a<layer>.h<head> / a<layer> / m<layer>)."""
     m = _FINE_HEAD_LABEL_RE.fullmatch(label)
     if m:
         return f"a{m.group(1)}.h{m.group(2)}"
     m = _FINE_MLP_LABEL_RE.fullmatch(label)
     if m:
         return f"m{m.group(1)}"
+    m = _COARSE_ATTN_RE.fullmatch(label)
+    if m:
+        return f"a{m.group(1)}"
+    m = _COARSE_MLP_RE.fullmatch(label)
+    if m:
+        return f"m{m.group(1)}"
     return None
 
 
 def _ablate_summary_lines(labels: Sequence[str], *, k: int = 10) -> Optional[list[str]]:
-    """Return top_10/bottom_10 lines if every label is a fine DLA component."""
+    """Return top_10/bottom_10 lines if every label is a DLA component.
+
+    Rankings are most positive → most negative. ``top_10`` is the first ``k``
+    units; ``bottom_10`` is the last ``k`` reversed so the most negative is first.
+    """
     units = [_dla_label_to_ablate_unit(lab) for lab in labels]
     if not units or any(u is None for u in units):
         return None
     n = min(k, len(units))
     return [
         f"top_10: {','.join(units[:n])}",
-        f"bottom_10: {','.join(units[-n:])}",
+        f"bottom_10: {','.join(reversed(units[-n:]))}",
     ]
 
 
@@ -2553,8 +2565,6 @@ class HighMinusLowRow:
 _EMBED_MEAN_RE = re.compile(
     r"embedding_contribution\s+mean=([^\s]+)\s+SEM=([^\s]+)"
 )
-_COARSE_ATTN_RE = re.compile(r"^L(\d+)_attn$")
-_COARSE_MLP_RE = re.compile(r"^L(\d+)_mlp$")
 
 
 def _sem_from_column(col: np.ndarray) -> float:
