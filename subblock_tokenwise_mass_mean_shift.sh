@@ -57,10 +57,29 @@ uptime
 #   --high_conf_threshold 0.8
 
 # Both attn+mlp simultaneously (individual-layer heatmap):
+# python3 ./subblock_tokenwise_mass_mean_shift/run_subblock_tokenwise_mass_mean_shift.py \
+#   --model_name mistralai/Mistral-7B-Instruct-v0.1 \
+#   --input_h5 ./process_generations/processed_generations_more_h5/mistral/2_200_9_prob_toks/train_verbalised_embeddings.h5 \
+#   --dataset trivia_qa \
+#   --no-enable_brief \
+#   --num_samples 22 \
+#   --device cuda:0 \
+#   --dtype bfloat16 \
+#   --new_h5_format \
+#   --ablate_subblocks mlp \
+#   --individual_layers \
+#   --alpha 1.0 \
+#   --expected_guess_tokens 5 \
+#   --expected_probability_tokens 7 \
+#   --low_conf_threshold 0.1 \
+#   --high_conf_threshold 0.9 \
+#   --extend_probability_span \
+
+# math, mistral
 python3 ./subblock_tokenwise_mass_mean_shift/run_subblock_tokenwise_mass_mean_shift.py \
   --model_name mistralai/Mistral-7B-Instruct-v0.1 \
-  --input_h5 ./process_generations/processed_generations_more_h5/mistral/2_200_9_prob_toks/train_verbalised_embeddings.h5 \
-  --dataset trivia_qa \
+  --input_h5 ./process_generations/processed_generations_more_h5/3_math_mistral_extended_with_concat_train/train_verbalised_embeddings.h5 \
+  --dataset math \
   --no-enable_brief \
   --num_samples 22 \
   --device cuda:0 \
@@ -71,11 +90,10 @@ python3 ./subblock_tokenwise_mass_mean_shift/run_subblock_tokenwise_mass_mean_sh
   --alpha 1.0 \
   --expected_guess_tokens 5 \
   --expected_probability_tokens 7 \
-  --low_conf_threshold 0.1 \
-  --high_conf_threshold 0.9 \
+  --low_conf_threshold 0.0 \
+  --high_conf_threshold 1.0 \
   --extend_probability_span \
-
-
+  --no-mean_from_low_confidence
 
 # Low-confidence cohort (uncomment to steer low-conf examples toward higher confidence):
 # python3 ./subblock_tokenwise_mass_mean_shift/run_subblock_tokenwise_mass_mean_shift.py \

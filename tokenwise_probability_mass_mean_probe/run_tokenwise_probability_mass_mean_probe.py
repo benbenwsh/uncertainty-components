@@ -55,6 +55,11 @@ from mass_mean_probe.run_mass_mean_probe import (
     parse_guess_and_marker_indices,
     parse_mode_confidence_from_response,
 )
+from plotting.paper_heatmaps import (
+    paper_png_path,
+    write_layer_token_grid_plot_annotated,
+    write_layer_token_grid_plot_paper,
+)
 
 
 TRAIN_RATIO = 0.9
@@ -119,6 +124,10 @@ def _line_plot_path(run_root: str) -> str:
 
 def _grid_plot_path(run_root: str) -> str:
     return os.path.join(run_root, "layer_token_deviation_grid.png")
+
+
+def _grid_plot_paper_path(run_root: str) -> str:
+    return os.path.join(run_root, "layer_token_deviation_grid_paper.png")
 
 
 def _attach_output_log(run_root: str) -> str:
@@ -765,50 +774,22 @@ def write_layer_token_grid_plot(
     mean_from_low_confidence: bool,
     linguistic_confidence_prompt: bool = False,
 ) -> None:
-    del linguistic_confidence_prompt
-    n_rows, n_cols = matrix_values.shape
-    max_dev = (
-        float(np.nanmax(matrix_deviation_desired))
-        if np.isfinite(matrix_deviation_desired).any()
-        else 0.0
+    write_layer_token_grid_plot_annotated(
+        path=path,
+        run_layers=run_layers,
+        token_labels=token_labels,
+        matrix_values=matrix_values,
+        matrix_deviation_signed=matrix_deviation_desired,
     )
-    if max_dev > 0:
-        alpha_grid = np.clip(matrix_deviation_desired / max_dev, 0.0, 1.0)
-    else:
-        alpha_grid = np.zeros_like(matrix_deviation_desired)
-    alpha_grid = np.nan_to_num(alpha_grid, nan=0.0)
-
-    rgba = np.zeros((n_rows, n_cols, 4), dtype=np.float32)
-    rgba[:, :, 0] = 0.1
-    rgba[:, :, 1] = 0.3
-    rgba[:, :, 2] = 1.0
-    rgba[:, :, 3] = alpha_grid
-
-    fig, ax = plt.subplots(figsize=(max(9.0, 1.4 * n_cols), max(6.0, 0.35 * n_rows)))
-    ax.imshow(rgba, aspect="auto", interpolation="nearest")
-
-    for r in range(n_rows):
-        for c in range(n_cols):
-            val = matrix_values[r, c]
-            text = "NA" if np.isnan(val) else f"{val:.3f}"
-            ax.text(c, r, text, ha="center", va="center", fontsize=8, color="black")
-
-    ax.set_yticks(np.arange(n_rows))
-    ax.set_yticklabels([str(layer) for layer in run_layers])
-    ax.set_ylabel("Layer")
-    direction = "below" if mean_from_low_confidence else "above"
-    ax.set_title(
-        f"Layer x token confidence (blue alpha = deviation {direction} baseline; opposite = 0)"
+    write_layer_token_grid_plot_paper(
+        path=paper_png_path(path),
+        run_layers=run_layers,
+        token_labels=token_labels,
+        matrix_values=matrix_values,
+        matrix_deviation_desired=matrix_deviation_desired,
+        mean_from_low_confidence=mean_from_low_confidence,
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
     )
-    _apply_input_output_token_axes(ax, n_cols=n_cols, token_labels=token_labels)
-
-    ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
-    ax.set_yticks(np.arange(-0.5, n_rows, 1), minor=True)
-    ax.grid(which="minor", color="gray", linestyle="-", linewidth=0.35, alpha=0.4)
-    ax.tick_params(which="minor", bottom=False, left=False)
-    fig.tight_layout()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
 
 
 def main() -> None:
@@ -1247,11 +1228,7 @@ def main() -> None:
                 continue
             matrix_values[r, c] = float(val)
             if baseline_mean is not None:
-                matrix_dev_desired[r, c] = _directed_deviation_from_baseline(
-                    float(val),
-                    float(baseline_mean),
-                    mean_from_low_confidence=args.mean_from_low_confidence,
-                )
+                matrix_dev_desired[r, c] = float(val) - float(baseline_mean)
             else:
                 matrix_dev_desired[r, c] = np.nan
 
@@ -1347,6 +1324,7 @@ def main() -> None:
         linguistic_confidence_prompt=args.linguistic_confidence_prompt,
     )
     logging.info("Wrote %s", _grid_plot_path(run_root))
+    logging.info("Wrote %s", _grid_plot_paper_path(run_root))
 
     write_line_plot(
         path=_line_plot_path(run_root),

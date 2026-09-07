@@ -495,9 +495,26 @@ def _marker_for_token_pos(token_pos: int) -> str:
     return marker_cycle[token_pos % len(marker_cycle)]
 
 
+_LABEL_FS = 16
+_TICK_FS = 13
+_LEGEND_FS = 13
+
+
 def _set_y_axis_from_zero(ax) -> None:
     """Ensure the y-axis lower bound is 0."""
     ax.set_ylim(bottom=0)
+
+
+def _style_metric_axes(ax, xlabel: str, ylabel: str, *, legend_outside: bool = False) -> None:
+    ax.set_xlabel(xlabel, fontsize=_LABEL_FS)
+    ax.set_ylabel(ylabel, fontsize=_LABEL_FS)
+    ax.tick_params(axis="both", labelsize=_TICK_FS)
+    if legend_outside:
+        ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=_LEGEND_FS)
+    else:
+        ax.legend(fontsize=_LEGEND_FS)
+    ax.grid(True, alpha=0.3)
+    _set_y_axis_from_zero(ax)
 
 
 def _plot_group_lines(
@@ -551,8 +568,123 @@ def _plot_group_lines(
             )
 
 
-def _load_all_token_metrics_from_run_dir(run_base: Path):
-    """Load saved per-layer metrics from tok_*/layer_*/verbalised_confidence_probe.pkl."""
+def _layer0_metric(metrics_dict, metric_idx: int, split: str) -> float | None:
+    layers = metrics_dict.get("layers") or []
+    try:
+        layer_idx = list(layers).index(0)
+    except ValueError:
+        return None
+    try:
+        return float(metrics_dict[split][metric_idx][layer_idx])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+
+
+def _tok0_metrics_dict(token_items):
+    for _token_name, metrics_dict, token_pos in token_items:
+        if token_pos == 0:
+            return metrics_dict
+    return None
+
+
+def _add_layer0_baseline(ax, token_items, metric_idx: int, split_mode: str, *, label_prefix: str = "Layer 0") -> None:
+    metrics_dict = _tok0_metrics_dict(token_items)
+    if metrics_dict is None:
+        return
+    splits = ("train", "test") if split_mode == "both" else (split_mode,)
+    for split in splits:
+        value = _layer0_metric(metrics_dict, metric_idx, split)
+        if value is None:
+            continue
+        split_label = "Train" if split == "train" else "Test"
+        ax.axhline(
+            y=value,
+            color="0.2",
+            linestyle=":",
+            linewidth=1.6,
+            label=f"{label_prefix} ({split_label})",
+        )
+
+
+def _parse_metrics_from_config_txt(path: Path) -> dict | None:
+    """Parse train/test MSE, MAE, and R² from a layer config.txt."""
+    if not path.is_file():
+        return None
+    values: dict[tuple[str, str], float] = {}
+    section = None
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        lowered = line.lower().rstrip(":")
+        if lowered == "train":
+            section = "train"
+            continue
+        if lowered == "test":
+            section = "test"
+            continue
+        if section is None or ":" not in line:
+            continue
+        key, _, raw_val = line.partition(":")
+        key = key.strip().lower().replace("²", "2")
+        if key not in {"mse", "mae", "r2"}:
+            continue
+        try:
+            values[(section, key)] = float(raw_val.strip())
+        except ValueError:
+            return None
+    needed = (
+        ("train", "mse"),
+        ("train", "mae"),
+        ("train", "r2"),
+        ("test", "mse"),
+        ("test", "mae"),
+        ("test", "r2"),
+    )
+    if any(item not in values for item in needed):
+        return None
+    return {
+        "train": {"mse": values[("train", "mse")], "mae": values[("train", "mae")], "r2": values[("train", "r2")]},
+        "test": {"mse": values[("test", "mse")], "mae": values[("test", "mae")], "r2": values[("test", "r2")]},
+    }
+
+
+def _parse_metrics_from_pickle(path: Path) -> dict | None:
+    if not path.is_file():
+        return None
+    try:
+        with open(path, "rb") as f:
+            payload = pickle.load(f)
+    except Exception as exc:
+        logging.warning("Failed to read %s: %s", path, exc)
+        return None
+    metrics = payload.get("metrics") if isinstance(payload, dict) else None
+    if not isinstance(metrics, dict):
+        return None
+    try:
+        return {
+            "train": {
+                "mse": float(metrics["train"]["mse"]),
+                "mae": float(metrics["train"]["mae"]),
+                "r2": float(metrics["train"]["r2"]),
+            },
+            "test": {
+                "mse": float(metrics["test"]["mse"]),
+                "mae": float(metrics["test"]["mae"]),
+                "r2": float(metrics["test"]["r2"]),
+            },
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _load_layer_metrics(layer_dir: Path) -> dict | None:
+    parsed = _parse_metrics_from_config_txt(layer_dir / "config.txt")
+    if parsed is not None:
+        return parsed
+    return _parse_metrics_from_pickle(layer_dir / "verbalised_confidence_probe.pkl")
+
+
+def _load_all_token_metrics_from_config_txt(run_base: Path):
+    """Load per-layer metrics from tok_*/layer_*/config.txt, falling back to probe pickles."""
     all_token_metrics = {}
     token_dirs = [d for d in run_base.iterdir() if d.is_dir() and d.name.startswith("tok_")]
     for token_dir in sorted(token_dirs, key=lambda p: _token_sort_key(p.name)):
@@ -562,45 +694,34 @@ def _load_all_token_metrics_from_run_dir(run_base: Path):
             logging.warning("Skipping directory with unexpected token name: %s", token_dir)
             continue
 
-        layer_pkls = sorted(
-            token_dir.glob("layer_*/verbalised_confidence_probe.pkl"),
-            key=lambda p: int(p.parent.name.split("_")[-1]) if p.parent.name.split("_")[-1].isdigit() else float("inf"),
+        layer_dirs = sorted(
+            [d for d in token_dir.iterdir() if d.is_dir() and d.name.startswith("layer_")],
+            key=lambda p: int(p.name.split("_")[-1]) if p.name.split("_")[-1].isdigit() else float("inf"),
         )
-        if len(layer_pkls) == 0:
-            logging.warning("No layer probe pickles found under %s", token_dir)
+        if len(layer_dirs) == 0:
+            logging.warning("No layer directories found under %s", token_dir)
             continue
 
         layer_numbers = []
         train_mse, train_mae, train_r2 = [], [], []
         test_mse, test_mae, test_r2 = [], [], []
 
-        for layer_pkl in layer_pkls:
-            try:
-                with open(layer_pkl, "rb") as f:
-                    payload = pickle.load(f)
-            except Exception as exc:
-                logging.warning("Failed to read %s: %s", layer_pkl, exc)
+        for layer_dir in layer_dirs:
+            suffix = layer_dir.name.split("_")[-1]
+            if not suffix.isdigit():
+                logging.warning("Skipping unexpected layer directory: %s", layer_dir)
                 continue
-
-            metrics = payload.get("metrics") if isinstance(payload, dict) else None
-            if not isinstance(metrics, dict):
-                logging.warning("Missing metrics in %s; skipping", layer_pkl)
+            metrics = _load_layer_metrics(layer_dir)
+            if metrics is None:
+                logging.warning("No parseable metrics in %s; skipping", layer_dir)
                 continue
-
-            train_metrics = metrics.get("train", {})
-            test_metrics = metrics.get("test", {})
-            try:
-                layer_num = int(layer_pkl.parent.name.split("_")[-1])
-                layer_numbers.append(layer_num)
-                train_mse.append(float(train_metrics["mse"]))
-                train_mae.append(float(train_metrics["mae"]))
-                train_r2.append(float(train_metrics["r2"]))
-                test_mse.append(float(test_metrics["mse"]))
-                test_mae.append(float(test_metrics["mae"]))
-                test_r2.append(float(test_metrics["r2"]))
-            except (KeyError, TypeError, ValueError) as exc:
-                logging.warning("Invalid metrics format in %s: %s", layer_pkl, exc)
-                continue
+            layer_numbers.append(int(suffix))
+            train_mse.append(metrics["train"]["mse"])
+            train_mae.append(metrics["train"]["mae"])
+            train_r2.append(metrics["train"]["r2"])
+            test_mse.append(metrics["test"]["mse"])
+            test_mae.append(metrics["test"]["mae"])
+            test_r2.append(metrics["test"]["r2"])
 
         if len(layer_numbers) == 0:
             logging.warning("No valid metrics recovered for %s", token_dir)
@@ -625,17 +746,36 @@ def _load_all_token_metrics_from_run_dir(run_base: Path):
     return all_token_metrics
 
 
+def _load_all_token_metrics_from_run_dir(run_base: Path):
+    """Load saved per-layer metrics from config.txt, falling back to probe pickles."""
+    return _load_all_token_metrics_from_config_txt(run_base)
+
+
+def _maybe_all_tokens_out_path(
+    run_base: Path,
+    stem: str,
+    name_suffix: str = "",
+    *,
+    skip_existing: bool = False,
+    only_if_original_exists: bool = False,
+) -> Path | None:
+    original = run_base / f"{stem}.png"
+    out_path = run_base / f"{stem}{name_suffix}.png"
+    if name_suffix and out_path.resolve() == original.resolve():
+        raise RuntimeError(f"Refusing to overwrite original plot {original}")
+    if only_if_original_exists and not original.is_file():
+        return None
+    if skip_existing and out_path.exists():
+        return None
+    return out_path
+
+
 def _plot_metrics_by_layer(layer_numbers, train_metrics, test_metrics, metric_name, metric_label, output_dir: Path):
     """Plot one metric (train and test) vs layer number and save to output_dir."""
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(layer_numbers, train_metrics, "o-", label="Train", markersize=4)
     ax.plot(layer_numbers, test_metrics, "s-", label="Test", markersize=4)
-    ax.set_xlabel("Layer index")
-    ax.set_ylabel(metric_label)
-    ax.set_title(f"{metric_label} by layer")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    _set_y_axis_from_zero(ax)
+    _style_metric_axes(ax, "Layer index", metric_label, legend_outside=False)
     fig.tight_layout()
     out_path = output_dir / f"{metric_name}_by_layer.png"
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -656,7 +796,23 @@ def _plot_all_metrics_by_layer(output_dir: Path, layer_numbers, train_metrics_li
         _plot_metrics_by_layer(layer_numbers, train_vals, test_vals, metric_name, metric_label, output_dir)
 
 
-def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: bool = False):
+def _save_all_tokens_figure(fig, ax, metric_label: str, out_path: Path) -> None:
+    _style_metric_axes(ax, "Layer index", metric_label, legend_outside=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    logging.info("Saved %s", out_path)
+
+
+def _plot_metrics_all_tokens(
+    run_base: Path,
+    all_token_metrics,
+    more_graphs: bool = False,
+    name_suffix: str = "",
+    *,
+    skip_existing: bool = False,
+    only_if_original_exists: bool = False,
+):
     """
     Create cross-token graphs for guess/probability/prompt/sem-answer/combined families.
     For guess/probability/combined families and each metric, save both splits in one chart
@@ -673,6 +829,12 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: boo
     if not more_graphs:
         metrics_config = metrics_config[:1]
 
+    path_kwargs = {
+        "name_suffix": name_suffix,
+        "skip_existing": skip_existing,
+        "only_if_original_exists": only_if_original_exists,
+    }
+
     guess_token_items = _sorted_token_items(all_token_metrics, "guess")
     prob_token_items = _sorted_token_items(all_token_metrics, "probability")
     prompt_token_items = _sorted_token_items(all_token_metrics, "mean_prompt")
@@ -680,69 +842,54 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: boo
 
     if len(guess_token_items) > 0:
         for metric_name, metric_label, metric_idx in metrics_config:
-            fig, ax = plt.subplots(figsize=(10, 6))
-            _plot_group_lines(ax, guess_token_items, metric_idx, cmap_name="Blues", split_mode="both")
-            ax.set_xlabel("Layer index")
-            ax.set_ylabel(metric_label)
-            ax.set_title(f"{metric_label} by layer - Guess prefix tokens")
-            ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
-            ax.grid(True, alpha=0.3)
-            _set_y_axis_from_zero(ax)
-            fig.tight_layout()
-            out_path = run_base / f"{metric_name}_all_tokens_guess.png"
-            fig.savefig(out_path, dpi=150, bbox_inches="tight")
-            plt.close(fig)
-            logging.info("Saved %s", out_path)
+            out_path = _maybe_all_tokens_out_path(run_base, f"{metric_name}_all_tokens_guess", **path_kwargs)
+            if out_path is not None:
+                fig, ax = plt.subplots(figsize=(10, 6))
+                _plot_group_lines(ax, guess_token_items, metric_idx, cmap_name="Blues", split_mode="both")
+                _add_layer0_baseline(ax, guess_token_items, metric_idx, "both")
+                _save_all_tokens_figure(fig, ax, metric_label, out_path)
 
-            for split_mode, split_label in [("train", "Train"), ("test", "Test")]:
+            for split_mode in ("train", "test"):
+                out_path = _maybe_all_tokens_out_path(
+                    run_base, f"{metric_name}_all_tokens_guess_{split_mode}", **path_kwargs
+                )
+                if out_path is None:
+                    continue
                 fig, ax = plt.subplots(figsize=(10, 6))
                 _plot_group_lines(ax, guess_token_items, metric_idx, cmap_name="Blues", split_mode=split_mode)
-                ax.set_xlabel("Layer index")
-                ax.set_ylabel(metric_label)
-                ax.set_title(f"{metric_label} by layer - Guess prefix tokens ({split_label} only)")
-                ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
-                ax.grid(True, alpha=0.3)
-                _set_y_axis_from_zero(ax)
-                fig.tight_layout()
-                out_path = run_base / f"{metric_name}_all_tokens_guess_{split_mode}.png"
-                fig.savefig(out_path, dpi=150, bbox_inches="tight")
-                plt.close(fig)
-                logging.info("Saved %s", out_path)
+                _add_layer0_baseline(ax, guess_token_items, metric_idx, split_mode)
+                _save_all_tokens_figure(fig, ax, metric_label, out_path)
 
     if len(prob_token_items) > 0:
         for metric_name, metric_label, metric_idx in metrics_config:
-            fig, ax = plt.subplots(figsize=(10, 6))
-            _plot_group_lines(ax, prob_token_items, metric_idx, cmap_name="Oranges", split_mode="both")
-            ax.set_xlabel("Layer index")
-            ax.set_ylabel(metric_label)
-            ax.set_title(f"{metric_label} by layer - Probability prefix tokens")
-            ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
-            ax.grid(True, alpha=0.3)
-            _set_y_axis_from_zero(ax)
-            fig.tight_layout()
-            out_path = run_base / f"{metric_name}_all_tokens_probability.png"
-            fig.savefig(out_path, dpi=150, bbox_inches="tight")
-            plt.close(fig)
-            logging.info("Saved %s", out_path)
+            out_path = _maybe_all_tokens_out_path(
+                run_base, f"{metric_name}_all_tokens_probability", **path_kwargs
+            )
+            if out_path is not None:
+                fig, ax = plt.subplots(figsize=(10, 6))
+                _plot_group_lines(ax, prob_token_items, metric_idx, cmap_name="Oranges", split_mode="both")
+                _add_layer0_baseline(ax, prob_token_items, metric_idx, "both")
+                _save_all_tokens_figure(fig, ax, metric_label, out_path)
 
-            for split_mode, split_label in [("train", "Train"), ("test", "Test")]:
+            for split_mode in ("train", "test"):
+                out_path = _maybe_all_tokens_out_path(
+                    run_base, f"{metric_name}_all_tokens_probability_{split_mode}", **path_kwargs
+                )
+                if out_path is None:
+                    continue
                 fig, ax = plt.subplots(figsize=(10, 6))
                 _plot_group_lines(ax, prob_token_items, metric_idx, cmap_name="Oranges", split_mode=split_mode)
-                ax.set_xlabel("Layer index")
-                ax.set_ylabel(metric_label)
-                ax.set_title(f"{metric_label} by layer - Probability prefix tokens ({split_label} only)")
-                ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
-                ax.grid(True, alpha=0.3)
-                _set_y_axis_from_zero(ax)
-                fig.tight_layout()
-                out_path = run_base / f"{metric_name}_all_tokens_probability_{split_mode}.png"
-                fig.savefig(out_path, dpi=150, bbox_inches="tight")
-                plt.close(fig)
-                logging.info("Saved %s", out_path)
+                _add_layer0_baseline(ax, prob_token_items, metric_idx, split_mode)
+                _save_all_tokens_figure(fig, ax, metric_label, out_path)
 
     if len(prompt_token_items) > 0:
         for metric_name, metric_label, metric_idx in metrics_config:
-            for split_mode, split_label in [("train", "Train"), ("test", "Test")]:
+            for split_mode in ("train", "test"):
+                out_path = _maybe_all_tokens_out_path(
+                    run_base, f"{metric_name}_all_tokens_prompt_{split_mode}", **path_kwargs
+                )
+                if out_path is None:
+                    continue
                 fig, ax = plt.subplots(figsize=(10, 6))
                 _plot_group_lines(
                     ax,
@@ -753,21 +900,16 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: boo
                     fixed_color="green",
                     label_name="prompt",
                 )
-                ax.set_xlabel("Layer index")
-                ax.set_ylabel(metric_label)
-                ax.set_title(f"{metric_label} by layer - Mean prompt token ({split_label} only)")
-                ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
-                ax.grid(True, alpha=0.3)
-                _set_y_axis_from_zero(ax)
-                fig.tight_layout()
-                out_path = run_base / f"{metric_name}_all_tokens_prompt_{split_mode}.png"
-                fig.savefig(out_path, dpi=150, bbox_inches="tight")
-                plt.close(fig)
-                logging.info("Saved %s", out_path)
+                _save_all_tokens_figure(fig, ax, metric_label, out_path)
 
     if len(sem_answer_token_items) > 0:
         for metric_name, metric_label, metric_idx in metrics_config:
-            for split_mode, split_label in [("train", "Train"), ("test", "Test")]:
+            for split_mode in ("train", "test"):
+                out_path = _maybe_all_tokens_out_path(
+                    run_base, f"{metric_name}_all_tokens_sem_answer_{split_mode}", **path_kwargs
+                )
+                if out_path is None:
+                    continue
                 fig, ax = plt.subplots(figsize=(10, 6))
                 _plot_group_lines(
                     ax,
@@ -778,17 +920,7 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: boo
                     fixed_color="purple",
                     label_name="sem_answer",
                 )
-                ax.set_xlabel("Layer index")
-                ax.set_ylabel(metric_label)
-                ax.set_title(f"{metric_label} by layer - Mean semantic answer token ({split_label} only)")
-                ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
-                ax.grid(True, alpha=0.3)
-                _set_y_axis_from_zero(ax)
-                fig.tight_layout()
-                out_path = run_base / f"{metric_name}_all_tokens_sem_answer_{split_mode}.png"
-                fig.savefig(out_path, dpi=150, bbox_inches="tight")
-                plt.close(fig)
-                logging.info("Saved %s", out_path)
+                _save_all_tokens_figure(fig, ax, metric_label, out_path)
 
     if (
         len(guess_token_items) > 0
@@ -797,40 +929,40 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: boo
         or len(sem_answer_token_items) > 0
     ):
         for metric_name, metric_label, metric_idx in metrics_config:
-            fig, ax = plt.subplots(figsize=(11, 6))
-            _plot_group_lines(ax, guess_token_items, metric_idx, cmap_name="Blues", split_mode="both")
-            _plot_group_lines(ax, prob_token_items, metric_idx, cmap_name="Oranges", split_mode="both")
-            _plot_group_lines(
-                ax,
-                prompt_token_items,
-                metric_idx,
-                cmap_name="Greens",
-                split_mode="both",
-                fixed_color="green",
-                label_name="prompt",
+            out_path = _maybe_all_tokens_out_path(
+                run_base, f"{metric_name}_all_tokens_combined", **path_kwargs
             )
-            _plot_group_lines(
-                ax,
-                sem_answer_token_items,
-                metric_idx,
-                cmap_name="Purples",
-                split_mode="both",
-                fixed_color="purple",
-                label_name="sem_answer",
-            )
-            ax.set_xlabel("Layer index")
-            ax.set_ylabel(metric_label)
-            ax.set_title(f"{metric_label} by layer - Combined guess prefix + probability prefix + prompt + sem_answer tokens")
-            ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
-            ax.grid(True, alpha=0.3)
-            _set_y_axis_from_zero(ax)
-            fig.tight_layout()
-            out_path = run_base / f"{metric_name}_all_tokens_combined.png"
-            fig.savefig(out_path, dpi=150, bbox_inches="tight")
-            plt.close(fig)
-            logging.info("Saved %s", out_path)
+            if out_path is not None:
+                fig, ax = plt.subplots(figsize=(11, 6))
+                _plot_group_lines(ax, guess_token_items, metric_idx, cmap_name="Blues", split_mode="both")
+                _plot_group_lines(ax, prob_token_items, metric_idx, cmap_name="Oranges", split_mode="both")
+                _plot_group_lines(
+                    ax,
+                    prompt_token_items,
+                    metric_idx,
+                    cmap_name="Greens",
+                    split_mode="both",
+                    fixed_color="green",
+                    label_name="prompt",
+                )
+                _plot_group_lines(
+                    ax,
+                    sem_answer_token_items,
+                    metric_idx,
+                    cmap_name="Purples",
+                    split_mode="both",
+                    fixed_color="purple",
+                    label_name="sem_answer",
+                )
+                _add_layer0_baseline(ax, guess_token_items, metric_idx, "both")
+                _save_all_tokens_figure(fig, ax, metric_label, out_path)
 
-            for split_mode, split_label in [("train", "Train"), ("test", "Test")]:
+            for split_mode in ("train", "test"):
+                out_path = _maybe_all_tokens_out_path(
+                    run_base, f"{metric_name}_all_tokens_combined_{split_mode}", **path_kwargs
+                )
+                if out_path is None:
+                    continue
                 fig, ax = plt.subplots(figsize=(11, 6))
                 _plot_group_lines(ax, guess_token_items, metric_idx, cmap_name="Blues", split_mode=split_mode)
                 _plot_group_lines(ax, prob_token_items, metric_idx, cmap_name="Oranges", split_mode=split_mode)
@@ -852,20 +984,8 @@ def _plot_metrics_all_tokens(run_base: Path, all_token_metrics, more_graphs: boo
                     fixed_color="purple",
                     label_name="sem_answer",
                 )
-                ax.set_xlabel("Layer index")
-                ax.set_ylabel(metric_label)
-                ax.set_title(
-                    f"{metric_label} by layer - Combined guess prefix + probability prefix + prompt + sem_answer tokens "
-                    f"({split_label} only)"
-                )
-                ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
-                ax.grid(True, alpha=0.3)
-                _set_y_axis_from_zero(ax)
-                fig.tight_layout()
-                out_path = run_base / f"{metric_name}_all_tokens_combined_{split_mode}.png"
-                fig.savefig(out_path, dpi=150, bbox_inches="tight")
-                plt.close(fig)
-                logging.info("Saved %s", out_path)
+                _add_layer0_baseline(ax, guess_token_items, metric_idx, split_mode)
+                _save_all_tokens_figure(fig, ax, metric_label, out_path)
 
 
 def _inverse_count_sample_weights(y: np.ndarray) -> np.ndarray:

@@ -44,6 +44,11 @@ from process_generations.process_generations_more_embs_from_h5 import (
     configure_prefix_tokens_for_model,
     parse_guess_and_probability_indices,
 )
+from plotting.paper_heatmaps import (
+    paper_png_path,
+    write_diverging_heatmap_annotated,
+    write_diverging_heatmap_paper,
+)
 
 SUPPORTED_MODEL_NAMES = (
     "mistralai/Mistral-7B-Instruct-v0.1",
@@ -2173,54 +2178,22 @@ def write_diverging_heatmap(
     title: str,
     rounding_dp: int,
 ) -> None:
-    """Blue=positive, red=negative; signs normalised separately; exact 0 uncoloured."""
-    n_rows, n_cols = matrix.shape
-    pos_max = float(np.max(matrix)) if matrix.size else 0.0
-    neg_min = float(np.min(matrix)) if matrix.size else 0.0
-    pos_max = max(pos_max, 0.0)
-    neg_min = min(neg_min, 0.0)
-
-    rgba = np.zeros((n_rows, n_cols, 4), dtype=np.float32)
-    for r in range(n_rows):
-        for c in range(n_cols):
-            v = float(matrix[r, c])
-            if v == 0.0:
-                continue
-            if v > 0.0:
-                alpha = (v / pos_max) if pos_max > 0 else 0.0
-                rgba[r, c] = (0.10, 0.35, 1.0, alpha)
-            else:
-                alpha = (abs(v) / abs(neg_min)) if neg_min < 0 else 0.0
-                rgba[r, c] = (1.0, 0.15, 0.15, alpha)
-
-    fig_w = max(8.0, 0.55 * n_cols + 2.0)
-    fig_h = max(6.0, 0.28 * n_rows + 1.5)
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-    ax.imshow(rgba, aspect="auto", interpolation="nearest")
-    fmt = f"{{:.{rounding_dp}f}}"
-    for r in range(n_rows):
-        for c in range(n_cols):
-            ax.text(
-                c,
-                r,
-                fmt.format(float(matrix[r, c])),
-                ha="center",
-                va="center",
-                fontsize=7,
-                color="black",
-            )
-    ax.set_yticks(np.arange(n_rows))
-    ax.set_yticklabels(list(row_labels))
-    ax.set_xticks(np.arange(n_cols))
-    ax.set_xticklabels(list(col_labels), rotation=45, ha="left")
-    ax.xaxis.tick_top()
-    ax.xaxis.set_label_position("top")
-    ax.set_ylabel("Layer")
-    ax.set_xlabel("Component")
-    ax.set_title(title)
-    fig.tight_layout()
-    fig.savefig(path, dpi=160)
-    plt.close(fig)
+    """Blue=positive, red=negative; bright diverging scale; exact values in cells."""
+    write_diverging_heatmap_annotated(
+        path,
+        matrix,
+        row_labels=row_labels,
+        col_labels=col_labels,
+        title=title,
+        rounding_dp=rounding_dp,
+    )
+    write_diverging_heatmap_paper(
+        paper_png_path(path),
+        matrix,
+        row_labels=row_labels,
+        col_labels=col_labels,
+        title=title,
+    )
 
 
 def write_bar_chart(

@@ -30,6 +30,13 @@ results nest under ``component_output/``.
 Numeric runs use pre-period and post-period digits. Linguistic Confidence
 (``--linguistic_confidence_prompt``, Mistral only) uses the variable-length
 Confidence: span.
+
+With ``--residual_stream``, a separate layer-level pass attributes the residual
+stream instead of Q/K/V inputs and MLP: display 0 is ``blocks.0.hook_resid_pre``
+(embedding; H5 ``res[0]``) and display ``k>=1`` is ``blocks.{k-1}.hook_resid_post``
+(H5 ``res[k]``). There is no fine split and no ``component_output/`` tree.
+Numeric residual runs write ``digit_vs_rest`` and ``high_vs_low`` with a
+two-column pre/post-period heatmap; linguistic residual heatmaps are one column.
 """
 
 from __future__ import annotations
@@ -79,7 +86,11 @@ from gradient_based_attr.run_gradient_based_attr import (
     prefix_generated_token_ids,
 )
 from headwise_mean_ablation.run_headwise_mean_ablation import resolve_n_key_value_heads
-from layerwise_mean_ablation.run_mean_ablation import greedy_generate, load_hooked_transformer
+from layerwise_mean_ablation.run_mean_ablation import (
+    greedy_generate,
+    hook_name_for_display_layer,
+    load_hooked_transformer,
+)
 from process_generations.process_generations_more_embs_from_h5 import (
     configure_prefix_tokens_for_model,
     parse_guess_and_probability_indices,
@@ -95,25 +106,39 @@ from direct_logit_attribution.run_direct_logit_attribution import (
     _open_h5_readonly,
     _read_decoded_tokens,
     _read_verbalised_confidence_scalar,
+    aggregate_component_stats,
     attach_output_log,
     component_labels_coarse,
     component_labels_fine,
+    ComponentStats,
     high_low_digit_sets,
+    high_minus_low_rows,
     linguistic_first_tokens_for_model,
     invert_square_o_proj,
     parse_individual_ids,
+    rank_by_mean,
+    rank_by_value,
     recover_concat_from_o,
     resolve_all_digit_ids,
     resolve_linguistic_first_token_ids,
     resolve_single_piece_token_id,
+    save_attributions_h5,
     validate_confidence_thresholds,
+    write_bar_chart,
+    write_distribution_plot,
+    write_diverging_heatmap,
     write_experiment_outputs,
     write_high_minus_low_from_results,
+    write_ranked_example_txt,
+    write_ranked_high_minus_low_txt,
+    write_ranked_mean_txt,
 )
 
 L_VS_UN_SPAN_INDEX = 6
 COMPONENT_OUTPUT_SUBDIR = "component_output"
 ATTN_OUT_RESUM_ATOL = 5e-2
+RESIDUAL_STREAM_GRANULARITY = "residual"
+NUMERIC_RESIDUAL_PERIODS = ("pre_period", "post_period")
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +155,7 @@ class SiteDirections:
     attn_out: np.ndarray  # [n_layers, d_model] from H5 attn[L]
     mlp_out: np.ndarray  # [n_layers, d_model] from H5 mlp[L]
     attn_heads: np.ndarray | None = None  # [n_layers, n_heads, d_model] post-norm writes
+    resid_stream: np.ndarray | None = None  # [n_layers+1, d_model] display layers
 
 
 @dataclass
@@ -196,6 +222,25 @@ def _resid_pre_all_layers(
             f"res hidden dim {res_hidden.shape[1]} != d_model={d_model}."
         )
     return np.asarray(res_hidden[: int(n_layers)], dtype=np.float32)
+
+
+def _resid_stream_all_layers(
+    res_hidden: np.ndarray, *, n_layers: int, d_model: int
+) -> np.ndarray:
+    """Full display-layer residual stack: res[0]=embedding, res[k]=resid-post of block k-1."""
+    if res_hidden.ndim != 2:
+        raise ValueError(f"Expected res [layers+1, d_model], got {res_hidden.shape}.")
+    expected_rows = int(n_layers) + 1
+    if int(res_hidden.shape[0]) != expected_rows:
+        raise ValueError(
+            f"res has {res_hidden.shape[0]} layer rows; expected n_layers+1={expected_rows} "
+            "(res[0] is embedding resid-pre; res[k] is resid-post of block k-1)."
+        )
+    if int(res_hidden.shape[1]) != int(d_model):
+        raise ValueError(
+            f"res hidden dim {res_hidden.shape[1]} != d_model={d_model}."
+        )
+    return np.asarray(res_hidden[:expected_rows], dtype=np.float32)
 
 
 def _mlp_input_all_layers(
@@ -442,6 +487,70 @@ def _read_site_arrays_at_index(
     return resid_pre, mlp_in, attn_out, mlp_out
 
 
+def _read_resid_stream_at_index(
+    r0: h5py.Group,
+    span_index: int,
+    *,
+    n_layers: int,
+    d_model: int,
+) -> np.ndarray:
+    n_tok = _probability_list_len(r0, "res")
+    if n_tok is None or int(span_index) >= int(n_tok):
+        raise ValueError(
+            f"probability span len={n_tok} cannot index span_index={span_index}."
+        )
+    res_h = _read_probability_token_hidden(r0, "res", span_index)
+    return _resid_stream_all_layers(res_h, n_layers=n_layers, d_model=d_model)
+
+
+def residual_stream_labels(n_layers: int) -> list[str]:
+    return [f"L{d}" for d in range(int(n_layers) + 1)]
+
+
+def build_numeric_residual_contrasts(
+    digit_ids: dict[str, tuple[int, str]],
+    high_digits: set[str],
+    low_digits: set[str],
+) -> list[ContrastSpec]:
+    """digit_vs_rest and high_vs_low at both periods (pre high_vs_low is 1 vs 0)."""
+    dummy = np.zeros(1, dtype=np.float32)
+    id0 = digit_ids["0"][0]
+    id1 = digit_ids["1"][0]
+    all_digit_ids = tuple(digit_ids[d][0] for d in "0123456789")
+    high_ids = tuple(digit_ids[d][0] for d in sorted(high_digits))
+    low_ids = tuple(digit_ids[d][0] for d in sorted(low_digits))
+    return [
+        ContrastSpec(
+            position="pre_period",
+            name="digit_vs_rest",
+            u=dummy,
+            pos_token_ids=(id0, id1),
+            neg_token_ids=None,
+        ),
+        ContrastSpec(
+            position="pre_period",
+            name="high_vs_low",
+            u=dummy,
+            pos_token_ids=(id1,),
+            neg_token_ids=(id0,),
+        ),
+        ContrastSpec(
+            position="post_period",
+            name="digit_vs_rest",
+            u=dummy,
+            pos_token_ids=all_digit_ids,
+            neg_token_ids=None,
+        ),
+        ContrastSpec(
+            position="post_period",
+            name="high_vs_low",
+            u=dummy,
+            pos_token_ids=high_ids,
+            neg_token_ids=low_ids,
+        ),
+    ]
+
+
 def compute_mass_mean_directions(
     input_h5: str,
     *,
@@ -454,11 +563,12 @@ def compute_mass_mean_directions(
     exclude_conf_one_positions: Sequence[str],
     require_l_or_un_positions: Sequence[str],
     head_write_specs: Sequence[AttnHeadWriteSpec] | None = None,
+    residual_stream: bool = False,
 ) -> dict[str, SiteDirections]:
     """Stream all high/low H5 examples; d = high_mean - low_mean at each site."""
     exclude_one = set(exclude_conf_one_positions)
     require_lu = set(require_l_or_un_positions)
-    need_heads = head_write_specs is not None
+    need_heads = head_write_specs is not None and not residual_stream
     if need_heads:
         assert head_write_specs is not None
         if len(head_write_specs) != int(n_layers):
@@ -524,72 +634,108 @@ def compute_mass_mean_directions(
                         continue
                 span_index = int(span_index_by_position[pos])
                 try:
-                    resid_pre, mlp_in, attn_out, mlp_out = _read_site_arrays_at_index(
-                        r0,
-                        span_index,
-                        n_layers=n_layers,
-                        d_model=d_model,
-                    )
+                    resid_stream_ex: np.ndarray | None = None
+                    resid_pre: np.ndarray | None = None
+                    mlp_in: np.ndarray | None = None
+                    attn_out: np.ndarray | None = None
+                    mlp_out: np.ndarray | None = None
                     attn_heads_ex: np.ndarray | None = None
-                    if head_write_specs is not None:
-                        concat_h = _read_concat_or_o_hidden(
+                    if residual_stream:
+                        resid_stream_ex = _read_resid_stream_at_index(
                             r0,
                             span_index,
-                            head_write_specs,
-                            o_proj_invs=o_proj_invs,
-                            used_o_fallback=used_o_fallback,
+                            n_layers=n_layers,
+                            d_model=d_model,
                         )
-                        if concat_h is None:
-                            if (
-                                o_proj_invs is None
-                                and _try_read_probability_token_hidden(
-                                    r0, "o", span_index
-                                )
-                                is not None
-                            ):
-                                o_proj_invs = _maybe_invert_o_proj_weights(
-                                    head_write_specs
-                                )
-                                concat_h = _read_concat_or_o_hidden(
-                                    r0,
-                                    span_index,
-                                    head_write_specs,
-                                    o_proj_invs=o_proj_invs,
-                                    used_o_fallback=used_o_fallback,
-                                )
-                        if concat_h is None:
-                            skipped_no_head_src += 1
-                            continue
-                        attn_heads_ex = _post_heads_all_layers(
-                            concat_h,
-                            attn_out,
-                            head_write_specs,
-                            resum_warned=resum_warned,
-                            resum_fail_counts=resum_fail_counts,
-                            context=f"ex={ex_id} pos={pos}",
+                    else:
+                        resid_pre, mlp_in, attn_out, mlp_out = _read_site_arrays_at_index(
+                            r0,
+                            span_index,
+                            n_layers=n_layers,
+                            d_model=d_model,
                         )
+                        if head_write_specs is not None:
+                            concat_h = _read_concat_or_o_hidden(
+                                r0,
+                                span_index,
+                                head_write_specs,
+                                o_proj_invs=o_proj_invs,
+                                used_o_fallback=used_o_fallback,
+                            )
+                            if concat_h is None:
+                                if (
+                                    o_proj_invs is None
+                                    and _try_read_probability_token_hidden(
+                                        r0, "o", span_index
+                                    )
+                                    is not None
+                                ):
+                                    o_proj_invs = _maybe_invert_o_proj_weights(
+                                        head_write_specs
+                                    )
+                                    concat_h = _read_concat_or_o_hidden(
+                                        r0,
+                                        span_index,
+                                        head_write_specs,
+                                        o_proj_invs=o_proj_invs,
+                                        used_o_fallback=used_o_fallback,
+                                    )
+                            if concat_h is None:
+                                skipped_no_head_src += 1
+                                continue
+                            attn_heads_ex = _post_heads_all_layers(
+                                concat_h,
+                                attn_out,
+                                head_write_specs,
+                                resum_warned=resum_warned,
+                                resum_fail_counts=resum_fail_counts,
+                                context=f"ex={ex_id} pos={pos}",
+                            )
                 except (TypeError, ValueError, OSError, KeyError) as exc:
                     skipped_bad += 1
                     logging.debug("Skip direction example %s pos=%s: %s", ex_id, pos, exc)
                     continue
                 for group in groups:
                     bucket = sums[pos][group]
-                    if not bucket:
-                        bucket["resid_pre"] = np.array(resid_pre, dtype=np.float64, copy=True)
-                        bucket["mlp"] = np.array(mlp_in, dtype=np.float64, copy=True)
-                        bucket["attn_out"] = np.array(attn_out, dtype=np.float64, copy=True)
-                        bucket["mlp_out"] = np.array(mlp_out, dtype=np.float64, copy=True)
-                        if attn_heads_ex is not None:
-                            bucket["attn_heads"] = np.array(
-                                attn_heads_ex, dtype=np.float64, copy=True
+                    if residual_stream:
+                        if resid_stream_ex is None:
+                            raise RuntimeError("residual_stream example row is missing.")
+                        if not bucket:
+                            bucket["resid_stream"] = np.array(
+                                resid_stream_ex, dtype=np.float64, copy=True
                             )
+                        else:
+                            bucket["resid_stream"] += resid_stream_ex
                     else:
-                        bucket["resid_pre"] += resid_pre
-                        bucket["mlp"] += mlp_in
-                        bucket["attn_out"] += attn_out
-                        bucket["mlp_out"] += mlp_out
-                        if attn_heads_ex is not None:
-                            bucket["attn_heads"] += attn_heads_ex
+                        if (
+                            resid_pre is None
+                            or mlp_in is None
+                            or attn_out is None
+                            or mlp_out is None
+                        ):
+                            raise RuntimeError("Site arrays missing for mass-mean bucket.")
+                        if not bucket:
+                            bucket["resid_pre"] = np.array(
+                                resid_pre, dtype=np.float64, copy=True
+                            )
+                            bucket["mlp"] = np.array(mlp_in, dtype=np.float64, copy=True)
+                            bucket["attn_out"] = np.array(
+                                attn_out, dtype=np.float64, copy=True
+                            )
+                            bucket["mlp_out"] = np.array(
+                                mlp_out, dtype=np.float64, copy=True
+                            )
+                            if attn_heads_ex is not None:
+                                bucket["attn_heads"] = np.array(
+                                    attn_heads_ex, dtype=np.float64, copy=True
+                                )
+                        else:
+                            bucket["resid_pre"] += resid_pre
+                            bucket["mlp"] += mlp_in
+                            bucket["attn_out"] += attn_out
+                            bucket["mlp_out"] += mlp_out
+                            if attn_heads_ex is not None:
+                                bucket["attn_heads"] += attn_heads_ex
                     counts[pos][group] += 1
 
     out: dict[str, SiteDirections] = {}
@@ -616,34 +762,46 @@ def compute_mass_mean_directions(
             )
         high = sums[pos]["high"]
         low = sums[pos]["low"]
-        resid_pre = ((high["resid_pre"] / n_high) - (low["resid_pre"] / n_low)).astype(
-            np.float32
-        )
-        mlp = ((high["mlp"] / n_high) - (low["mlp"] / n_low)).astype(np.float32)
-        attn_out = ((high["attn_out"] / n_high) - (low["attn_out"] / n_low)).astype(
-            np.float32
-        )
-        mlp_out = ((high["mlp_out"] / n_high) - (low["mlp_out"] / n_low)).astype(
-            np.float32
-        )
-        attn_heads = None
-        if need_heads:
-            if "attn_heads" not in high or "attn_heads" not in low:
-                raise ValueError(
-                    f"No per-head concat/o writes for mass-mean at {pos!r}."
-                )
-            attn_heads = (
-                (high["attn_heads"] / n_high) - (low["attn_heads"] / n_low)
+        resid_stream = None
+        zeros = np.zeros((int(n_layers), int(d_model)), dtype=np.float32)
+        if residual_stream:
+            resid_stream = (
+                (high["resid_stream"] / n_high) - (low["resid_stream"] / n_low)
             ).astype(np.float32)
-            head_sum = attn_heads.sum(axis=1)
-            completeness = float(np.max(np.abs(head_sum - attn_out)))
-            logging.info(
-                "Mass-mean head completeness %s: max |sum_h d_h - d_attn|=%.6g "
-                "(n_heads=%d)",
-                pos,
-                completeness,
-                int(attn_heads.shape[1]),
+            resid_pre = resid_stream[: int(n_layers)]
+            mlp = zeros
+            attn_out = zeros
+            mlp_out = zeros
+            attn_heads = None
+        else:
+            resid_pre = ((high["resid_pre"] / n_high) - (low["resid_pre"] / n_low)).astype(
+                np.float32
             )
+            mlp = ((high["mlp"] / n_high) - (low["mlp"] / n_low)).astype(np.float32)
+            attn_out = ((high["attn_out"] / n_high) - (low["attn_out"] / n_low)).astype(
+                np.float32
+            )
+            mlp_out = ((high["mlp_out"] / n_high) - (low["mlp_out"] / n_low)).astype(
+                np.float32
+            )
+            attn_heads = None
+            if need_heads:
+                if "attn_heads" not in high or "attn_heads" not in low:
+                    raise ValueError(
+                        f"No per-head concat/o writes for mass-mean at {pos!r}."
+                    )
+                attn_heads = (
+                    (high["attn_heads"] / n_high) - (low["attn_heads"] / n_low)
+                ).astype(np.float32)
+                head_sum = attn_heads.sum(axis=1)
+                completeness = float(np.max(np.abs(head_sum - attn_out)))
+                logging.info(
+                    "Mass-mean head completeness %s: max |sum_h d_h - d_attn|=%.6g "
+                    "(n_heads=%d)",
+                    pos,
+                    completeness,
+                    int(attn_heads.shape[1]),
+                )
         out[pos] = SiteDirections(
             resid_pre=resid_pre,
             mlp=mlp,
@@ -652,10 +810,11 @@ def compute_mass_mean_directions(
             attn_out=attn_out,
             mlp_out=mlp_out,
             attn_heads=attn_heads,
+            resid_stream=resid_stream,
         )
         logging.info(
             "Mass-mean direction %s: n_high=%d n_low=%d resid_pre=%s mlp=%s "
-            "attn_out=%s mlp_out=%s attn_heads=%s",
+            "attn_out=%s mlp_out=%s attn_heads=%s resid_stream=%s",
             pos,
             n_high,
             n_low,
@@ -664,6 +823,7 @@ def compute_mass_mean_directions(
             tuple(attn_out.shape),
             tuple(mlp_out.shape),
             None if attn_heads is None else tuple(attn_heads.shape),
+            None if resid_stream is None else tuple(resid_stream.shape),
         )
     if skipped_bad:
         logging.info("Direction stream skipped %d unreadable site rows.", skipped_bad)
@@ -693,6 +853,8 @@ def save_directions_npz(path: Path, directions: dict[str, SiteDirections]) -> No
         payload[f"{pos}__n_low"] = np.asarray(d.n_low, dtype=np.int64)
         if d.attn_heads is not None:
             payload[f"{pos}__attn_heads"] = d.attn_heads
+        if d.resid_stream is not None:
+            payload[f"{pos}__resid_stream"] = d.resid_stream
     np.savez_compressed(path, **payload)
 
 
@@ -1380,6 +1542,291 @@ def enable_split_input_hooks(model) -> None:
     model.set_use_hook_mlp_in(True)
 
 
+class ResidualStreamCapture:
+    """Retain grads of display-layer residual-stream sites without breaking the chain.
+
+    Display 0 (``blocks.0.hook_resid_pre``) may become a grad leaf. Later display
+    layers (``hook_resid_post`` of block k-1) only ``retain_grad`` on the live
+    residual so earlier-layer dots still include indirect paths through ΔL.
+    """
+
+    def __init__(self, *, n_layers: int, d_model: int) -> None:
+        self.n_layers = int(n_layers)
+        self.n_display = int(n_layers) + 1
+        self.d_model = int(d_model)
+        self.resid: list[torch.Tensor | None] = [None] * self.n_display
+        self._model = None
+
+    def clear_captured(self) -> None:
+        for i in range(len(self.resid)):
+            self.resid[i] = None
+
+    def iter_tensors(self):
+        for t in self.resid:
+            if t is not None:
+                yield t
+
+    def zero_grads(self) -> None:
+        for t in self.iter_tensors():
+            if t.grad is not None:
+                t.grad = None
+
+    def _make_retain_hook(self, display_layer: int, *, allow_leaf: bool):
+        def hook_fn(activation: torch.Tensor, hook) -> torch.Tensor:
+            del hook
+            if allow_leaf:
+                out = _retain_or_leaf(activation)
+            else:
+                if not activation.requires_grad:
+                    raise RuntimeError(
+                        f"Display layer {display_layer} residual does not require grad. "
+                        "Detaching intermediate residual-stream sites would cut earlier "
+                        "layers off from ΔL."
+                    )
+                activation.retain_grad()
+                out = activation
+            self.resid[display_layer] = out
+            return out
+
+        return hook_fn
+
+    def register(self, model) -> None:
+        self._model = model
+        hook_dict = getattr(model, "hook_dict", None)
+        if not isinstance(hook_dict, dict) or not hook_dict:
+            raise ValueError(
+                "HookedTransformer is missing hook_dict; cannot attach residual-stream hooks."
+            )
+        needed = [hook_name_for_display_layer(d) for d in range(self.n_display)]
+        missing = [name for name in needed if name not in hook_dict]
+        if missing:
+            raise ValueError(
+                "Model is missing TransformerLens hook points required for "
+                f"residual-stream attribution: {missing[:8]}."
+            )
+
+    def fwd_hooks(self) -> list[tuple[str, object]]:
+        hooks: list[tuple[str, object]] = []
+        for display in range(self.n_display):
+            hooks.append(
+                (
+                    hook_name_for_display_layer(display),
+                    self._make_retain_hook(display, allow_leaf=display == 0),
+                )
+            )
+        return hooks
+
+    def assert_sites_ready(self) -> None:
+        missing = [i for i in range(self.n_display) if self.resid[i] is None]
+        if missing:
+            raise RuntimeError(
+                f"Residual-stream hooks missed tensors at display layers {missing[:8]}."
+            )
+        not_grad = [
+            i for i in range(self.n_display) if not self.resid[i].requires_grad
+        ]
+        if not_grad:
+            raise RuntimeError(
+                "Captured residual-stream tensors do not require grad at display "
+                f"layers {not_grad[:8]}."
+            )
+
+    def remove(self) -> None:
+        if self._model is not None:
+            self._model.reset_hooks(including_permanent=True)
+            self._model = None
+
+
+def scores_from_residual_capture(
+    capture: ResidualStreamCapture,
+    direction: SiteDirections,
+) -> np.ndarray:
+    if direction.resid_stream is None:
+        raise RuntimeError("Residual-stream scoring requires resid_stream directions.")
+    d_all = direction.resid_stream
+    if d_all.ndim != 2 or int(d_all.shape[0]) != capture.n_display:
+        raise ValueError(
+            f"resid_stream direction shape {tuple(d_all.shape)} != "
+            f"(n_display, d_model)=({capture.n_display}, {capture.d_model})."
+        )
+    if int(d_all.shape[1]) != capture.d_model:
+        raise ValueError(
+            f"resid_stream d_model {int(d_all.shape[1])} != capture d_model={capture.d_model}."
+        )
+    row = np.zeros(capture.n_display, dtype=np.float32)
+    for display in range(capture.n_display):
+        row[display] = _mlp_dot(
+            _last_pos_grad(
+                capture.resid[display], name="resid_stream", layer=display
+            ),
+            d_all[display],
+        )
+    return row
+
+
+def _score_residual_pass(
+    *,
+    model,
+    tokens: torch.Tensor,
+    capture: ResidualStreamCapture,
+    pos_contrasts: Sequence[ContrastSpec],
+    direction: SiteDirections,
+    position: str,
+) -> dict[tuple[str, str], tuple[np.ndarray, float, float]]:
+    out: dict[tuple[str, str], tuple[np.ndarray, float, float]] = {}
+    capture.clear_captured()
+    capture.zero_grads()
+    with torch.enable_grad():
+        logits = model.run_with_hooks(
+            tokens,
+            return_type="logits",
+            fwd_hooks=capture.fwd_hooks(),
+            reset_hooks_end=True,
+        )
+        capture.assert_sites_ready()
+        last_logits = logits[0, -1].float()
+        for ci, contrast in enumerate(pos_contrasts):
+            retain = ci < len(pos_contrasts) - 1
+            ld = logit_diff_from_logits(
+                last_logits, contrast.pos_token_ids, contrast.neg_token_ids
+            )
+            ld.backward(retain_graph=retain)
+            ld_val = float(ld.detach().item())
+            row = scores_from_residual_capture(capture, direction)
+            out[(position, contrast.name)] = (row, 0.0, ld_val)
+            capture.zero_grads()
+    del logits, last_logits
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return out
+
+
+def run_residual_attribution_for_example(
+    *,
+    model,
+    example: GradExample,
+    capture: ResidualStreamCapture,
+    contrasts: Sequence[ContrastSpec],
+    expected_span: int,
+    prompt_prefix: str,
+    directions: dict[str, SiteDirections],
+) -> dict[tuple[str, str], tuple[np.ndarray, float, float]]:
+    out: dict[tuple[str, str], tuple[np.ndarray, float, float]] = {}
+    by_position: dict[str, list[ContrastSpec]] = {}
+    for c in contrasts:
+        by_position.setdefault(c.position, []).append(c)
+
+    for position, pos_contrasts in by_position.items():
+        if position not in directions:
+            raise ValueError(f"No mass-mean direction computed for position {position!r}.")
+        direction = directions[position]
+        span_idx = contrast_span_index(pos_contrasts[0], example, expected_span)
+        for extra in pos_contrasts[1:]:
+            other = contrast_span_index(extra, example, expected_span)
+            if other != span_idx:
+                raise ValueError(
+                    f"Contrasts at position {position!r} disagree on span index "
+                    f"({span_idx} vs {other})."
+                )
+        abs_idx = example.first_prob_token_index + span_idx
+        if abs_idx < 0 or abs_idx >= len(example.decoded_tokens):
+            raise ValueError(
+                f"Example {example.example_id}: abs index {abs_idx} out of range "
+                f"for {position} (len={len(example.decoded_tokens)})."
+            )
+        tokens = build_prefix_input_ids_tl(
+            model,
+            example,
+            abs_idx,
+            prompt_prefix=prompt_prefix,
+        )
+        out.update(
+            _score_residual_pass(
+                model=model,
+                tokens=tokens,
+                capture=capture,
+                pos_contrasts=pos_contrasts,
+                direction=direction,
+                position=position,
+            )
+        )
+        del tokens
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return out
+
+
+def run_residual_cohort_attributions(
+    *,
+    examples: Sequence[GradExample],
+    model,
+    capture: ResidualStreamCapture,
+    contrasts: Sequence[ContrastSpec],
+    expected_span: int,
+    desc: str,
+    prompt_prefix: str,
+    directions: dict[str, SiteDirections],
+) -> dict[tuple[str, str], ExperimentResult]:
+    n_ex = len(examples)
+    labels = residual_stream_labels(capture.n_layers)
+    keys = [(c.position, c.name) for c in contrasts]
+    attrs: dict[tuple[str, str], np.ndarray] = {
+        key: np.zeros((n_ex, len(labels)), dtype=np.float32) for key in keys
+    }
+    embeds: dict[tuple[str, str], np.ndarray] = {
+        key: np.zeros(n_ex, dtype=np.float32) for key in keys
+    }
+    scores: dict[tuple[str, str], np.ndarray] = {
+        key: np.zeros(n_ex, dtype=np.float32) for key in keys
+    }
+    example_ids: list[str] = []
+    skipped = 0
+    ei = 0
+    for ex in tqdm(examples, desc=desc):
+        try:
+            per = run_residual_attribution_for_example(
+                model=model,
+                example=ex,
+                capture=capture,
+                contrasts=contrasts,
+                expected_span=expected_span,
+                prompt_prefix=prompt_prefix,
+                directions=directions,
+            )
+        except (ValueError, RuntimeError) as exc:
+            skipped += 1
+            logging.warning("Skipping example %s: %s", ex.example_id, exc)
+            continue
+        example_ids.append(ex.example_id)
+        for key in keys:
+            row, embed_attr, ld_val = per[key]
+            attrs[key][ei] = row
+            embeds[key][ei] = embed_attr
+            scores[key][ei] = ld_val
+        ei += 1
+
+    if skipped:
+        logging.info("%s skipped %d examples.", desc, skipped)
+    if ei == 0:
+        raise ValueError(f"No examples succeeded for cohort {desc!r}.")
+
+    packed: dict[tuple[str, str], ExperimentResult] = {}
+    for position, name in keys:
+        key = (position, name)
+        packed[key] = ExperimentResult(
+            position=position,
+            contrast_name=name,
+            granularity=RESIDUAL_STREAM_GRANULARITY,
+            labels=labels,
+            example_ids=example_ids,
+            attributions=attrs[key][:ei],
+            embed_attributions=embeds[key][:ei],
+            true_scores=scores[key][:ei],
+            completeness_residuals=np.zeros(ei, dtype=np.float32),
+        )
+    return packed
+
+
 def _score_site_pass(
     *,
     model,
@@ -1626,6 +2073,471 @@ def run_cohort_attributions(
     return input_results, output_results
 
 
+def _residual_period_component_labels(
+    n_layers: int, periods: Sequence[str]
+) -> list[str]:
+    labels: list[str] = []
+    n_display = int(n_layers) + 1
+    if len(periods) == 1:
+        return residual_stream_labels(n_layers)
+    for display in range(n_display):
+        for period in periods:
+            labels.append(f"L{display}_{period}")
+    return labels
+
+
+def _residual_flatten_period_values(
+    period_vectors: Sequence[np.ndarray],
+) -> np.ndarray:
+    """Layer-major, period-minor flatten of [n_display] vectors."""
+    n_display = int(period_vectors[0].shape[0])
+    out = np.zeros(n_display * len(period_vectors), dtype=np.float32)
+    idx = 0
+    for display in range(n_display):
+        for vec in period_vectors:
+            out[idx] = float(vec[display])
+            idx += 1
+    return out
+
+
+def _save_residual_numeric_h5(
+    path: Path,
+    period_results: dict[str, ExperimentResult],
+    *,
+    contrast_name: str,
+) -> None:
+    first = next(iter(period_results.values()))
+    with h5py.File(path, "w") as f:
+        dt = h5py.string_dtype(encoding="utf-8")
+        f.create_dataset("component_labels", data=np.asarray(first.labels, dtype=dt))
+        f.attrs["contrast_name"] = contrast_name
+        f.attrs["granularity"] = RESIDUAL_STREAM_GRANULARITY
+        f.attrs["position"] = ",".join(period_results.keys())
+        for period, result in period_results.items():
+            g = f.create_group(period)
+            g.create_dataset("attributions", data=result.attributions)
+            g.create_dataset("embed_attributions", data=result.embed_attributions)
+            g.create_dataset("true_scores", data=result.true_scores)
+            g.create_dataset(
+                "example_ids", data=np.asarray(result.example_ids, dtype=dt)
+            )
+
+
+def _write_residual_experiment_outputs(
+    exp_dir: Path,
+    period_results: dict[str, ExperimentResult],
+    examples_by_id: dict[str, GradExample],
+    individual_ids: Sequence[str],
+    *,
+    contrast_name: str,
+    col_labels: Sequence[str],
+    n_layers: int,
+    bar_chart_top_k: int,
+) -> None:
+    """Write residual-stream mean/example heatmaps (1 col linguistic, 2 col numeric)."""
+    if not period_results:
+        raise ValueError("period_results is empty.")
+    periods = list(period_results.keys())
+    if len(periods) != len(col_labels):
+        raise ValueError(
+            f"col_labels {list(col_labels)} length != n_periods={len(periods)}."
+        )
+    n_display = int(n_layers) + 1
+    row_labels = [str(d) for d in range(n_display)]
+    ranked_labels = _residual_period_component_labels(n_layers, periods)
+    first = next(iter(period_results.values()))
+    for result in period_results.values():
+        if result.labels != first.labels:
+            raise ValueError(
+                f"Residual label mismatch for {contrast_name}: "
+                f"{result.labels[:3]} vs {first.labels[:3]}"
+            )
+        if result.attributions.shape[1] != n_display:
+            raise ValueError(
+                f"{contrast_name} attributions width {result.attributions.shape[1]} "
+                f"!= n_display={n_display}."
+            )
+
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    if len(period_results) == 1:
+        save_attributions_h5(exp_dir / "attributions.h5", first)
+    else:
+        _save_residual_numeric_h5(
+            exp_dir / "attributions.h5",
+            period_results,
+            contrast_name=contrast_name,
+        )
+
+    period_means = [
+        np.mean(result.attributions, axis=0).astype(np.float32)
+        for result in period_results.values()
+    ]
+    period_sems = [
+        (
+            np.std(result.attributions, axis=0, ddof=1)
+            / np.sqrt(result.attributions.shape[0])
+        ).astype(np.float32)
+        if result.attributions.shape[0] > 1
+        else np.zeros(n_display, dtype=np.float32)
+        for result in period_results.values()
+    ]
+    mean_mat = np.stack(period_means, axis=1)
+    flat_means = _residual_flatten_period_values(period_means)
+    flat_sems = _residual_flatten_period_values(period_sems)
+    stats = [
+        ComponentStats(
+            label=lab,
+            mean=float(flat_means[i]),
+            sem=float(flat_sems[i]),
+            median=float(flat_means[i]),
+            top10_fraction=0.0,
+            sign_consistency=1.0,
+        )
+        for i, lab in enumerate(ranked_labels)
+    ]
+    # Prefer real per-example stats when a single cohort backs the heatmap.
+    if len(period_results) == 1:
+        stats = aggregate_component_stats(first.attributions, first.labels)
+        ranked_labels = list(first.labels)
+        flat_means = np.array([s.mean for s in stats], dtype=np.float32)
+        flat_sems = np.array([s.sem for s in stats], dtype=np.float32)
+    ranked = rank_by_mean(stats)
+
+    if len(period_results) == 1:
+        write_distribution_plot(
+            exp_dir / "distribution_topk.png",
+            first.attributions,
+            first.labels,
+            ranked[: max(bar_chart_top_k, 1)],
+            top_k=bar_chart_top_k,
+            title=(
+                f"attr-patch residual {first.position} / {contrast_name}: "
+                f"top-{bar_chart_top_k} by |mean|, ordered by mean"
+            ),
+        )
+
+    mean_dir = exp_dir / "mean"
+    mean_dir.mkdir(parents=True, exist_ok=True)
+    n_note = ", ".join(
+        f"{period} n={len(result.example_ids)}"
+        for period, result in period_results.items()
+    )
+    write_diverging_heatmap(
+        mean_dir / "heatmap.png",
+        mean_mat,
+        row_labels=row_labels,
+        col_labels=list(col_labels),
+        title=(
+            f"Mean attr-patch residual — {contrast_name} ({n_note}; "
+            "± normalised separately)"
+        ),
+        rounding_dp=ANNOTATION_ROUNDING_DP,
+    )
+    embed_parts = [
+        float(np.mean(result.embed_attributions))
+        for result in period_results.values()
+        if result.embed_attributions.size
+    ]
+    embed_mean = float(np.mean(embed_parts)) if embed_parts else 0.0
+    write_ranked_mean_txt(
+        mean_dir / "ranked.txt", ranked, embed_mean=embed_mean, embed_sem=0.0
+    )
+    write_bar_chart(
+        mean_dir / "bar_chart.png",
+        [s.label for s in ranked],
+        [s.mean for s in ranked],
+        title=f"Mean attr-patch residual — {contrast_name}",
+        top_k=bar_chart_top_k,
+        errors=[s.sem for s in ranked],
+    )
+
+    id_to_row = {
+        period: {eid: i for i, eid in enumerate(result.example_ids)}
+        for period, result in period_results.items()
+    }
+    for eid in individual_ids:
+        missing = [p for p, lookup in id_to_row.items() if eid not in lookup]
+        if missing:
+            raise ValueError(
+                f"Individual example {eid} missing from residual periods {missing}."
+            )
+        ex = examples_by_id[eid]
+        period_vals = [
+            result.attributions[id_to_row[period][eid]]
+            for period, result in period_results.items()
+        ]
+        mat = np.stack(period_vals, axis=1)
+        ex_dir = exp_dir / f"example_{eid}"
+        ex_dir.mkdir(parents=True, exist_ok=True)
+        write_diverging_heatmap(
+            ex_dir / "heatmap.png",
+            mat,
+            row_labels=row_labels,
+            col_labels=list(col_labels),
+            title=(
+                f"Example {eid} attr-patch residual — {contrast_name} "
+                "(normalised to this example's own min/max; ± separately)"
+            ),
+            rounding_dp=ANNOTATION_ROUNDING_DP,
+        )
+        flat_vals = _residual_flatten_period_values(period_vals)
+        ranked_pairs = rank_by_value(ranked_labels, flat_vals)
+        first_period = next(iter(period_results))
+        first_result = period_results[first_period]
+        true_score = float(first_result.true_scores[id_to_row[first_period][eid]])
+        if len(period_results) > 1:
+            score_bits = [
+                f"{period}={float(result.true_scores[id_to_row[period][eid]]):.6g}"
+                for period, result in period_results.items()
+            ]
+            write_ranked_example_txt(
+                ex_dir / "ranked.txt",
+                ranked_pairs,
+                example_id=eid,
+                response=ex.response,
+                confidence=ex.verbalised_confidence,
+                embed_attr=0.0,
+                true_score=true_score,
+            )
+            extra = ex_dir / "ranked.txt"
+            text = extra.read_text(encoding="utf-8")
+            extra.write_text(
+                text.replace(
+                    f"true_contrast_score={true_score:.6g}",
+                    "true_contrast_scores " + " ".join(score_bits),
+                    1,
+                ),
+                encoding="utf-8",
+            )
+        else:
+            write_ranked_example_txt(
+                ex_dir / "ranked.txt",
+                ranked_pairs,
+                example_id=eid,
+                response=ex.response,
+                confidence=ex.verbalised_confidence,
+                embed_attr=float(
+                    first_result.embed_attributions[id_to_row[first_period][eid]]
+                ),
+                true_score=true_score,
+            )
+        write_bar_chart(
+            ex_dir / "bar_chart.png",
+            [p[0] for p in ranked_pairs],
+            [p[1] for p in ranked_pairs],
+            title=f"Example {eid} attr-patch residual — {contrast_name}",
+            top_k=bar_chart_top_k,
+            errors=None,
+        )
+
+
+def _write_residual_high_minus_low(
+    exp_dir: Path,
+    high_period_results: dict[str, ExperimentResult],
+    low_period_results: dict[str, ExperimentResult],
+    *,
+    contrast_name: str,
+    col_labels: Sequence[str],
+    n_layers: int,
+    bar_chart_top_k: int,
+) -> None:
+    if set(high_period_results) != set(low_period_results):
+        raise ValueError(
+            f"High/low residual periods differ for {contrast_name}: "
+            f"{sorted(high_period_results)} vs {sorted(low_period_results)}."
+        )
+    periods = list(high_period_results.keys())
+    n_display = int(n_layers) + 1
+    row_labels = [str(d) for d in range(n_display)]
+    ranked_labels = _residual_period_component_labels(n_layers, periods)
+    high_means = []
+    low_means = []
+    high_sems = []
+    low_sems = []
+    for period in periods:
+        high = high_period_results[period]
+        low = low_period_results[period]
+        if high.labels != low.labels:
+            raise ValueError(
+                f"High/low label mismatch for residual {contrast_name}/{period}."
+            )
+        h_stats = aggregate_component_stats(high.attributions, high.labels)
+        l_stats = aggregate_component_stats(low.attributions, low.labels)
+        high_means.append(np.array([s.mean for s in h_stats], dtype=np.float32))
+        low_means.append(np.array([s.mean for s in l_stats], dtype=np.float32))
+        high_sems.append(np.array([s.sem for s in h_stats], dtype=np.float32))
+        low_sems.append(np.array([s.sem for s in l_stats], dtype=np.float32))
+    diff_mat = np.stack(high_means, axis=1) - np.stack(low_means, axis=1)
+    flat_high = _residual_flatten_period_values(high_means)
+    flat_low = _residual_flatten_period_values(low_means)
+    flat_high_sem = _residual_flatten_period_values(high_sems)
+    flat_low_sem = _residual_flatten_period_values(low_sems)
+    if len(periods) == 1:
+        ranked_labels = list(next(iter(high_period_results.values())).labels)
+        flat_high = high_means[0]
+        flat_low = low_means[0]
+        flat_high_sem = high_sems[0]
+        flat_low_sem = low_sems[0]
+    ranked = high_minus_low_rows(
+        ranked_labels, flat_high, flat_low, flat_high_sem, flat_low_sem
+    )
+    n_high_note = ", ".join(
+        f"{p} n_high={len(high_period_results[p].example_ids)}" for p in periods
+    )
+    n_low_note = ", ".join(
+        f"{p} n_low={len(low_period_results[p].example_ids)}" for p in periods
+    )
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    mean_dir = exp_dir / "mean"
+    mean_dir.mkdir(parents=True, exist_ok=True)
+    write_ranked_high_minus_low_txt(
+        mean_dir / "ranked.txt",
+        ranked,
+        embed_diff=0.0,
+        embed_high=0.0,
+        embed_low=0.0,
+        n_high=len(next(iter(high_period_results.values())).example_ids),
+        n_low=len(next(iter(low_period_results.values())).example_ids),
+    )
+    extra = mean_dir / "ranked.txt"
+    text = extra.read_text(encoding="utf-8")
+    extra.write_text(
+        text.replace(
+            f"n_high={len(next(iter(high_period_results.values())).example_ids)}  "
+            f"n_low={len(next(iter(low_period_results.values())).example_ids)}",
+            f"{n_high_note}; {n_low_note}",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    write_diverging_heatmap(
+        mean_dir / "heatmap.png",
+        diff_mat.astype(np.float32),
+        row_labels=row_labels,
+        col_labels=list(col_labels),
+        title=(
+            f"High−low attr-patch residual — {contrast_name} "
+            f"({n_high_note}; {n_low_note}; ± normalised separately)"
+        ),
+        rounding_dp=ANNOTATION_ROUNDING_DP,
+    )
+    write_bar_chart(
+        mean_dir / "bar_chart.png",
+        [r.label for r in ranked],
+        [r.diff for r in ranked],
+        title=f"High−low attr-patch residual — {contrast_name}",
+        top_k=bar_chart_top_k,
+        errors=[r.diff_sem for r in ranked],
+    )
+
+
+def _write_residual_cohort_dirs(
+    *,
+    run_root: Path,
+    results: dict[tuple[str, str], ExperimentResult],
+    examples_by_id: dict[str, GradExample],
+    individual_ids: Sequence[str],
+    dirname_suffix: str,
+    n_layers: int,
+    bar_chart_top_k: int,
+    linguistic: bool,
+) -> None:
+    names: list[str] = []
+    for _position, name in results:
+        if name not in names:
+            names.append(name)
+    for name in names:
+        period_results = {
+            pos: result for (pos, n), result in results.items() if n == name
+        }
+        if linguistic:
+            col_labels = ["residual"]
+        else:
+            missing = [p for p in NUMERIC_RESIDUAL_PERIODS if p not in period_results]
+            if missing:
+                raise ValueError(
+                    f"Residual numeric contrast {name!r} missing periods {missing}."
+                )
+            period_results = {
+                period: period_results[period] for period in NUMERIC_RESIDUAL_PERIODS
+            }
+            col_labels = list(NUMERIC_RESIDUAL_PERIODS)
+        leaf = f"{name}{dirname_suffix}"
+        exp_dir = run_root / leaf
+        logging.info(
+            "Writing residual %s (periods=%s)",
+            leaf,
+            ",".join(
+                f"{p}:{len(r.example_ids)}" for p, r in period_results.items()
+            ),
+        )
+        allowed: set[str] | None = None
+        for result in period_results.values():
+            ids = set(result.example_ids)
+            allowed = ids if allowed is None else allowed & ids
+        allowed_ids = allowed or set()
+        contrast_ids = [eid for eid in individual_ids if eid in allowed_ids]
+        if len(contrast_ids) < min(len(individual_ids), len(allowed_ids)):
+            for eid in next(iter(period_results.values())).example_ids:
+                if eid in allowed_ids and eid not in contrast_ids:
+                    contrast_ids.append(eid)
+                if len(contrast_ids) >= len(individual_ids):
+                    break
+        _write_residual_experiment_outputs(
+            exp_dir,
+            period_results,
+            examples_by_id,
+            contrast_ids[: len(individual_ids)],
+            contrast_name=name,
+            col_labels=col_labels,
+            n_layers=n_layers,
+            bar_chart_top_k=bar_chart_top_k,
+        )
+
+
+def _write_residual_high_minus_low_dirs(
+    *,
+    run_root: Path,
+    high_results: dict[tuple[str, str], ExperimentResult],
+    low_results: dict[tuple[str, str], ExperimentResult],
+    n_layers: int,
+    bar_chart_top_k: int,
+    linguistic: bool,
+) -> None:
+    names: list[str] = []
+    for _position, name in high_results:
+        if name not in names:
+            names.append(name)
+    for name in names:
+        high_period = {
+            pos: result for (pos, n), result in high_results.items() if n == name
+        }
+        low_period = {
+            pos: result for (pos, n), result in low_results.items() if n == name
+        }
+        if linguistic:
+            col_labels = ["residual"]
+        else:
+            high_period = {
+                period: high_period[period] for period in NUMERIC_RESIDUAL_PERIODS
+            }
+            low_period = {
+                period: low_period[period] for period in NUMERIC_RESIDUAL_PERIODS
+            }
+            col_labels = list(NUMERIC_RESIDUAL_PERIODS)
+        leaf = f"{name}__high_minus_low"
+        logging.info("Writing residual high-minus-low ranking %s", leaf)
+        _write_residual_high_minus_low(
+            run_root / leaf,
+            high_period,
+            low_period,
+            contrast_name=name,
+            col_labels=col_labels,
+            n_layers=n_layers,
+            bar_chart_top_k=bar_chart_top_k,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Run scaffolding
 # ---------------------------------------------------------------------------
@@ -1693,6 +2605,16 @@ def write_readme(path: Path) -> None:
         "cohorts are written as `...__high_conf/` and `...__low_conf/`. "
         "`...__high_minus_low/` ranks components by signed "
         "(high_conf mean − low_conf mean) of these attribution scores.\n\n"
+        "With `--residual_stream`, attribution patching is on the residual stream "
+        "at display layers instead of Q/K/V inputs and MLP: display 0 is "
+        "`blocks.0.hook_resid_pre` (embedding; H5 `res[0]`) and display `k>=1` is "
+        "`blocks.{k-1}.hook_resid_post` (H5 `res[k]`). There is no coarse/fine split "
+        "and no `component_output/` tree. Numeric residual experiments are written "
+        "flat as `{contrast}/` (`digit_vs_rest` and `high_vs_low`; pre-period "
+        "`high_vs_low` is 1 vs 0) with a two-column heatmap (pre_period, post_period) "
+        "and layer rows `0 … n_layers`. The post-period column still drops "
+        "verbalised_confidence 1.0. Linguistic residual heatmaps are one column "
+        "(`residual`) under the same flat `{contrast}/` names.\n\n"
         "`--rerun_autoregressive` (default) greedy-decodes a new Guess:/Probability: "
         "completion from each H5 question for the live attribution pass and keeps the "
         "sampled token ids for prefix reconstruction (Mistral ``\\n`` is not 1:1 under "
@@ -1742,17 +2664,33 @@ def write_config_txt(
         f"d_model={d_model}",
         "method=attribution_patching",
         "direction_definition=high_mean_minus_low_mean",
-        "sites=hook_q_input,hook_k_input,hook_v_input,hook_mlp_in",
-        "attn_direction=h5_res[L] (resid-pre of block L)",
-        "mlp_direction=h5_res[L]+attn[L] (resid-mid, cloned onto hook_mlp_in)",
-        "fine_head_score=q_input_dot + k_input_dot + v_input_dot (GQA shares K/V within query group)",
-        f"attribute_component_outputs={args.attribute_component_outputs}",
-        "output_pass=second_independent_forward",
-        "output_sites=hook_attn_out,hook_mlp_out",
-        "output_attn_direction=h5_attn[L] (hook_attn_out addend; after ln1_post / post_attention_layernorm on sandwich Gemma)",
-        "output_mlp_direction=h5_mlp[L] (hook_mlp_out; after ln2_post / post_feedforward_layernorm on sandwich Gemma)",
-        "output_fine_head_score=<grad_post_h, d_h>; d_h = high_mean(post_h)-low_mean(post_h) from H5 concat (o fallback) through W_O; sandwich Gemma applies per-example shared ln1_post before averaging",
-        f"output_results_subdir={COMPONENT_OUTPUT_SUBDIR}",
+    ]
+    if args.residual_stream:
+        lines += [
+            "residual_stream=True",
+            "sites=display residual stream "
+            "(0=blocks.0.hook_resid_pre; k>=1=blocks.{k-1}.hook_resid_post)",
+            "resid_direction=h5_res[k] (display k; res[0]=embedding, res[k]=resid-post of block k-1)",
+            "attribute_component_outputs=False",
+            "output_pass=skipped",
+            f"n_display_layers={n_layers + 1}",
+        ]
+    else:
+        lines += [
+            "residual_stream=False",
+            "sites=hook_q_input,hook_k_input,hook_v_input,hook_mlp_in",
+            "attn_direction=h5_res[L] (resid-pre of block L)",
+            "mlp_direction=h5_res[L]+attn[L] (resid-mid, cloned onto hook_mlp_in)",
+            "fine_head_score=q_input_dot + k_input_dot + v_input_dot (GQA shares K/V within query group)",
+            f"attribute_component_outputs={args.attribute_component_outputs}",
+            "output_pass=second_independent_forward",
+            "output_sites=hook_attn_out,hook_mlp_out",
+            "output_attn_direction=h5_attn[L] (hook_attn_out addend; after ln1_post / post_attention_layernorm on sandwich Gemma)",
+            "output_mlp_direction=h5_mlp[L] (hook_mlp_out; after ln2_post / post_feedforward_layernorm on sandwich Gemma)",
+            "output_fine_head_score=<grad_post_h, d_h>; d_h = high_mean(post_h)-low_mean(post_h) from H5 concat (o fallback) through W_O; sandwich Gemma applies per-example shared ln1_post before averaging",
+            f"output_results_subdir={COMPONENT_OUTPUT_SUBDIR}",
+        ]
+    lines += [
         "",
         f"expected_probability_tokens={args.expected_probability_tokens}",
         f"expected_confidence_tokens={args.expected_confidence_tokens}",
@@ -1805,7 +2743,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Attribution patching of mass-mean (high−low) residual-input "
             "directions (hook_q/k/v_input and hook_mlp_in), and optionally "
             "component-output directions (hook_attn_out addend and hook_mlp_out), onto "
-            "verbalised-confidence logit differences."
+            "verbalised-confidence logit differences. With --residual_stream, patch "
+            "the residual stream at display layers instead."
         )
     )
     p.add_argument(
@@ -1873,6 +2812,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "(H5 mlp; after ln2_post on sandwich Gemma-3). Fine heads use "
             "per-head mass-mean directions from H5 concat (o fallback). "
             "Written under component_output/. If false, input-site pass only."
+        ),
+    )
+    p.add_argument(
+        "--residual_stream",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If true, attribution-patch the residual stream at display layers "
+            "(0=blocks.0.hook_resid_pre embedding; k>=1=blocks.{k-1}.hook_resid_post) "
+            "with mass-mean directions from H5 res[k]. Layer-level only (no fine "
+            "granularity, no component_output). Numeric runs write digit_vs_rest and "
+            "high_vs_low (pre-period high_vs_low is 1 vs 0) with a two-column "
+            "pre/post-period heatmap; linguistic writes one column."
         ),
     )
     p.add_argument(
@@ -2002,6 +2954,19 @@ def main() -> None:
     for g in args.granularity:
         if g not in gran_list:
             gran_list.append(g)
+    residual_stream = bool(args.residual_stream)
+    if residual_stream:
+        if gran_list not in (["coarse", "fine"], ["coarse"]):
+            logging.warning(
+                "Ignoring --granularity %s; residual-stream mode is layer-level only.",
+                gran_list,
+            )
+        gran_list = [RESIDUAL_STREAM_GRANULARITY]
+        if args.attribute_component_outputs:
+            logging.info(
+                "residual_stream=True: skipping component-output pass "
+                "(--attribute_component_outputs ignored)."
+            )
     args.granularity = gran_list
 
     input_h5 = str(Path(args.input_h5).resolve())
@@ -2076,7 +3041,12 @@ def main() -> None:
         )
         expected_span = args.expected_probability_tokens + 2
         prompt_prefix = CONFIDENCE_PROMPT
-        contrasts = build_numeric_contrasts(digit_ids, high_digits, low_digits)
+        if residual_stream:
+            contrasts = build_numeric_residual_contrasts(
+                digit_ids, high_digits, low_digits
+            )
+        else:
+            contrasts = build_numeric_contrasts(digit_ids, high_digits, low_digits)
         fill_post_period_excl_one = True
         positions = ["pre_period", "post_period"]
         exclude_conf_one_positions = ["post_period"]
@@ -2093,7 +3063,11 @@ def main() -> None:
     }
     logging.info("Span indices: %s", span_index_by_position)
 
-    need_output_fine = bool(args.attribute_component_outputs) and "fine" in gran_list
+    need_output_fine = (
+        (not residual_stream)
+        and bool(args.attribute_component_outputs)
+        and "fine" in gran_list
+    )
     head_write_specs = (
         extract_attn_head_write_specs(model) if need_output_fine else None
     )
@@ -2108,6 +3082,7 @@ def main() -> None:
         exclude_conf_one_positions=exclude_conf_one_positions,
         require_l_or_un_positions=require_l_or_un_positions,
         head_write_specs=head_write_specs,
+        residual_stream=residual_stream,
     )
     save_directions_npz(run_root / "directions.npz", directions)
     logging.info("Wrote %s", run_root / "directions.npz")
@@ -2212,32 +3187,152 @@ def main() -> None:
             len(cohorts.low),
         )
 
-    enable_split_input_hooks(model)
-    capture = SiteInputCapture(
-        n_layers=n_layers,
-        n_heads=n_heads,
-        n_kv_heads=n_kv_heads,
-        d_head=d_head,
-        d_model=d_model,
-        capture_outputs=bool(args.attribute_component_outputs),
-        need_fine="fine" in gran_list,
-    )
-    capture.register(model)
-    logging.info(
-        "Input-site pass: hook_q/k/v_input and hook_mlp_in via run_with_hooks "
-        "on all %d layers (use_split_qkv_input, use_hook_mlp_in).",
-        n_layers,
-    )
-    if capture.capture_outputs:
-        logging.info(
-            "Output-site pass: second independent forward for hook_attn_out "
-            "(GBA-style addend%s) and hook_mlp_out; results under %s/.",
-            " with per-head rebuild" if capture.need_fine else "",
-            COMPONENT_OUTPUT_SUBDIR,
-        )
+    if residual_stream and fill_post_period_excl_one:
+        usable_ids_post = [ex.example_id for ex in cohorts.all_excl_one]
+        if requested_ids is not None:
+            missing = [i for i in requested_ids if i not in set(usable_ids_post)]
+            if missing:
+                raise ValueError(
+                    "--individual_example_indices not in post-period (conf≠1.0) "
+                    "set required for residual-stream two-column heatmaps: "
+                    f"{missing}"
+                )
+            individual_ids_all = requested_ids
+        else:
+            individual_ids_all = usable_ids_post[: args.n_individual_examples]
+        if args.confidence_split:
+            individual_ids_high = [ex.example_id for ex in cohorts.high_excl_one][
+                : args.n_individual_examples
+            ]
+            individual_ids_low = [ex.example_id for ex in cohorts.low_excl_one][
+                : args.n_individual_examples
+            ]
 
     l_vs_un_skipped_ids: set[str] = set()
+    if residual_stream:
+        capture = ResidualStreamCapture(n_layers=n_layers, d_model=d_model)
+        capture.register(model)
+        logging.info(
+            "Residual-stream pass: display 0=%s, k>=1=blocks.{k-1}.hook_resid_post "
+            "(%d display layers).",
+            hook_name_for_display_layer(0),
+            n_layers + 1,
+        )
+    else:
+        enable_split_input_hooks(model)
+        capture = SiteInputCapture(
+            n_layers=n_layers,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            d_head=d_head,
+            d_model=d_model,
+            capture_outputs=bool(args.attribute_component_outputs),
+            need_fine="fine" in gran_list,
+        )
+        capture.register(model)
+        logging.info(
+            "Input-site pass: hook_q/k/v_input and hook_mlp_in via run_with_hooks "
+            "on all %d layers (use_split_qkv_input, use_hook_mlp_in).",
+            n_layers,
+        )
+        if capture.capture_outputs:
+            logging.info(
+                "Output-site pass: second independent forward for hook_attn_out "
+                "(GBA-style addend%s) and hook_mlp_out; results under %s/.",
+                " with per-head rebuild" if capture.need_fine else "",
+                COMPONENT_OUTPUT_SUBDIR,
+            )
+
     output_run_root = run_root / COMPONENT_OUTPUT_SUBDIR
+
+    def _run_and_write_residual(
+        *,
+        cohort_examples: list[GradExample],
+        post_period_examples: list[GradExample] | None,
+        individual_ids: Sequence[str],
+        dirname_suffix: str,
+        cohort_label: str,
+    ) -> dict[tuple[str, str], ExperimentResult]:
+        if not isinstance(capture, ResidualStreamCapture):
+            raise RuntimeError("Residual-stream run requires ResidualStreamCapture.")
+        combined: dict[tuple[str, str], ExperimentResult] = {}
+        examples_by_id: dict[str, GradExample] = {}
+        if linguistic:
+            for contrast in contrasts:
+                filtered = filter_examples_for_contrast(
+                    cohort_examples, contrast, skipped_ids=l_vs_un_skipped_ids
+                )
+                if not filtered:
+                    need = (
+                        "any usable span"
+                        if contrast.span_index is None
+                        else f"span_len > {contrast.span_index}"
+                    )
+                    raise ValueError(
+                        f"No {cohort_label} examples with {need} for contrast "
+                        f"{contrast.name!r}."
+                    )
+                if len(filtered) <= args.n_individual_examples:
+                    raise ValueError(
+                        f"{cohort_label} cohort for contrast {contrast.name!r} has "
+                        f"{len(filtered)} examples after span filtering, which must be "
+                        f"strictly greater than --n_individual_examples "
+                        f"({args.n_individual_examples})."
+                    )
+                part = run_residual_cohort_attributions(
+                    examples=filtered,
+                    model=model,
+                    capture=capture,
+                    contrasts=[contrast],
+                    expected_span=expected_span,
+                    desc=f"{cohort_label}/{contrast.name}",
+                    prompt_prefix=prompt_prefix,
+                    directions=directions,
+                )
+                combined.update(part)
+                for ex in filtered:
+                    examples_by_id[ex.example_id] = ex
+        else:
+            if post_period_examples is None:
+                raise ValueError("Numeric residual runs require post-period examples.")
+            pre_contrasts = [c for c in contrasts if c.position == "pre_period"]
+            post_contrasts = [c for c in contrasts if c.position == "post_period"]
+            pre_results = run_residual_cohort_attributions(
+                examples=cohort_examples,
+                model=model,
+                capture=capture,
+                contrasts=pre_contrasts,
+                expected_span=expected_span,
+                desc=f"{cohort_label}/pre_period",
+                prompt_prefix=prompt_prefix,
+                directions=directions,
+            )
+            post_results = run_residual_cohort_attributions(
+                examples=post_period_examples,
+                model=model,
+                capture=capture,
+                contrasts=post_contrasts,
+                expected_span=expected_span,
+                desc=f"{cohort_label}/post_period",
+                prompt_prefix=prompt_prefix,
+                directions=directions,
+            )
+            combined = {**pre_results, **post_results}
+            examples_by_id = {
+                ex.example_id: ex
+                for ex in list(cohort_examples) + list(post_period_examples)
+            }
+        _write_residual_cohort_dirs(
+            run_root=run_root,
+            results=combined,
+            examples_by_id=examples_by_id,
+            individual_ids=individual_ids,
+            dirname_suffix=dirname_suffix,
+            n_layers=n_layers,
+            bar_chart_top_k=args.bar_chart_top_k,
+            linguistic=linguistic,
+        )
+        return combined
 
     def _run_and_write(
         *,
@@ -2342,55 +3437,93 @@ def main() -> None:
             )
         return combined, combined_out
 
-    all_input, all_output = _run_and_write(
-        cohort_examples=cohorts.all,
-        post_period_examples=(
-            cohorts.all_excl_one if fill_post_period_excl_one else None
-        ),
-        individual_ids=individual_ids_all,
-        dirname_suffix="",
-        cohort_label="all-examples",
-    )
-    del all_input, all_output
+    if residual_stream:
+        _run_and_write_residual(
+            cohort_examples=cohorts.all,
+            post_period_examples=(
+                cohorts.all_excl_one if fill_post_period_excl_one else None
+            ),
+            individual_ids=individual_ids_all,
+            dirname_suffix="",
+            cohort_label="all-examples",
+        )
+        if args.confidence_split:
+            high_resid = _run_and_write_residual(
+                cohort_examples=cohorts.high,
+                post_period_examples=(
+                    cohorts.high_excl_one if fill_post_period_excl_one else None
+                ),
+                individual_ids=individual_ids_high or [],
+                dirname_suffix="__high_conf",
+                cohort_label="high-confidence",
+            )
+            low_resid = _run_and_write_residual(
+                cohort_examples=cohorts.low,
+                post_period_examples=(
+                    cohorts.low_excl_one if fill_post_period_excl_one else None
+                ),
+                individual_ids=individual_ids_low or [],
+                dirname_suffix="__low_conf",
+                cohort_label="low-confidence",
+            )
+            _write_residual_high_minus_low_dirs(
+                run_root=run_root,
+                high_results=high_resid,
+                low_results=low_resid,
+                n_layers=n_layers,
+                bar_chart_top_k=args.bar_chart_top_k,
+                linguistic=linguistic,
+            )
+    else:
+        all_input, all_output = _run_and_write(
+            cohort_examples=cohorts.all,
+            post_period_examples=(
+                cohorts.all_excl_one if fill_post_period_excl_one else None
+            ),
+            individual_ids=individual_ids_all,
+            dirname_suffix="",
+            cohort_label="all-examples",
+        )
+        del all_input, all_output
 
-    if args.confidence_split:
-        high_input, high_output = _run_and_write(
-            cohort_examples=cohorts.high,
-            post_period_examples=(
-                cohorts.high_excl_one if fill_post_period_excl_one else None
-            ),
-            individual_ids=individual_ids_high or [],
-            dirname_suffix="__high_conf",
-            cohort_label="high-confidence",
-        )
-        low_input, low_output = _run_and_write(
-            cohort_examples=cohorts.low,
-            post_period_examples=(
-                cohorts.low_excl_one if fill_post_period_excl_one else None
-            ),
-            individual_ids=individual_ids_low or [],
-            dirname_suffix="__low_conf",
-            cohort_label="low-confidence",
-        )
-        hml_kwargs = dict(
-            n_layers=n_layers,
-            n_heads=n_heads,
-            bar_chart_top_k=args.bar_chart_top_k,
-            linguistic=linguistic,
-        )
-        _write_high_minus_low_dirs(
-            run_root=run_root,
-            high_results=high_input,
-            low_results=low_input,
-            **hml_kwargs,
-        )
-        if high_output:
+        if args.confidence_split:
+            high_input, high_output = _run_and_write(
+                cohort_examples=cohorts.high,
+                post_period_examples=(
+                    cohorts.high_excl_one if fill_post_period_excl_one else None
+                ),
+                individual_ids=individual_ids_high or [],
+                dirname_suffix="__high_conf",
+                cohort_label="high-confidence",
+            )
+            low_input, low_output = _run_and_write(
+                cohort_examples=cohorts.low,
+                post_period_examples=(
+                    cohorts.low_excl_one if fill_post_period_excl_one else None
+                ),
+                individual_ids=individual_ids_low or [],
+                dirname_suffix="__low_conf",
+                cohort_label="low-confidence",
+            )
+            hml_kwargs = dict(
+                n_layers=n_layers,
+                n_heads=n_heads,
+                bar_chart_top_k=args.bar_chart_top_k,
+                linguistic=linguistic,
+            )
             _write_high_minus_low_dirs(
-                run_root=output_run_root,
-                high_results=high_output,
-                low_results=low_output,
+                run_root=run_root,
+                high_results=high_input,
+                low_results=low_input,
                 **hml_kwargs,
             )
+            if high_output:
+                _write_high_minus_low_dirs(
+                    run_root=output_run_root,
+                    high_results=high_output,
+                    low_results=low_output,
+                    **hml_kwargs,
+                )
 
     if linguistic:
         logging.info(

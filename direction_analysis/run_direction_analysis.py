@@ -19,6 +19,8 @@ import pickle
 import sys
 from typing import List, Optional, Sequence, Tuple
 
+from matplotlib.colors import LinearSegmentedColormap
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -35,10 +37,23 @@ from mass_mean_probe.run_mass_mean_probe import (
 from direction_analysis.h5_probability_directions import (
     compute_probability_mass_mean_direction_streaming,
 )
+from plotting.paper_heatmaps import (
+    PAPER_DPI,
+    apply_input_output_token_axes,
+    paper_png_path,
+)
 
 
 MODULE_NAME = "direction_analysis"
 RESULTS_STEM = "mass_mean_directions"
+_LABEL_FS = 16
+_TICK_FS = 13
+_CELL_FS = 10
+_ANNOTATED_DPI = 180
+WHITE_TO_BLUE = LinearSegmentedColormap.from_list(
+    "direction_white_blue",
+    [(1.0, 1.0, 1.0), (0.1, 0.3, 1.0)],
+)
 
 
 def _resolve_run_root(cli_output_dir: Optional[str]) -> str:
@@ -103,22 +118,70 @@ def _minmax_alpha(values: np.ndarray) -> np.ndarray:
     return np.nan_to_num(alpha.astype(np.float32), nan=0.0)
 
 
+def _row_minmax_alpha(values: np.ndarray) -> np.ndarray:
+    """Per-row min-max: max in the row is 1, min is 0."""
+    out = np.zeros_like(values, dtype=np.float32)
+    for r in range(values.shape[0]):
+        out[r] = _minmax_alpha(values[r])
+    return out
+
+
+def _alpha_grid(values: np.ndarray, alpha_mode: str) -> np.ndarray:
+    if alpha_mode == "row":
+        return _row_minmax_alpha(values)
+    if alpha_mode == "global":
+        return _minmax_alpha(values)
+    raise ValueError(f"Unknown alpha_mode: {alpha_mode}")
+
+
+def _finite_range(values: np.ndarray) -> Tuple[float, float]:
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return 0.0, 0.0
+    return float(np.min(finite)), float(np.max(finite))
+
+
+def _style_direction_heatmap_axes(
+    ax,
+    *,
+    n_rows: int,
+    n_cols: int,
+    run_layers: Sequence[int],
+    token_labels: Sequence[str],
+    tick_rotation: float = 30,
+) -> None:
+    ax.set_yticks(np.arange(n_rows))
+    ax.set_yticklabels([str(layer) for layer in run_layers], fontsize=_TICK_FS)
+    ax.set_ylabel("Layer", fontsize=_LABEL_FS)
+    apply_input_output_token_axes(
+        ax,
+        n_cols=n_cols,
+        token_labels=token_labels,
+        rotation=tick_rotation,
+        fontsize=_TICK_FS,
+        label_fontsize=_LABEL_FS,
+    )
+    ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, n_rows, 1), minor=True)
+    ax.grid(which="minor", color="gray", linestyle="-", linewidth=0.35, alpha=0.4)
+    ax.tick_params(which="minor", bottom=False, left=False)
+    ax.set_xlim(-0.5, n_cols - 0.5)
+    ax.set_ylim(n_rows - 0.5, -0.5)
+
+
 def write_rgba_heatmap(
     *,
     path: str,
     run_layers: Sequence[int],
     token_labels: Sequence[str],
     matrix_values: np.ndarray,
-    title: str,
-    xlabel: str,
+    alpha_mode: str = "global",
     value_fmt: str = "{:.3f}",
 ) -> Tuple[float, float]:
-    """Blue RGBA heatmap with min-max alpha. Returns (vmin, vmax) of finite values."""
+    """Blue RGBA heatmap. Returns (vmin, vmax) of finite raw values."""
     n_rows, n_cols = matrix_values.shape
-    finite = matrix_values[np.isfinite(matrix_values)]
-    vmin = float(np.min(finite)) if finite.size else 0.0
-    vmax = float(np.max(finite)) if finite.size else 0.0
-    alpha_grid = _minmax_alpha(matrix_values)
+    vmin, vmax = _finite_range(matrix_values)
+    alpha_grid = _alpha_grid(matrix_values, alpha_mode)
 
     rgba = np.zeros((n_rows, n_cols, 4), dtype=np.float32)
     rgba[:, :, 0] = 0.1
@@ -128,35 +191,81 @@ def write_rgba_heatmap(
 
     fig, ax = plt.subplots(figsize=(max(9.0, 1.4 * n_cols), max(6.0, 0.35 * n_rows)))
     ax.imshow(rgba, aspect="auto", interpolation="nearest")
-
     for r in range(n_rows):
         for c in range(n_cols):
             val = matrix_values[r, c]
             text = "NA" if not np.isfinite(val) else value_fmt.format(float(val))
-            ax.text(c, r, text, ha="center", va="center", fontsize=8, color="black")
-
-    ax.set_yticks(np.arange(n_rows))
-    ax.set_yticklabels([str(layer) for layer in run_layers])
-    ax.set_xticks(np.arange(n_cols))
-    ax.set_xticklabels(
-        [f"{i}:{_render_token_label(tok)}" for i, tok in enumerate(token_labels)],
-        rotation=30,
-        ha="left",
+            ax.text(c, r, text, ha="center", va="center", fontsize=_CELL_FS, color="black")
+    _style_direction_heatmap_axes(
+        ax,
+        n_rows=n_rows,
+        n_cols=n_cols,
+        run_layers=run_layers,
+        token_labels=token_labels,
+        tick_rotation=30,
     )
-    ax.xaxis.tick_top()
-    ax.xaxis.set_label_position("top")
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel("Layer")
-    ax.set_title(title)
-
-    ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
-    ax.set_yticks(np.arange(-0.5, n_rows, 1), minor=True)
-    ax.grid(which="minor", color="gray", linestyle="-", linewidth=0.35, alpha=0.4)
-    ax.tick_params(which="minor", bottom=False, left=False)
     fig.tight_layout()
-    fig.savefig(path, dpi=180, bbox_inches="tight")
+    fig.savefig(path, dpi=_ANNOTATED_DPI, bbox_inches="tight")
     plt.close(fig)
     return vmin, vmax
+
+
+def write_rgba_heatmap_paper(
+    *,
+    path: str,
+    run_layers: Sequence[int],
+    token_labels: Sequence[str],
+    matrix_values: np.ndarray,
+    alpha_mode: str = "global",
+    cbar_label: str,
+) -> Path:
+    """Paper heatmap: no cell text, white-to-blue scale, colorbar."""
+    out = Path(path)
+    n_rows, n_cols = matrix_values.shape
+    if alpha_mode == "row":
+        display = _row_minmax_alpha(matrix_values)
+        vmin, vmax = 0.0, 1.0
+    else:
+        display = np.ma.masked_invalid(np.asarray(matrix_values, dtype=np.float64))
+        vmin, vmax = _finite_range(matrix_values)
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+
+    fig_w = max(5.8, 0.62 * n_cols + 3.0)
+    fig_h = max(4.6, 0.16 * n_rows + 2.2)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    im = ax.imshow(
+        display,
+        aspect="auto",
+        interpolation="nearest",
+        cmap=WHITE_TO_BLUE,
+        vmin=vmin,
+        vmax=vmax,
+    )
+    _style_direction_heatmap_axes(
+        ax,
+        n_rows=n_rows,
+        n_cols=n_cols,
+        run_layers=run_layers,
+        token_labels=token_labels,
+        tick_rotation=45,
+    )
+    fig.tight_layout()
+    cax = inset_axes(
+        ax,
+        width="100%",
+        height="100%",
+        loc="lower left",
+        bbox_to_anchor=(1.06, 0.0, 0.045, 1.0),
+        bbox_transform=ax.transAxes,
+        borderpad=0,
+    )
+    cbar = fig.colorbar(im, cax=cax)
+    cbar.set_label(cbar_label, fontsize=_LABEL_FS)
+    cbar.ax.tick_params(labelsize=_TICK_FS)
+    fig.savefig(out, dpi=PAPER_DPI, bbox_inches="tight", pad_inches=0.16)
+    plt.close(fig)
+    return out
 
 
 def _cosine_similarity_rows(direction: np.ndarray) -> np.ndarray:
@@ -283,7 +392,9 @@ def main() -> None:
         default=False,
         help=(
             "If true (and not using linguistic confidence), treat probability span length as "
-            "expected_probability_tokens + 2."
+            "expected_probability_tokens + 2. If true together with "
+            "--linguistic_confidence_prompt, accept embeddings_probability lengths "
+            ">= expected_confidence_tokens and use only the first N of those tokens."
         ),
     )
     parser.add_argument(
@@ -320,6 +431,14 @@ def main() -> None:
         extend_probability_span=args.extend_probability_span,
     )
     direction_prob_token_budget = span_token_count
+    allow_at_least_expected = (
+        bool(args.linguistic_confidence_prompt) and bool(args.extend_probability_span)
+    )
+    logging.info(
+        "Span budget=%d allow_at_least_expected=%s",
+        direction_prob_token_budget,
+        allow_at_least_expected,
+    )
 
     logging.info("Computing probability mass-mean directions (streaming H5)...")
     direction_probability, low_ids, high_ids, n_layers, h5_example_count = (
@@ -329,6 +448,7 @@ def main() -> None:
             low_conf_threshold=args.low_conf_threshold,
             high_conf_threshold=args.high_conf_threshold,
             new_h5_format=args.new_h5_format,
+            allow_at_least_expected=allow_at_least_expected,
         )
     )
     run_layers = list(range(n_layers))
@@ -356,12 +476,6 @@ def main() -> None:
         span_token_count=n_tokens,
         linguistic_confidence_prompt=args.linguistic_confidence_prompt,
     )
-    xlabel = (
-        "Confidence token position"
-        if args.linguistic_confidence_prompt
-        else "Probability token position"
-    )
-
     logging.info("Writing direction pickles under %s/{{layer}}/{{token}}.pkl", run_root)
     write_direction_pickles(run_root, direction_probability)
 
@@ -372,11 +486,18 @@ def main() -> None:
         run_layers=run_layers,
         token_labels=token_labels,
         matrix_values=magnitudes,
-        title="Layer x token mass-mean direction magnitude (blue alpha = min-max)",
-        xlabel=xlabel,
+        alpha_mode="row",
         value_fmt="{:.3f}",
     )
-    logging.info("Wrote %s (range [%.6f, %.6f])", mag_path, mag_vmin, mag_vmax)
+    mag_paper = write_rgba_heatmap_paper(
+        path=str(paper_png_path(mag_path)),
+        run_layers=run_layers,
+        token_labels=token_labels,
+        matrix_values=magnitudes,
+        alpha_mode="row",
+        cbar_label="Relative magnitude within layer",
+    )
+    logging.info("Wrote %s and %s (range [%.6f, %.6f])", mag_path, mag_paper, mag_vmin, mag_vmax)
 
     cosine_matrix = _cosine_similarity_rows(direction_probability)
     cosine_layers = list(range(1, n_layers))
@@ -386,11 +507,18 @@ def main() -> None:
         run_layers=cosine_layers,
         token_labels=token_labels,
         matrix_values=cosine_matrix,
-        title="Cosine similarity vs previous layer (blue alpha = min-max; row 0 excluded)",
-        xlabel=xlabel,
+        alpha_mode="global",
         value_fmt="{:.3f}",
     )
-    logging.info("Wrote %s (range [%.6f, %.6f])", cos_path, cos_vmin, cos_vmax)
+    cos_paper = write_rgba_heatmap_paper(
+        path=str(paper_png_path(cos_path)),
+        run_layers=cosine_layers,
+        token_labels=token_labels,
+        matrix_values=cosine_matrix,
+        alpha_mode="global",
+        cbar_label="Cosine similarity vs previous layer",
+    )
+    logging.info("Wrote %s and %s (range [%.6f, %.6f])", cos_path, cos_paper, cos_vmin, cos_vmax)
 
     finished_at = datetime.now().isoformat(timespec="seconds")
     write_config_txt(

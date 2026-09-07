@@ -9,6 +9,8 @@ Inputs:
 
 Outputs:
   - attention_table_probability_pos_<0..N-1>.png
+  - attention_table_probability_pos_<0..N-1>_paper.png
+  - optional __layer_avg annotated + paper siblings
   - attention_tables.npz
   - summary.json
   - config.txt
@@ -22,13 +24,18 @@ from datetime import datetime
 import json
 import math
 from pathlib import Path
+import sys
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 import h5py
-import matplotlib.pyplot as plt
 import numpy as np
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from plotting.attention_span_plots import write_attention_span_plot_pair
 
 # Gemma-3 token alternatives (fixed length; each inner list = allowed tokens at that position)
 GUESS_PREFIX_TOKENS = [
@@ -503,7 +510,7 @@ def _row_labels(num_layers: int, num_heads: int) -> List[str]:
 
 
 def _layer_labels(num_layers: int) -> List[str]:
-    return [f"layer_{layer}" for layer in range(num_layers)]
+    return [str(layer) for layer in range(num_layers)]
 
 
 def _average_heads_by_layer(matrix: np.ndarray, num_heads: int) -> np.ndarray:
@@ -519,57 +526,6 @@ def _average_heads_by_layer(matrix: np.ndarray, num_heads: int) -> np.ndarray:
     num_layers = total_rows // num_heads
     reshaped = matrix.reshape(num_layers, num_heads, n_cols)
     return np.mean(reshaped, axis=1)
-
-
-def _render_table_png(
-    matrix: np.ndarray,
-    row_labels: Sequence[str],
-    col_labels: Sequence[str],
-    output_path: Path,
-    title: str,
-) -> None:
-    n_rows, n_cols = matrix.shape
-    fig_width = max(12.0, 3.2 + 1.2 * n_cols)
-    fig_height = max(10.0, 2.5 + 0.17 * n_rows)
-
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-    ax.axis("off")
-    ax.set_title(title, fontsize=12, pad=8)
-
-    formatted = [[f"{v:.6f}" for v in row] for row in matrix]
-    table = ax.table(
-        cellText=formatted,
-        rowLabels=list(row_labels),
-        colLabels=list(col_labels),
-        cellLoc="center",
-        loc="center",
-    )
-
-    # Per-row normalization: within each layer.head row, map the minimum
-    # attention to alpha=0 and the maximum to alpha=1 for a blue shade.
-    blue_rgb = (0.0, 0.0, 1.0)
-    eps = 1e-12
-    for r in range(n_rows):
-        row_vals = matrix[r]
-        row_min = float(np.min(row_vals))
-        row_max = float(np.max(row_vals))
-        denom = row_max - row_min
-        for c in range(n_cols):
-            if denom <= eps:
-                alpha = 0.0
-            else:
-                alpha = float((row_vals[c] - row_min) / denom)
-            table[(r + 1, c)].set_facecolor((*blue_rgb, alpha))
-            # Improve readability for highly opaque cells.
-            table[(r + 1, c)].get_text().set_color("white" if alpha >= 0.6 else "black")
-
-    table.auto_set_font_size(False)
-    table.set_fontsize(6)
-    table.scale(1.0, 1.08)
-
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
 
 
 def _write_config(
@@ -680,12 +636,11 @@ def _write_group_outputs(
             args.include_self_probability_attention,
         )
         png_path = output_dir / f"attention_table_probability_pos_{p}.png"
-        _render_table_png(
+        write_attention_span_plot_pair(
+            png_path,
             matrix=mean_table,
             row_labels=row_labels,
             col_labels=columns,
-            output_path=png_path,
-            title=f"Probability Position {p}: Normalized Attention Table",
         )
         summary_payload["tables"][f"probability_pos_{p}"] = {
             "columns": columns,
@@ -696,12 +651,11 @@ def _write_group_outputs(
         if args.include_layer_averaged_tables:
             layer_avg_table = _average_heads_by_layer(mean_table, num_q_heads_used)
             layer_avg_png_path = output_dir / f"attention_table_probability_pos_{p}__layer_avg.png"
-            _render_table_png(
+            write_attention_span_plot_pair(
+                layer_avg_png_path,
                 matrix=layer_avg_table,
                 row_labels=_layer_labels(layer_avg_table.shape[0]),
                 col_labels=columns,
-                output_path=layer_avg_png_path,
-                title=f"Probability Position {p}: Layer-Averaged Attention Table",
             )
             summary_payload["tables"][f"probability_pos_{p}"]["layer_avg_shape"] = list(
                 layer_avg_table.shape

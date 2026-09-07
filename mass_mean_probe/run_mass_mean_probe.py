@@ -36,7 +36,6 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 import h5py
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from datasets import Dataset
@@ -69,6 +68,9 @@ from layerwise_mean_ablation.run_mean_ablation import (  # noqa: E402
     probability_row_indices_for_mode,
     truncate_sorted_ids,
     validate_last_a_panl_and_pc_mode,
+)
+from plotting.mass_mean_probe_plots import (  # noqa: E402
+    plot_mode_confidence_from_summary as _plot_mode_confidence_from_summary,
 )
 
 CONFIDENCE_PROMPT_NUMERIC = (
@@ -623,82 +625,14 @@ def write_summary_json(path: str, summary_payload: Dict[str, object]) -> None:
         json.dump(summary_payload, f, ensure_ascii=False, indent=2)
 
 
-def _plot_mode_confidence_from_summary(
-    *,
-    mode_name: str,
-    mode_payload: Dict[str, Dict[str, Dict[str, object]]],
-    baseline_payload: Dict[str, Dict[str, object]],
-    ablation_targets: Sequence[str],
-    output_path: str,
-) -> None:
-    target_colors = {"high": "tab:blue", "low": "tab:orange"}
-    fig, ax = plt.subplots(figsize=(10, 5.5))
-
-    for target in ("high", "low"):
-        if target not in ablation_targets:
-            continue
-        alpha_map = mode_payload.get(target, {})
-        if not isinstance(alpha_map, dict):
-            continue
-        points: List[Tuple[float, float, int]] = []
-        for metrics in alpha_map.values():
-            if not isinstance(metrics, dict):
-                continue
-            mean_conf = metrics.get("mean_confidence")
-            alpha_val = metrics.get("alpha_value")
-            sample_count = metrics.get("sample_count", 0)
-            if mean_conf is None or alpha_val is None:
-                continue
-            points.append((float(alpha_val), float(mean_conf), int(sample_count)))
-        points.sort(key=lambda tup: tup[0])
-        if points:
-            xs = [p[0] for p in points]
-            ys = [p[1] for p in points]
-            ax.plot(xs, ys, marker="o", linewidth=1.8, color=target_colors[target], label=f"target={target}")
-            for x_val, y_val, sample_count in points:
-                ax.annotate(
-                    str(sample_count),
-                    (x_val, y_val),
-                    textcoords="offset points",
-                    xytext=(4, 4),
-                    fontsize=8,
-                    color=target_colors[target],
-                )
-
-    for baseline_target in ("high", "low"):
-        baseline_metrics = baseline_payload.get(baseline_target, {})
-        baseline_mean = baseline_metrics.get("mean_confidence") if isinstance(baseline_metrics, dict) else None
-        if baseline_mean is None:
-            continue
-        ax.axhline(
-            y=float(baseline_mean),
-            color=target_colors[baseline_target],
-            linestyle=":",
-            linewidth=1.0,
-            label=f"baseline_{baseline_target}",
-        )
-
-    ax.set_xlabel("Alpha")
-    ax.set_ylabel("Verbalised confidence")
-    ax.set_ylim(0.0, 1.0)
-    ax.set_title(f"Verbalised confidence vs alpha ({mode_name})")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    logging.info("Wrote %s", output_path)
-
-
 def write_summary_plots_from_json(
     *,
     summary_payload: Dict[str, object],
     ablation_targets: Sequence[str],
     output_dir: str,
+    low_conf_threshold: float,
+    high_conf_threshold: float,
 ) -> None:
-    baseline_payload = summary_payload.get("no_replacement_baseline", {})
-    if not isinstance(baseline_payload, dict):
-        raise ValueError("summary payload baseline must be a dict")
     for mode_name, mode_payload in summary_payload.items():
         if mode_name == "no_replacement_baseline":
             continue
@@ -708,13 +642,21 @@ def write_summary_plots_from_json(
         _plot_mode_confidence_from_summary(
             mode_name=mode_name,
             mode_payload=mode_payload,
-            baseline_payload=baseline_payload,
             ablation_targets=ablation_targets,
             output_path=plot_path,
+            low_conf_threshold=low_conf_threshold,
+            high_conf_threshold=high_conf_threshold,
         )
 
 
-def write_summary_plots_from_file(*, summary_json_file: str, ablation_targets: Sequence[str], output_dir: str) -> None:
+def write_summary_plots_from_file(
+    *,
+    summary_json_file: str,
+    ablation_targets: Sequence[str],
+    output_dir: str,
+    low_conf_threshold: float,
+    high_conf_threshold: float,
+) -> None:
     with open(summary_json_file, "r", encoding="utf-8") as f:
         summary_payload = json.load(f)
     if not isinstance(summary_payload, dict):
@@ -723,6 +665,8 @@ def write_summary_plots_from_file(*, summary_json_file: str, ablation_targets: S
         summary_payload=summary_payload,
         ablation_targets=ablation_targets,
         output_dir=output_dir,
+        low_conf_threshold=low_conf_threshold,
+        high_conf_threshold=high_conf_threshold,
     )
 
 
@@ -2647,6 +2591,8 @@ def main() -> None:
         summary_json_file=summary_out_path,
         ablation_targets=args.ablation_targets,
         output_dir=os.path.dirname(out_path),
+        low_conf_threshold=args.low_conf_threshold,
+        high_conf_threshold=args.high_conf_threshold,
     )
     write_layer_direction_pickles(
         output_json_path=out_path,

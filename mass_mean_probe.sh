@@ -25,7 +25,7 @@ python3 ./mass_mean_probe/run_mass_mean_probe.py \
   --input_h5 ./process_generations/processed_generations_more_h5/new_gemma/4_trivia_gemma_extended_with_concat_3000_train/balanced/train_verbalised_embeddings.h5 \
   --num_samples 50 \
   --device cuda:0 \
-  --ablate_layers 0-47 \
+  --ablate_layers 13-26 \
   --dtype bfloat16 \
   --alpha 0.0 0.25 0.5 1.0 2.0 \
   --ablation_targets low high \
