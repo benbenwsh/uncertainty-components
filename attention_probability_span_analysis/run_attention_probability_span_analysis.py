@@ -38,17 +38,75 @@ if str(REPO_ROOT) not in sys.path:
 from plotting.attention_span_plots import write_attention_span_plot_pair
 
 # Gemma-3 token alternatives (fixed length; each inner list = allowed tokens at that position)
-GUESS_PREFIX_TOKENS = [
+GEMMA_GUESS_PREFIX_TOKENS = [
     ["\n", "\n\n"],
     ["Guess"],
     [":"],
 ]
-PROBABILITY_PREFIX_TOKENS = [
+GEMMA_PROBABILITY_PREFIX_TOKENS = [
     ["\n"],
     ["Probability", " Probability"],
     [":"],
     [" "],
 ]
+
+# Qwen2.5 token alternatives (from ans_gen/generated_answers/3_32B_200 decoded tokens)
+QWEN_GUESS_PREFIX_TOKENS = [
+    [" Guess", "Guess"],
+    [":"],
+]
+QWEN_PROBABILITY_PREFIX_TOKENS = [
+    ["\n"],
+    [" Probability"],
+    [":"],
+    [" "],
+]
+
+# Mistral-7B-Instruct-v0.1 (from ans_gen/generated_answers/1_svamp_mistral)
+MISTRAL_GUESS_PREFIX_TOKENS = [
+    ["\n"],
+    ["\n"],
+    ["Gu"],
+    ["ess"],
+    [":"],
+]
+MISTRAL_PROBABILITY_PREFIX_TOKENS = [
+    ["\n"],
+    ["Pro"],
+    ["b"],
+    ["ability"],
+    [":"],
+    [""],  # space before number decodes as empty string
+]
+
+SUPPORTED_MODEL_NAMES = (
+    "mistralai/Mistral-7B-Instruct-v0.1",
+    "google/gemma-3-12b-it",
+    "Qwen/Qwen2.5-32B-Instruct",
+)
+
+# Active tables; set via configure_prefix_tokens_for_model(model_name).
+GUESS_PREFIX_TOKENS: list[list[str]] = GEMMA_GUESS_PREFIX_TOKENS
+PROBABILITY_PREFIX_TOKENS: list[list[str]] = GEMMA_PROBABILITY_PREFIX_TOKENS
+
+
+def configure_prefix_tokens_for_model(model_name: str) -> None:
+    """Set GUESS/PROBABILITY_PREFIX_TOKENS from exact model_name (case-sensitive)."""
+    global GUESS_PREFIX_TOKENS, PROBABILITY_PREFIX_TOKENS
+    if model_name == "google/gemma-3-12b-it":
+        GUESS_PREFIX_TOKENS = GEMMA_GUESS_PREFIX_TOKENS
+        PROBABILITY_PREFIX_TOKENS = GEMMA_PROBABILITY_PREFIX_TOKENS
+    elif model_name == "Qwen/Qwen2.5-32B-Instruct":
+        GUESS_PREFIX_TOKENS = QWEN_GUESS_PREFIX_TOKENS
+        PROBABILITY_PREFIX_TOKENS = QWEN_PROBABILITY_PREFIX_TOKENS
+    elif model_name == "mistralai/Mistral-7B-Instruct-v0.1":
+        GUESS_PREFIX_TOKENS = MISTRAL_GUESS_PREFIX_TOKENS
+        PROBABILITY_PREFIX_TOKENS = MISTRAL_PROBABILITY_PREFIX_TOKENS
+    else:
+        raise ValueError(
+            f"Unsupported model_name for Guess/Probability token parsing: {model_name!r}. "
+            f"Supported: {list(SUPPORTED_MODEL_NAMES)}."
+        )
 
 
 @dataclass(frozen=True)
@@ -129,6 +187,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--embeddings_h5", type=str, required=True, help="Processed embeddings H5 path.")
     parser.add_argument(
+        "--model_name",
+        type=str,
+        default="google/gemma-3-12b-it",
+        choices=list(SUPPORTED_MODEL_NAMES),
+        help="Model used to select Guess/Probability prefix token tables.",
+    )
+    parser.add_argument(
         "--expected_probability_tokens",
         type=int,
         default=9,
@@ -154,7 +219,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--include_self_probability_attention",
-        default=False,
+        default=True,
         action=argparse.BooleanOptionalAction,
         help=(
             "Include attention from probability token position p to its own key (prob_p) "
@@ -163,7 +228,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--include_layer_averaged_tables",
-        default=False,
+        default=True,
         action=argparse.BooleanOptionalAction,
         help=(
             "Generate additional per-probability tables with rows aggregated by layer "
@@ -532,6 +597,7 @@ def _write_config(
     *,
     output_dir: Path,
     embeddings_h5: Path,
+    model_name: str,
     expected_probability_tokens: int,
     expected_guess_tokens: int,
     include_self_probability_attention: bool,
@@ -553,6 +619,7 @@ def _write_config(
         "",
         "[Inputs]",
         f"embeddings_h5={embeddings_h5}",
+        f"model_name={model_name}",
         "",
         "[Run]",
         f"expected_probability_tokens={expected_probability_tokens}",
@@ -606,6 +673,7 @@ def _write_group_outputs(
 
     mean_tables: Dict[int, np.ndarray] = {}
     summary_payload = {
+        "model_name": args.model_name,
         "expected_probability_tokens": args.expected_probability_tokens,
         "expected_guess_tokens": args.expected_guess_tokens,
         "include_self_probability_attention": args.include_self_probability_attention,
@@ -641,6 +709,8 @@ def _write_group_outputs(
             matrix=mean_table,
             row_labels=row_labels,
             col_labels=columns,
+            model_name=args.model_name,
+            path_hint=str(output_dir),
         )
         summary_payload["tables"][f"probability_pos_{p}"] = {
             "columns": columns,
@@ -656,6 +726,8 @@ def _write_group_outputs(
                 matrix=layer_avg_table,
                 row_labels=_layer_labels(layer_avg_table.shape[0]),
                 col_labels=columns,
+                model_name=args.model_name,
+                path_hint=str(output_dir),
             )
             summary_payload["tables"][f"probability_pos_{p}"]["layer_avg_shape"] = list(
                 layer_avg_table.shape
@@ -676,6 +748,7 @@ def _write_group_outputs(
     _write_config(
         output_dir=output_dir,
         embeddings_h5=embeddings_h5,
+        model_name=args.model_name,
         expected_probability_tokens=args.expected_probability_tokens,
         expected_guess_tokens=args.expected_guess_tokens,
         include_self_probability_attention=args.include_self_probability_attention,
@@ -693,6 +766,7 @@ def _write_group_outputs(
 
 def main() -> None:
     args = parse_args()
+    configure_prefix_tokens_for_model(args.model_name)
     embeddings_h5 = Path(args.embeddings_h5)
     output_dir = resolve_output_dir(args.output_dir)
 

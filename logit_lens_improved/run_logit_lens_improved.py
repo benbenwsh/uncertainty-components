@@ -16,6 +16,7 @@ from collections.abc import Iterable, Sequence
 from datetime import datetime
 import json
 from pathlib import Path
+import sys
 import time
 
 import h5py
@@ -28,6 +29,16 @@ from transformers import AutoConfig, AutoTokenizer
 from tqdm import tqdm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from direction_analysis.h5_probability_directions import read_decoded_tokens
+from process_generations.process_generations_more_embs_from_h5 import (
+    L_VS_UN_SPAN_INDEX,
+    configure_prefix_tokens_for_model,
+    linguistic_span_token_is_l_or_un,
+)
 
 EMBEDDING_CHOICES = (
     "mean_prompt",
@@ -154,6 +165,16 @@ def _read_verbalised_confidence_scalar(r0: h5py.Group) -> float | None:
 
 def _h5_list_length(group_obj: h5py.Group) -> int:
     return int(group_obj.attrs.get("__len__", len(group_obj.keys())))
+
+
+def _probability_span_len(r0: h5py.Group, component: str, *, subblock_mode: bool) -> int | None:
+    field = r0.get("embeddings_probability")
+    if field is None or not isinstance(field, h5py.Group):
+        return None
+    comp_group = _get_component_group(field, component, subblock_mode=subblock_mode)
+    if comp_group is None or not isinstance(comp_group, h5py.Group):
+        return None
+    return _h5_list_length(comp_group)
 
 
 def _path_to_weight_key(path: tuple[str, ...]) -> str:
@@ -775,6 +796,8 @@ def _write_config_txt(
         f"expected_probability_tokens: {args.expected_probability_tokens}",
         f"extend_probability_span: {args.extend_probability_span}",
         f"probability_token_budget: {args.expected_probability_tokens + (2 if args.extend_probability_span else 0)}",
+        f"linguistic_confidence_prompt: {args.linguistic_confidence_prompt}",
+        f"l_vs_un: {args.l_vs_un}",
         f"split_confidence_groups: {args.split_confidence_groups}",
         f"low_conf_threshold: {args.low_conf_threshold}",
         f"high_conf_threshold: {args.high_conf_threshold}",
@@ -861,6 +884,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--linguistic_confidence_prompt",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If true, treat the H5 as a linguistic Confidence: run. "
+            "Does not change the probability-token budget; use with "
+            "--l_vs_un to apply the DLA L/Un example filter."
+        ),
+    )
+    parser.add_argument(
+        "--l_vs_un",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If true together with --linguistic_confidence_prompt, keep only examples "
+            "whose Confidence: span token at index 6 decodes as L or Un (same as DLA). "
+            "Ignored when --linguistic_confidence_prompt is off."
+        ),
+    )
+    parser.add_argument(
         "--split_confidence_groups",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -903,6 +946,14 @@ def main():
     probability_token_budget = args.expected_probability_tokens + (
         2 if args.extend_probability_span else 0
     )
+    apply_l_vs_un = bool(args.linguistic_confidence_prompt) and bool(args.l_vs_un)
+    if args.l_vs_un and not args.linguistic_confidence_prompt:
+        print(
+            "Warning: ignoring --l_vs_un because --linguistic_confidence_prompt is off.",
+            file=sys.stderr,
+        )
+    if apply_l_vs_un:
+        configure_prefix_tokens_for_model(args.model_name_or_path)
     token_labels = _canonical_token_labels(
         include_set,
         expected_guess_tokens=args.expected_guess_tokens,
@@ -950,6 +1001,7 @@ def main():
     count_high = 0
     count_low = 0
     valid_examples = 0
+    skipped_l_vs_un = 0
     n_layers: int | None = None
     hidden_dim: int | None = None
 
@@ -1000,6 +1052,20 @@ def main():
                             f"expected {(n_layers, hidden_dim)}, got {arr.shape}."
                         )
 
+            if apply_l_vs_un:
+                span_len = _probability_span_len(
+                    r0, components[0], subblock_mode=args.subblock_mode
+                )
+                decoded = read_decoded_tokens(r0)
+                if (
+                    span_len is None
+                    or span_len <= L_VS_UN_SPAN_INDEX
+                    or not decoded
+                    or not linguistic_span_token_is_l_or_un(decoded)
+                ):
+                    skipped_l_vs_un += 1
+                    continue
+
             valid_examples += 1
             count_overall += 1
             if confidence >= args.high_conf_threshold:
@@ -1045,6 +1111,11 @@ def main():
 
     if valid_examples == 0:
         raise ValueError("No valid examples found in the provided input_h5.")
+    if apply_l_vs_un:
+        print(
+            f"L_vs_Un skipped {skipped_l_vs_un} examples whose span-index-"
+            f"{L_VS_UN_SPAN_INDEX} token was not L or Un."
+        )
     if args.split_confidence_groups:
         if len(per_example_high) < args.n_examples:
             raise ValueError(

@@ -785,6 +785,7 @@ def write_layer_token_grid_plot(
     matrix_deviation_desired: np.ndarray,
     mean_from_low_confidence: bool,
     linguistic_confidence_prompt: bool = False,
+    model_name: Optional[str] = None,
 ) -> None:
     write_layer_token_grid_plot_annotated(
         path=path,
@@ -792,6 +793,8 @@ def write_layer_token_grid_plot(
         token_labels=token_labels,
         matrix_values=matrix_values,
         matrix_deviation_signed=matrix_deviation_desired,
+        model_name=model_name,
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
     )
     write_layer_token_grid_plot_paper(
         path=paper_png_path(path),
@@ -801,6 +804,7 @@ def write_layer_token_grid_plot(
         matrix_deviation_desired=matrix_deviation_desired,
         mean_from_low_confidence=mean_from_low_confidence,
         linguistic_confidence_prompt=linguistic_confidence_prompt,
+        model_name=model_name,
     )
 
 
@@ -1369,6 +1373,7 @@ def main() -> None:
         matrix_deviation_desired=matrix_dev_desired,
         mean_from_low_confidence=args.mean_from_low_confidence,
         linguistic_confidence_prompt=args.linguistic_confidence_prompt,
+        model_name=args.model_name,
     )
     logging.info("Wrote %s", _grid_plot_path(run_root))
     logging.info("Wrote %s", _grid_plot_paper_path(run_root))

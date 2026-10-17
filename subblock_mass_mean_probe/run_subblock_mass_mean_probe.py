@@ -37,6 +37,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from semantic_similarity_metrics import (
+    add_semantic_similarity_method_arg,
+    open_semantic_similarity_scorer,
+    release_cuda_cache,
+    semantic_similarity_config_lines,
+)
 from blockwise_zero_ablation.run_blockwise_zero_ablation import SUBBLOCK_TO_HOOK
 from mass_mean_probe.run_mass_mean_probe import (
     BRIEF_PROMPTS,
@@ -45,6 +51,7 @@ from mass_mean_probe.run_mass_mean_probe import (
     GENERATED_TOKENS_SOURCE_CHOICES,
     SEMANTIC_SIMILARITY_MODES,
     WHOLE_SEQUENCE_MODES,
+    add_direction_input_h5_args,
     _absolute_all_pre_guess_positions,
     _absolute_guess_span_positions,
     _absolute_pre_probability_positions,
@@ -59,14 +66,20 @@ from mass_mean_probe.run_mass_mean_probe import (
     _should_stop_generation,
     _positions_for_whole_sequence_mode,
     _postprocess_response_from_full_decode,
-    batch_compute_semantic_similarities,
+    apply_subblock_zero_fill,
+    attach_unparsed_zero_aggregate_metrics,
     compute_uncertainty_score,
     compute_verbalised_confidence_effect,
+    probe_summary_unparsed_zero_row_lines,
+    subblock_zero_fill_config_row_lines,
+    unparsed_zero_config_section_lines,
+    zero_fill_config_section_lines,
     construct_fewshot_prompt_from_indices,
+    collect_low_high_ids_from_examples,
+    direction_h5_config_lines,
     encode_example_id,
     load_examples_h5,
     load_hooked_transformer,
-    load_sentence_transformer_for_metrics,
     load_eval_dataset,
     mode_to_output_key,
     parse_ablate_layers,
@@ -77,6 +90,7 @@ from mass_mean_probe.run_mass_mean_probe import (
     split_answerable_indices,
     SUPPORTED_MODEL_NAMES,
     truncate_sorted_ids,
+    validate_direction_input_h5_args,
     validate_last_a_panl_and_pc_mode,
 )
 
@@ -356,7 +370,11 @@ def _direction_mode_activation_applier_builder(
             return _apply_probability_tokens_mean_replace
 
         if mode in PROBABILITY_ROW_INDEX_MODES:
-            row_indices = probability_row_indices_for_mode(mode, model_name)
+            row_indices = probability_row_indices_for_mode(
+                mode,
+                model_name,
+                linguistic_confidence_prompt=linguistic_confidence_prompt,
+            )
 
             def _apply_probability_row_indices_mean_replace(
                 activation: torch.Tensor,
@@ -705,6 +723,9 @@ def _build_summary_json(
         Dict[str, Dict[str, Dict[str, Dict[float, List[float]]]]]
     ] = None,
     mode_uncertainty_score_values: Optional[Dict[str, Dict[str, Dict[str, Dict[float, List[float]]]]]] = None,
+    mode_semantic_similarity_unparsed_zero_values: Optional[
+        Dict[str, Dict[str, Dict[str, Dict[float, List[float]]]]]
+    ] = None,
 ) -> Dict[str, object]:
     summary: Dict[str, object] = {}
     for mode in non_none_modes:
@@ -739,6 +760,7 @@ def _build_summary_json(
                         sem_mean, sem_count = _mean_and_count(sem_values)
                         alpha_metrics["mean_semantic_similarity"] = sem_mean
                         alpha_metrics["semantic_similarity_sample_count"] = sem_count
+                    vce_mean: Optional[float] = None
                     if mode_verbalised_confidence_effect_values is not None:
                         vce_values = (
                             mode_verbalised_confidence_effect_values.get(mode, {})
@@ -759,6 +781,27 @@ def _build_summary_json(
                         unc_mean, unc_count = _mean_and_count(unc_values)
                         alpha_metrics["mean_uncertainty_score"] = unc_mean
                         alpha_metrics["uncertainty_score_sample_count"] = unc_count
+                    if (
+                        mode_semantic_similarity_unparsed_zero_values is not None
+                        and mode in SEMANTIC_SIMILARITY_MODES
+                    ):
+                        zero_values = (
+                            mode_semantic_similarity_unparsed_zero_values.get(mode, {})
+                            .get(component, {})
+                            .get(target, {})
+                            .get(alpha, [])
+                        )
+                        attach_unparsed_zero_aggregate_metrics(
+                            alpha_metrics,
+                            unparsed_zero_values=zero_values,
+                            baseline_mean_confidence=(
+                                float(np.mean(baseline_values_by_target.get(target, [])))
+                                if baseline_values_by_target.get(target, [])
+                                else None
+                            ),
+                            mode_mean_confidence=alpha_metrics.get("mean_confidence"),
+                            mean_from_low_confidence=(target == "high"),
+                        )
                     alpha_payload[alpha_key] = alpha_metrics
                 component_payload[target] = alpha_payload
             mode_payload[component] = component_payload
@@ -901,6 +944,9 @@ def write_config_txt(
     mode_confidence_values: Dict[str, Dict[str, Dict[str, Dict[float, List[float]]]]],
     finished_at: str,
     summary_payload: Optional[Dict[str, object]] = None,
+    direction_low_conf_count: Optional[int] = None,
+    direction_high_conf_count: Optional[int] = None,
+    direction_h5_example_count: Optional[int] = None,
 ) -> None:
     non_none_modes = [m for m in args.ablation_mode if m != "none"]
     flattened_means = _flatten_summary_means_for_config(
@@ -922,6 +968,12 @@ def write_config_txt(
         "",
         "[Data]",
         f"input_h5={args.input_h5}",
+        *direction_h5_config_lines(
+            args,
+            direction_low_conf_count=direction_low_conf_count,
+            direction_high_conf_count=direction_high_conf_count,
+            direction_h5_example_count=direction_h5_example_count,
+        ),
         f"dataset={args.dataset}",
         f"new_h5_format={args.new_h5_format}",
         f"h5_example_count={h5_example_count}",
@@ -955,6 +1007,7 @@ def write_config_txt(
         f"expected_guess_tokens={args.expected_guess_tokens}",
         f"normalize_span_directions={args.normalize_span_directions}",
         f"parse_mode_verbalised_confidence={args.parse_mode_verbalised_confidence}",
+        *semantic_similarity_config_lines(args.semantic_similarity_method),
         f"linguistic_confidence_prompt={args.linguistic_confidence_prompt}",
         f"low_conf_threshold={args.low_conf_threshold}",
         f"high_conf_threshold={args.high_conf_threshold}",
@@ -1008,8 +1061,29 @@ def write_config_txt(
                         if unc_mean is not None:
                             parts.append(f"mean_uncertainty_score={float(unc_mean):.6f}")
                         lines.append(" ".join(parts))
+        lines.extend(
+            unparsed_zero_config_section_lines(
+                probe_summary_unparsed_zero_row_lines(
+                    summary_payload,
+                    modes=non_none_modes,
+                    targets=args.ablation_targets,
+                    components=args.ablate_subblocks,
+                )
+            )
+        )
 
     lines.extend(["", "[Run]", f"finished_at={finished_at}"])
+    if summary_payload is not None:
+        lines.extend(
+            zero_fill_config_section_lines(
+                subblock_zero_fill_config_row_lines(
+                    summary_payload,
+                    modes=non_none_modes,
+                    components=args.ablate_subblocks,
+                    targets=args.ablation_targets,
+                )
+            )
+        )
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -1046,6 +1120,7 @@ def main() -> None:
         choices=list(SUPPORTED_MODEL_NAMES),
     )
     parser.add_argument("--input_h5", type=str, required=True, help="Path to *_verbalised_embeddings.h5 file.")
+    add_direction_input_h5_args(parser)
     parser.add_argument(
         "--new_h5_format",
         action=argparse.BooleanOptionalAction,
@@ -1121,10 +1196,11 @@ def main() -> None:
         default=["probability_prefix_last_token"],
         choices=list(GENERATED_TOKENS_SOURCE_CHOICES),
         help=(
-            "Generated-token direction source for all_tokens_mean_replace and "
-            "generated_tokens_mean_replace. Prompt positions always use prompt_mean; every "
-            "non-prompt position uses the selected source. Currently only "
-            "probability_prefix_last_token (probability[-1]) is supported."
+            "Direction source for all_tokens_mean_replace and generated_tokens_mean_replace. "
+            "probability_prefix_last_token (default): prompt_mean on prompt positions, "
+            "probability[-1] on every other patched position. "
+            "probability_prefix_first_token: probability[0] at every patched position, "
+            "including earlier prompt tokens (matches componentwise generated_tokens_mean_replace)."
         ),
     )
     parser.add_argument(
@@ -1178,6 +1254,7 @@ def main() -> None:
         default=True,
         help="Parse verbalised confidence from generated responses and report aggregate means.",
     )
+    add_semantic_similarity_method_arg(parser)
     parser.add_argument(
         "--linguistic_confidence_prompt",
         action=argparse.BooleanOptionalAction,
@@ -1197,6 +1274,7 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    validate_direction_input_h5_args(args)
 
     if not args.new_h5_format:
         raise ValueError(
@@ -1204,7 +1282,11 @@ def main() -> None:
         )
     if len(set(args.ablation_mode)) != len(args.ablation_mode):
         raise ValueError(f"Duplicate ablation modes are not allowed: {args.ablation_mode}")
-    validate_last_a_panl_and_pc_mode(args.model_name, args.ablation_mode)
+    validate_last_a_panl_and_pc_mode(
+        args.model_name,
+        args.ablation_mode,
+        linguistic_confidence_prompt=args.linguistic_confidence_prompt,
+    )
     if "none" not in args.ablation_mode:
         raise ValueError("Please include 'none' in --ablation_mode for baseline comparisons.")
     if any(m in WHOLE_SEQUENCE_MODES for m in args.ablation_mode):
@@ -1269,15 +1351,41 @@ def main() -> None:
     ablate_layers = parse_ablate_layers(args.ablate_layers, model.cfg.n_layers)
 
     examples_h5 = load_examples_h5(Path(args.input_h5))
-    _, _, direction_by_component, low_ids, high_ids = compute_low_high_span_means_and_directions_by_component(
-        examples_h5,
-        ablate_layers=ablate_layers,
-        low_conf_threshold=args.low_conf_threshold,
-        high_conf_threshold=args.high_conf_threshold,
-        expected_probability_tokens=args.expected_probability_tokens,
-        expected_guess_tokens=args.expected_guess_tokens,
-        components=args.ablate_subblocks,
-    )
+    direction_low_conf_count: Optional[int] = None
+    direction_high_conf_count: Optional[int] = None
+    direction_h5_example_count: Optional[int] = None
+    if args.direction_input_h5:
+        low_ids, high_ids = collect_low_high_ids_from_examples(
+            examples_h5,
+            low_conf_threshold=args.low_conf_threshold,
+            high_conf_threshold=args.high_conf_threshold,
+        )
+        direction_examples_h5 = load_examples_h5(Path(args.direction_input_h5))
+        direction_h5_example_count = len(direction_examples_h5)
+        _, _, direction_by_component, direction_low_ids, direction_high_ids = (
+            compute_low_high_span_means_and_directions_by_component(
+                direction_examples_h5,
+                ablate_layers=ablate_layers,
+                low_conf_threshold=float(args.direction_low_conf_threshold),
+                high_conf_threshold=float(args.direction_high_conf_threshold),
+                expected_probability_tokens=args.expected_probability_tokens,
+                expected_guess_tokens=args.expected_guess_tokens,
+                components=args.ablate_subblocks,
+            )
+        )
+        direction_low_conf_count = len(direction_low_ids)
+        direction_high_conf_count = len(direction_high_ids)
+        del direction_examples_h5, direction_low_ids, direction_high_ids
+    else:
+        _, _, direction_by_component, low_ids, high_ids = compute_low_high_span_means_and_directions_by_component(
+            examples_h5,
+            ablate_layers=ablate_layers,
+            low_conf_threshold=args.low_conf_threshold,
+            high_conf_threshold=args.high_conf_threshold,
+            expected_probability_tokens=args.expected_probability_tokens,
+            expected_guess_tokens=args.expected_guess_tokens,
+            components=args.ablate_subblocks,
+        )
     if args.normalize_span_directions:
         normalization_stats = normalize_component_direction_spans_to_unit_norm_budget(
             direction_by_component,
@@ -1297,7 +1405,7 @@ def main() -> None:
                 )
 
     logging.info(
-        "Loaded %d H5 examples. low_conf=%d (<=%.3f), high_conf=%d (>=%.3f), layers=%s, components=%s, alphas=%s",
+        "Loaded %d eval H5 examples. low_conf=%d (<=%.3f), high_conf=%d (>=%.3f), layers=%s, components=%s, alphas=%s",
         len(examples_h5),
         len(low_ids),
         args.low_conf_threshold,
@@ -1307,6 +1415,16 @@ def main() -> None:
         args.ablate_subblocks,
         list(args.alpha),
     )
+    if args.direction_input_h5:
+        logging.info(
+            "Direction H5 %s: low_conf=%d (<=%.3f), high_conf=%d (>=%.3f), examples=%d",
+            args.direction_input_h5,
+            int(direction_low_conf_count or 0),
+            float(args.direction_low_conf_threshold),
+            int(direction_high_conf_count or 0),
+            float(args.direction_high_conf_threshold),
+            int(direction_h5_example_count or 0),
+        )
     eval_low_ids = set(truncate_sorted_ids(low_ids, args.num_samples))
     eval_high_ids = set(truncate_sorted_ids(high_ids, args.num_samples))
     eval_ids = eval_low_ids | eval_high_ids
@@ -1321,13 +1439,10 @@ def main() -> None:
 
     out_path = resolve_output_json_path(args.output_json)
 
-    sentence_transformer = None
     compute_derived_metrics = "none" in args.ablation_mode and len(args.ablation_mode) > 1
-    if compute_derived_metrics and any(m in SEMANTIC_SIMILARITY_MODES for m in args.ablation_mode):
-        logging.info(
-            "Loading sentence-transformers model for semantic_similarity.",
-        )
-        sentence_transformer = load_sentence_transformer_for_metrics()
+    collect_semantic_similarity = compute_derived_metrics and any(
+        m in SEMANTIC_SIMILARITY_MODES for m in args.ablation_mode
+    )
 
     results = {"train": {}, "validation": {}}
     mini_results = {"train": {}, "validation": {}}
@@ -1361,6 +1476,13 @@ def main() -> None:
         for mode in [m for m in args.ablation_mode if m != "none"]
     }
     mode_uncertainty_score_values: Dict[str, Dict[str, Dict[str, Dict[float, List[float]]]]] = {
+        mode: {
+            component: {target: {float(alpha): [] for alpha in args.alpha} for target in args.ablation_targets}
+            for component in args.ablate_subblocks
+        }
+        for mode in [m for m in args.ablation_mode if m != "none"]
+    }
+    mode_semantic_similarity_unparsed_zero_values: Dict[str, Dict[str, Dict[str, Dict[float, List[float]]]]] = {
         mode: {
             component: {target: {float(alpha): [] for alpha in args.alpha} for target in args.ablation_targets}
             for component in args.ablate_subblocks
@@ -1555,7 +1677,7 @@ def main() -> None:
                                             float(alpha)
                                         ].append(float(vce))
 
-                if sentence_transformer is not None and baseline_semantic_answer is not None:
+                if collect_semantic_similarity and baseline_semantic_answer is not None:
                     for target in args.ablation_targets:
                         if target == "low" and not ex_is_low:
                             continue
@@ -1577,6 +1699,9 @@ def main() -> None:
                                         continue
                                     mode_semantic_answer = subblock_entry.get("semantic_answer")
                                     if mode_semantic_answer is None:
+                                        mode_semantic_similarity_unparsed_zero_values[mode][subblock][
+                                            target
+                                        ][float(alpha)].append(0.0)
                                         continue
                                     pending_semantic_similarity.append(
                                         (
@@ -1603,22 +1728,45 @@ def main() -> None:
                 baseline_response[:120],
             )
 
-    if pending_semantic_similarity and sentence_transformer is not None:
-        pairs = [(baseline_text, mode_text) for *_rest, baseline_text, mode_text in pending_semantic_similarity]
-        similarities = batch_compute_semantic_similarities(sentence_transformer, pairs)
-        for task, similarity in zip(pending_semantic_similarity, similarities):
-            split_name, ex_id, mode, target, alpha, subblock, key, _baseline_text, _mode_text = task
-            subblock_entry = results[split_name][ex_id][key][subblock]
-            mini_subblock_entry = mini_results[split_name][ex_id][key][subblock]
-            subblock_entry["semantic_similarity"] = similarity
-            mini_subblock_entry["semantic_similarity"] = similarity
-            mode_semantic_similarity_values[mode][subblock][target][alpha].append(similarity)
-            vce = subblock_entry.get("verbalised_confidence_effect")
-            if vce is not None:
-                uncertainty = compute_uncertainty_score(similarity, float(vce))
-                subblock_entry["uncertainty_score"] = uncertainty
-                mini_subblock_entry["uncertainty_score"] = uncertainty
-                mode_uncertainty_score_values[mode][subblock][target][alpha].append(uncertainty)
+    model_n_layers = int(model.cfg.n_layers)
+    del model
+    release_cuda_cache()
+
+    similarity_scorer = None
+    questions_by_id = None
+    if collect_semantic_similarity and pending_semantic_similarity:
+        similarity_scorer, questions_by_id = open_semantic_similarity_scorer(
+            args.semantic_similarity_method,
+            device,
+            args.input_h5,
+        )
+    try:
+        if pending_semantic_similarity and similarity_scorer is not None:
+            similarities = similarity_scorer.score_answers(
+                example_ids=[task[1] for task in pending_semantic_similarity],
+                correct_answers=[task[-2] for task in pending_semantic_similarity],
+                llm_outputs=[task[-1] for task in pending_semantic_similarity],
+                questions_by_id=questions_by_id,
+            )
+            for task, similarity in zip(pending_semantic_similarity, similarities):
+                split_name, ex_id, mode, target, alpha, subblock, key, _baseline_text, _mode_text = task
+                subblock_entry = results[split_name][ex_id][key][subblock]
+                mini_subblock_entry = mini_results[split_name][ex_id][key][subblock]
+                subblock_entry["semantic_similarity"] = similarity
+                mini_subblock_entry["semantic_similarity"] = similarity
+                mode_semantic_similarity_values[mode][subblock][target][alpha].append(similarity)
+                mode_semantic_similarity_unparsed_zero_values[mode][subblock][target][alpha].append(
+                    similarity
+                )
+                vce = subblock_entry.get("verbalised_confidence_effect")
+                if vce is not None:
+                    uncertainty = compute_uncertainty_score(similarity, float(vce))
+                    subblock_entry["uncertainty_score"] = uncertainty
+                    mini_subblock_entry["uncertainty_score"] = uncertainty
+                    mode_uncertainty_score_values[mode][subblock][target][alpha].append(uncertainty)
+    finally:
+        if similarity_scorer is not None:
+            similarity_scorer.close()
 
     derived_metric_kwargs: Dict[str, object] = {}
     if compute_derived_metrics:
@@ -1626,6 +1774,7 @@ def main() -> None:
             "mode_semantic_similarity_values": mode_semantic_similarity_values,
             "mode_verbalised_confidence_effect_values": mode_verbalised_confidence_effect_values,
             "mode_uncertainty_score_values": mode_uncertainty_score_values,
+            "mode_semantic_similarity_unparsed_zero_values": mode_semantic_similarity_unparsed_zero_values,
         }
 
     summary_payload = _build_summary_json(
@@ -1638,6 +1787,8 @@ def main() -> None:
         baseline_values_by_target=baseline_values_by_target,
         **derived_metric_kwargs,
     )
+    if compute_derived_metrics:
+        apply_subblock_zero_fill(summary_payload, results)
 
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
@@ -1665,7 +1816,7 @@ def main() -> None:
         config_out_path,
         args=args,
         device=device,
-        model_n_layers=model.cfg.n_layers,
+        model_n_layers=model_n_layers,
         ablate_layers=ablate_layers,
         prompt_indices=prompt_indices,
         low_conf_count=len(low_ids),
@@ -1674,6 +1825,9 @@ def main() -> None:
         mode_confidence_values=mode_confidence_values,
         finished_at=datetime.now().astimezone().isoformat(timespec="seconds"),
         summary_payload=summary_payload if compute_derived_metrics else None,
+        direction_low_conf_count=direction_low_conf_count,
+        direction_high_conf_count=direction_high_conf_count,
+        direction_h5_example_count=direction_h5_example_count,
     )
     logging.info("Wrote %s", out_path)
     logging.info("Wrote %s", mini_out_path)

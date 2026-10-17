@@ -28,12 +28,17 @@ import argparse
 import logging
 import pickle
 import re
+import sys
 from pathlib import Path
 
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.model_selection import KFold
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 try:
     from verbalised_confidence_probes.train_verbalised_confidence_probe import (
@@ -48,6 +53,8 @@ except ImportError:
         train_verbalised_confidence_probe,
         write_config_txt,
     )
+
+from plotting.attention_span_plots import decorate_attention_input_labels
 
 
 def _decode_h5_string(value):
@@ -517,6 +524,27 @@ def _style_metric_axes(ax, xlabel: str, ylabel: str, *, legend_outside: bool = F
     _set_y_axis_from_zero(ax)
 
 
+def _v4_series_label(
+    token_name: str,
+    token_pos: int,
+    label_name: str | None,
+    path_hint: str,
+) -> str:
+    _, embedding_type = _parse_token_dir_name(token_name)
+    if label_name == "prompt" or embedding_type == "mean_prompt":
+        return "mean_prompt"
+    if label_name == "sem_answer" or embedding_type == "mean_sem_answer":
+        return "mean_sem_ans"
+    if embedding_type == "guess":
+        return f"guess_{token_pos}"
+    if embedding_type == "probability":
+        raw = f"prob_{token_pos}"
+        return decorate_attention_input_labels([raw], path_hint=path_hint)[0]
+    if label_name is not None:
+        return label_name
+    return token_name
+
+
 def _plot_group_lines(
     ax,
     token_items,
@@ -525,6 +553,9 @@ def _plot_group_lines(
     split_mode: str = "both",
     fixed_color: str | None = None,
     label_name: str | None = None,
+    *,
+    use_v4_labels: bool = False,
+    path_hint: str = "",
 ):
     if len(token_items) == 0:
         return
@@ -540,13 +571,17 @@ def _plot_group_lines(
         test_vals = metrics_dict["test"][metric_idx]
         color = colors[order_idx]
         marker = _marker_for_token_pos(token_pos)
-        series_label = label_name if label_name is not None else token_name
+        if use_v4_labels:
+            series_label = _v4_series_label(token_name, token_pos, label_name, path_hint)
+        else:
+            series_label = label_name if label_name is not None else token_name
 
         if split_mode in ("both", "train"):
+            train_label = series_label if use_v4_labels else f"{series_label} (Train)"
             ax.plot(
                 layer_numbers,
                 train_vals,
-                label=f"{series_label} (Train)",
+                label=train_label,
                 marker=marker,
                 markersize=4,
                 color=color,
@@ -555,10 +590,14 @@ def _plot_group_lines(
                 alpha=style["alpha"],
             )
         if split_mode in ("both", "test"):
+            if use_v4_labels:
+                test_label = series_label if split_mode == "test" else None
+            else:
+                test_label = f"{series_label} (Test)"
             ax.plot(
                 layer_numbers,
                 test_vals,
-                label=f"{series_label} (Test)",
+                label=test_label,
                 marker=marker,
                 markersize=4,
                 color=color,
@@ -587,22 +626,38 @@ def _tok0_metrics_dict(token_items):
     return None
 
 
-def _add_layer0_baseline(ax, token_items, metric_idx: int, split_mode: str, *, label_prefix: str = "Layer 0") -> None:
+def _add_layer0_baseline(
+    ax,
+    token_items,
+    metric_idx: int,
+    split_mode: str,
+    *,
+    label_prefix: str = "Layer 0",
+    use_v4_labels: bool = False,
+    path_hint: str = "",
+) -> None:
+    del path_hint
     metrics_dict = _tok0_metrics_dict(token_items)
     if metrics_dict is None:
         return
     splits = ("train", "test") if split_mode == "both" else (split_mode,)
+    labeled = False
     for split in splits:
         value = _layer0_metric(metrics_dict, metric_idx, split)
         if value is None:
             continue
         split_label = "Train" if split == "train" else "Test"
+        if use_v4_labels:
+            line_label = label_prefix if not labeled else None
+            labeled = True
+        else:
+            line_label = f"{label_prefix} ({split_label})"
         ax.axhline(
             y=value,
             color="0.2",
             linestyle=":",
             linewidth=1.6,
-            label=f"{label_prefix} ({split_label})",
+            label=line_label,
         )
 
 
@@ -834,6 +889,10 @@ def _plot_metrics_all_tokens(
         "skip_existing": skip_existing,
         "only_if_original_exists": only_if_original_exists,
     }
+    line_kwargs = {
+        "use_v4_labels": name_suffix == "_v4",
+        "path_hint": str(run_base),
+    }
 
     guess_token_items = _sorted_token_items(all_token_metrics, "guess")
     prob_token_items = _sorted_token_items(all_token_metrics, "probability")
@@ -845,8 +904,8 @@ def _plot_metrics_all_tokens(
             out_path = _maybe_all_tokens_out_path(run_base, f"{metric_name}_all_tokens_guess", **path_kwargs)
             if out_path is not None:
                 fig, ax = plt.subplots(figsize=(10, 6))
-                _plot_group_lines(ax, guess_token_items, metric_idx, cmap_name="Blues", split_mode="both")
-                _add_layer0_baseline(ax, guess_token_items, metric_idx, "both")
+                _plot_group_lines(ax, guess_token_items, metric_idx, cmap_name="Blues", split_mode="both", **line_kwargs)
+                _add_layer0_baseline(ax, guess_token_items, metric_idx, "both", **line_kwargs)
                 _save_all_tokens_figure(fig, ax, metric_label, out_path)
 
             for split_mode in ("train", "test"):
@@ -856,8 +915,8 @@ def _plot_metrics_all_tokens(
                 if out_path is None:
                     continue
                 fig, ax = plt.subplots(figsize=(10, 6))
-                _plot_group_lines(ax, guess_token_items, metric_idx, cmap_name="Blues", split_mode=split_mode)
-                _add_layer0_baseline(ax, guess_token_items, metric_idx, split_mode)
+                _plot_group_lines(ax, guess_token_items, metric_idx, cmap_name="Blues", split_mode=split_mode, **line_kwargs)
+                _add_layer0_baseline(ax, guess_token_items, metric_idx, split_mode, **line_kwargs)
                 _save_all_tokens_figure(fig, ax, metric_label, out_path)
 
     if len(prob_token_items) > 0:
@@ -867,8 +926,8 @@ def _plot_metrics_all_tokens(
             )
             if out_path is not None:
                 fig, ax = plt.subplots(figsize=(10, 6))
-                _plot_group_lines(ax, prob_token_items, metric_idx, cmap_name="Oranges", split_mode="both")
-                _add_layer0_baseline(ax, prob_token_items, metric_idx, "both")
+                _plot_group_lines(ax, prob_token_items, metric_idx, cmap_name="Oranges", split_mode="both", **line_kwargs)
+                _add_layer0_baseline(ax, prob_token_items, metric_idx, "both", **line_kwargs)
                 _save_all_tokens_figure(fig, ax, metric_label, out_path)
 
             for split_mode in ("train", "test"):
@@ -878,8 +937,8 @@ def _plot_metrics_all_tokens(
                 if out_path is None:
                     continue
                 fig, ax = plt.subplots(figsize=(10, 6))
-                _plot_group_lines(ax, prob_token_items, metric_idx, cmap_name="Oranges", split_mode=split_mode)
-                _add_layer0_baseline(ax, prob_token_items, metric_idx, split_mode)
+                _plot_group_lines(ax, prob_token_items, metric_idx, cmap_name="Oranges", split_mode=split_mode, **line_kwargs)
+                _add_layer0_baseline(ax, prob_token_items, metric_idx, split_mode, **line_kwargs)
                 _save_all_tokens_figure(fig, ax, metric_label, out_path)
 
     if len(prompt_token_items) > 0:
@@ -899,6 +958,7 @@ def _plot_metrics_all_tokens(
                     split_mode=split_mode,
                     fixed_color="green",
                     label_name="prompt",
+                    **line_kwargs,
                 )
                 _save_all_tokens_figure(fig, ax, metric_label, out_path)
 
@@ -919,6 +979,7 @@ def _plot_metrics_all_tokens(
                     split_mode=split_mode,
                     fixed_color="purple",
                     label_name="sem_answer",
+                    **line_kwargs,
                 )
                 _save_all_tokens_figure(fig, ax, metric_label, out_path)
 
@@ -934,8 +995,8 @@ def _plot_metrics_all_tokens(
             )
             if out_path is not None:
                 fig, ax = plt.subplots(figsize=(11, 6))
-                _plot_group_lines(ax, guess_token_items, metric_idx, cmap_name="Blues", split_mode="both")
-                _plot_group_lines(ax, prob_token_items, metric_idx, cmap_name="Oranges", split_mode="both")
+                _plot_group_lines(ax, guess_token_items, metric_idx, cmap_name="Blues", split_mode="both", **line_kwargs)
+                _plot_group_lines(ax, prob_token_items, metric_idx, cmap_name="Oranges", split_mode="both", **line_kwargs)
                 _plot_group_lines(
                     ax,
                     prompt_token_items,
@@ -944,6 +1005,7 @@ def _plot_metrics_all_tokens(
                     split_mode="both",
                     fixed_color="green",
                     label_name="prompt",
+                    **line_kwargs,
                 )
                 _plot_group_lines(
                     ax,
@@ -953,8 +1015,9 @@ def _plot_metrics_all_tokens(
                     split_mode="both",
                     fixed_color="purple",
                     label_name="sem_answer",
+                    **line_kwargs,
                 )
-                _add_layer0_baseline(ax, guess_token_items, metric_idx, "both")
+                _add_layer0_baseline(ax, guess_token_items, metric_idx, "both", **line_kwargs)
                 _save_all_tokens_figure(fig, ax, metric_label, out_path)
 
             for split_mode in ("train", "test"):
@@ -964,8 +1027,8 @@ def _plot_metrics_all_tokens(
                 if out_path is None:
                     continue
                 fig, ax = plt.subplots(figsize=(11, 6))
-                _plot_group_lines(ax, guess_token_items, metric_idx, cmap_name="Blues", split_mode=split_mode)
-                _plot_group_lines(ax, prob_token_items, metric_idx, cmap_name="Oranges", split_mode=split_mode)
+                _plot_group_lines(ax, guess_token_items, metric_idx, cmap_name="Blues", split_mode=split_mode, **line_kwargs)
+                _plot_group_lines(ax, prob_token_items, metric_idx, cmap_name="Oranges", split_mode=split_mode, **line_kwargs)
                 _plot_group_lines(
                     ax,
                     prompt_token_items,
@@ -974,6 +1037,7 @@ def _plot_metrics_all_tokens(
                     split_mode=split_mode,
                     fixed_color="green",
                     label_name="prompt",
+                    **line_kwargs,
                 )
                 _plot_group_lines(
                     ax,
@@ -983,8 +1047,9 @@ def _plot_metrics_all_tokens(
                     split_mode=split_mode,
                     fixed_color="purple",
                     label_name="sem_answer",
+                    **line_kwargs,
                 )
-                _add_layer0_baseline(ax, guess_token_items, metric_idx, split_mode)
+                _add_layer0_baseline(ax, guess_token_items, metric_idx, split_mode, **line_kwargs)
                 _save_all_tokens_figure(fig, ax, metric_label, out_path)
 
 

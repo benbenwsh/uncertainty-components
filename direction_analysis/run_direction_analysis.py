@@ -41,6 +41,7 @@ from plotting.paper_heatmaps import (
     PAPER_DPI,
     apply_input_output_token_axes,
     paper_png_path,
+    sparse_layer_yticks,
 )
 
 
@@ -149,10 +150,15 @@ def _style_direction_heatmap_axes(
     run_layers: Sequence[int],
     token_labels: Sequence[str],
     tick_rotation: float = 30,
+    sparse_layer_ticks: bool = False,
+    model_name: Optional[str] = None,
+    linguistic_confidence_prompt: bool = False,
+    path_hint: str = "",
 ) -> None:
-    ax.set_yticks(np.arange(n_rows))
-    ax.set_yticklabels([str(layer) for layer in run_layers], fontsize=_TICK_FS)
-    ax.set_ylabel("Layer", fontsize=_LABEL_FS)
+    if not sparse_layer_ticks:
+        ax.set_yticks(np.arange(n_rows))
+        ax.set_yticklabels([str(layer) for layer in run_layers], fontsize=_TICK_FS)
+        ax.set_ylabel("Layer", fontsize=_LABEL_FS)
     apply_input_output_token_axes(
         ax,
         n_cols=n_cols,
@@ -160,6 +166,9 @@ def _style_direction_heatmap_axes(
         rotation=tick_rotation,
         fontsize=_TICK_FS,
         label_fontsize=_LABEL_FS,
+        model_name=model_name,
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
+        path_hint=path_hint,
     )
     ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
     ax.set_yticks(np.arange(-0.5, n_rows, 1), minor=True)
@@ -167,6 +176,13 @@ def _style_direction_heatmap_axes(
     ax.tick_params(which="minor", bottom=False, left=False)
     ax.set_xlim(-0.5, n_cols - 0.5)
     ax.set_ylim(n_rows - 0.5, -0.5)
+    if sparse_layer_ticks:
+        sparse_layer_yticks(
+            ax,
+            run_layers,
+            fontsize=_TICK_FS,
+            label_fontsize=_LABEL_FS,
+        )
 
 
 def write_rgba_heatmap(
@@ -177,6 +193,9 @@ def write_rgba_heatmap(
     matrix_values: np.ndarray,
     alpha_mode: str = "global",
     value_fmt: str = "{:.3f}",
+    model_name: Optional[str] = None,
+    linguistic_confidence_prompt: bool = False,
+    path_hint: str = "",
 ) -> Tuple[float, float]:
     """Blue RGBA heatmap. Returns (vmin, vmax) of finite raw values."""
     n_rows, n_cols = matrix_values.shape
@@ -203,6 +222,9 @@ def write_rgba_heatmap(
         run_layers=run_layers,
         token_labels=token_labels,
         tick_rotation=30,
+        model_name=model_name,
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
+        path_hint=path_hint,
     )
     fig.tight_layout()
     fig.savefig(path, dpi=_ANNOTATED_DPI, bbox_inches="tight")
@@ -218,6 +240,9 @@ def write_rgba_heatmap_paper(
     matrix_values: np.ndarray,
     alpha_mode: str = "global",
     cbar_label: str,
+    model_name: Optional[str] = None,
+    linguistic_confidence_prompt: bool = False,
+    path_hint: str = "",
 ) -> Path:
     """Paper heatmap: no cell text, white-to-blue scale, colorbar."""
     out = Path(path)
@@ -249,6 +274,10 @@ def write_rgba_heatmap_paper(
         run_layers=run_layers,
         token_labels=token_labels,
         tick_rotation=45,
+        sparse_layer_ticks=True,
+        model_name=model_name,
+        linguistic_confidence_prompt=linguistic_confidence_prompt,
+        path_hint=path_hint,
     )
     fig.tight_layout()
     cax = inset_axes(
@@ -342,6 +371,7 @@ def write_config_txt(
         "",
         "[Span]",
         f"linguistic_confidence_prompt={args.linguistic_confidence_prompt}",
+        f"l_vs_un={getattr(args, 'l_vs_un', False)}",
         f"expected_probability_tokens={args.expected_probability_tokens}",
         f"expected_confidence_tokens={args.expected_confidence_tokens}",
         f"extend_probability_span={args.extend_probability_span}",
@@ -404,6 +434,16 @@ def main() -> None:
         help="If true, use Confidence: span budget; if false, use Probability: span budget.",
     )
     parser.add_argument(
+        "--l_vs_un",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If true together with --linguistic_confidence_prompt, keep only examples "
+            "whose Confidence: span token at index 6 decodes as L or Un (same as DLA). "
+            "Ignored when --linguistic_confidence_prompt is off."
+        ),
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default=None,
@@ -434,10 +474,14 @@ def main() -> None:
     allow_at_least_expected = (
         bool(args.linguistic_confidence_prompt) and bool(args.extend_probability_span)
     )
+    apply_l_vs_un = bool(args.linguistic_confidence_prompt) and bool(args.l_vs_un)
+    if args.l_vs_un and not args.linguistic_confidence_prompt:
+        logging.warning("Ignoring --l_vs_un because --linguistic_confidence_prompt is off.")
     logging.info(
-        "Span budget=%d allow_at_least_expected=%s",
+        "Span budget=%d allow_at_least_expected=%s l_vs_un=%s",
         direction_prob_token_budget,
         allow_at_least_expected,
+        apply_l_vs_un,
     )
 
     logging.info("Computing probability mass-mean directions (streaming H5)...")
@@ -449,6 +493,8 @@ def main() -> None:
             high_conf_threshold=args.high_conf_threshold,
             new_h5_format=args.new_h5_format,
             allow_at_least_expected=allow_at_least_expected,
+            l_vs_un=apply_l_vs_un,
+            model_name=args.model_name if apply_l_vs_un else None,
         )
     )
     run_layers = list(range(n_layers))
@@ -488,6 +534,8 @@ def main() -> None:
         matrix_values=magnitudes,
         alpha_mode="row",
         value_fmt="{:.3f}",
+        model_name=args.model_name,
+        linguistic_confidence_prompt=args.linguistic_confidence_prompt,
     )
     mag_paper = write_rgba_heatmap_paper(
         path=str(paper_png_path(mag_path)),
@@ -496,6 +544,8 @@ def main() -> None:
         matrix_values=magnitudes,
         alpha_mode="row",
         cbar_label="Relative magnitude within layer",
+        model_name=args.model_name,
+        linguistic_confidence_prompt=args.linguistic_confidence_prompt,
     )
     logging.info("Wrote %s and %s (range [%.6f, %.6f])", mag_path, mag_paper, mag_vmin, mag_vmax)
 
@@ -509,6 +559,8 @@ def main() -> None:
         matrix_values=cosine_matrix,
         alpha_mode="global",
         value_fmt="{:.3f}",
+        model_name=args.model_name,
+        linguistic_confidence_prompt=args.linguistic_confidence_prompt,
     )
     cos_paper = write_rgba_heatmap_paper(
         path=str(paper_png_path(cos_path)),
@@ -517,6 +569,8 @@ def main() -> None:
         matrix_values=cosine_matrix,
         alpha_mode="global",
         cbar_label="Cosine similarity vs previous layer",
+        model_name=args.model_name,
+        linguistic_confidence_prompt=args.linguistic_confidence_prompt,
     )
     logging.info("Wrote %s and %s (range [%.6f, %.6f])", cos_path, cos_paper, cos_vmin, cos_vmax)
 
@@ -545,6 +599,8 @@ def main() -> None:
         "low_conf_count": len(low_ids),
         "high_conf_count": len(high_ids),
         "h5_example_count": h5_example_count,
+        "linguistic_confidence_prompt": args.linguistic_confidence_prompt,
+        "l_vs_un": args.l_vs_un,
         "magnitude_min": mag_vmin,
         "magnitude_max": mag_vmax,
         "cosine_min": cos_vmin,

@@ -50,10 +50,8 @@ from layerwise_mean_ablation.run_mean_ablation import (
     _as_layer_hidden,
     _is_expected_or_plus_two,
     _mean_and_count,
-    batch_compute_semantic_similarities,
     compute_uncertainty_score,
     compute_verbalised_confidence_effect,
-    load_sentence_transformer_for_metrics,
     parse_semantic_answer_from_response,
     probability_row_indices_for_mode,
     resolve_combo_target_ids,
@@ -61,9 +59,16 @@ from layerwise_mean_ablation.run_mean_ablation import (
     truncate_sorted_ids,
     validate_last_a_panl_and_pc_mode,
 )
+from semantic_similarity_metrics import (
+    add_semantic_similarity_method_arg,
+    open_semantic_similarity_scorer,
+    release_cuda_cache,
+    semantic_similarity_config_lines,
+)
 from mass_mean_probe.run_mass_mean_probe import (
-    DEFAULT_SEMANTIC_SIMILARITY_MODEL,
     SEMANTIC_SIMILARITY_MODES,
+    apply_blockwise_zero_fill,
+    write_zero_fill_config_file,
 )
 
 
@@ -177,6 +182,7 @@ def write_config_txt(
         f"high_conf_threshold={args.high_conf_threshold}",
         f"low_conf_selected_count={low_conf_count}",
         f"high_conf_selected_count={high_conf_count}",
+        *semantic_similarity_config_lines(args.semantic_similarity_method),
         "",
         "[Mode Confidence Metrics]",
         "Values below are mean verbalised confidence.",
@@ -788,10 +794,12 @@ def main() -> None:
             "last_a_and_panl_mean_replace: rows 0 and 1 (last answer token and post-answer newline). "
             "last_a_panl_and_pc_mean_replace: "
             "same gating as probability_tokens_mean_replace but only H5 probability rows 0, 1, and "
-            "a model-specific pre-confidence index (Mistral 6, Gemma 3; unsupported for Qwen). "
+            "a model-specific pre-confidence index (numeric: Mistral 6, Gemma 3; linguistic: "
+            "Mistral 4; unsupported for Qwen and for Gemma with --linguistic_confidence_prompt). "
             "panl_mean_replace: only H5 probability row 1 (post-answer newline). "
             "pc_mean_replace: only the model-specific pre-confidence index "
-            "(Mistral 6, Gemma 3; unsupported for Qwen). "
+            "(numeric: Mistral 6, Gemma 3; linguistic: Mistral 4; unsupported for Qwen and for "
+            "Gemma with --linguistic_confidence_prompt). "
             "probability_last_token_mean_replace: mean-replace only the "
             "last token of the H5 probability span (end_prob; first value digit). "
             "probability_span_except_last_token_mean_replace: mean-replace all probability-span tokens "
@@ -846,6 +854,7 @@ def main() -> None:
     parser.add_argument("--expected_probability_tokens", type=int, default=7)
     parser.add_argument("--expected_guess_tokens", type=int, default=5)
     parser.add_argument("--parse_mode_verbalised_confidence", action=argparse.BooleanOptionalAction, default=True)
+    add_semantic_similarity_method_arg(parser)
     parser.add_argument("--output_json", type=str, default=None)
     parser.add_argument("--individual_layers", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--plot_from_existing_summary", action=argparse.BooleanOptionalAction, default=False)
@@ -995,7 +1004,6 @@ def main() -> None:
     def run_one_evaluation(
         layer_subset: Sequence[int],
         cached_none: Optional[Dict[str, Dict[str, Dict[str, object]]]] = None,
-        sentence_transformer=None,
     ) -> Tuple[
         dict,
         dict,
@@ -1009,6 +1017,7 @@ def main() -> None:
         Dict[str, Dict[str, int]],
         Dict[str, Dict[str, Optional[float]]],
         Dict[str, Dict[str, int]],
+        List[Tuple[str, str, str, str, str, str]],
     ]:
         results = {"train": {}, "validation": {}}
         mini_results = {"train": {}, "validation": {}}
@@ -1194,7 +1203,8 @@ def main() -> None:
 
                             if (
                                 mode in SEMANTIC_SIMILARITY_MODES
-                                and sentence_transformer is not None
+                                and "none" in args.ablation_mode
+                                and len(args.ablation_mode) > 1
                                 and baseline_semantic_answer is not None
                                 and mode_semantic_answer is not None
                             ):
@@ -1211,24 +1221,6 @@ def main() -> None:
 
                 results[split_name][ex_id] = entry
                 mini_results[split_name][ex_id] = mini_entry
-
-        if pending_semantic_similarity and sentence_transformer is not None:
-            pairs = [(baseline_text, mode_text) for *_rest, baseline_text, mode_text in pending_semantic_similarity]
-            similarities = batch_compute_semantic_similarities(sentence_transformer, pairs)
-            for task, similarity in zip(pending_semantic_similarity, similarities):
-                split_name, ex_id, mode, subblock, _baseline_text, _mode_text = task
-                mode_key = mode_to_output_key(mode)
-                subblock_entry = results[split_name][ex_id][mode_key][subblock]
-                mini_subblock_entry = mini_results[split_name][ex_id][mode_key][subblock]
-                subblock_entry["semantic_similarity"] = similarity
-                mini_subblock_entry["semantic_similarity"] = similarity
-                mode_semantic_similarity_values[mode][subblock].append(similarity)
-                vce = subblock_entry.get("verbalised_confidence_effect")
-                if vce is not None:
-                    uncertainty = compute_uncertainty_score(similarity, float(vce))
-                    subblock_entry["uncertainty_score"] = uncertainty
-                    mini_subblock_entry["uncertainty_score"] = uncertainty
-                    mode_uncertainty_score_values[mode][subblock].append(uncertainty)
 
         mode_confidence_means: Dict[str, Dict[str, Optional[float]]] = {}
         mode_confidence_counts: Dict[str, Dict[str, int]] = {}
@@ -1281,7 +1273,60 @@ def main() -> None:
             mode_verbalised_confidence_effect_counts,
             mode_uncertainty_score_means,
             mode_uncertainty_score_counts,
+            pending_semantic_similarity,
         )
+
+    def apply_deferred_blockwise_scores(results, mini_results, pending, scorer, questions_by_id):
+        sem_values = {
+            mode_name: {subblock: [] for subblock in args.ablate_subblocks}
+            for mode_name in args.ablation_mode
+            if mode_name != "none"
+        }
+        unc_values = {
+            mode_name: {subblock: [] for subblock in args.ablate_subblocks}
+            for mode_name in args.ablation_mode
+            if mode_name != "none"
+        }
+        if pending and scorer is not None:
+            similarities = scorer.score_answers(
+                example_ids=[task[1] for task in pending],
+                correct_answers=[task[-2] for task in pending],
+                llm_outputs=[task[-1] for task in pending],
+                questions_by_id=questions_by_id,
+            )
+            for task, similarity in zip(pending, similarities):
+                split_name, ex_id, mode, subblock, _baseline_text, _mode_text = task
+                mode_key = mode_to_output_key(mode)
+                subblock_entry = results[split_name][ex_id][mode_key][subblock]
+                mini_subblock_entry = mini_results[split_name][ex_id][mode_key][subblock]
+                subblock_entry["semantic_similarity"] = similarity
+                mini_subblock_entry["semantic_similarity"] = similarity
+                sem_values[mode][subblock].append(similarity)
+                vce = subblock_entry.get("verbalised_confidence_effect")
+                if vce is not None:
+                    uncertainty = compute_uncertainty_score(similarity, float(vce))
+                    subblock_entry["uncertainty_score"] = uncertainty
+                    mini_subblock_entry["uncertainty_score"] = uncertainty
+                    unc_values[mode][subblock].append(uncertainty)
+        sem_means: Dict[str, Dict[str, Optional[float]]] = {}
+        sem_counts: Dict[str, Dict[str, int]] = {}
+        unc_means: Dict[str, Dict[str, Optional[float]]] = {}
+        unc_counts: Dict[str, Dict[str, int]] = {}
+        for mode_name in args.ablation_mode:
+            if mode_name == "none":
+                continue
+            sem_means[mode_name] = {}
+            sem_counts[mode_name] = {}
+            unc_means[mode_name] = {}
+            unc_counts[mode_name] = {}
+            for subblock in args.ablate_subblocks:
+                sem_means[mode_name][subblock], sem_counts[mode_name][subblock] = _mean_and_count(
+                    sem_values[mode_name][subblock]
+                )
+                unc_means[mode_name][subblock], unc_counts[mode_name][subblock] = _mean_and_count(
+                    unc_values[mode_name][subblock]
+                )
+        return sem_means, sem_counts, unc_means, unc_counts
 
     def build_none_cache() -> Dict[str, Dict[str, Dict[str, object]]]:
         none_cache: Dict[str, Dict[str, Dict[str, object]]] = {"train": {}, "validation": {}}
@@ -1313,49 +1358,88 @@ def main() -> None:
         return none_cache
 
     compute_derived_metrics = "none" in args.ablation_mode and len(args.ablation_mode) > 1
-    sentence_transformer = None
-    if compute_derived_metrics and any(m in SEMANTIC_SIMILARITY_MODES for m in args.ablation_mode):
-        logging.info(
-            "Loading sentence-transformers model %s for semantic_similarity.",
-            DEFAULT_SEMANTIC_SIMILARITY_MODEL,
-        )
-        sentence_transformer = load_sentence_transformer_for_metrics()
+    language_model_n_layers = int(model.cfg.n_layers)
 
-    derived_metric_kwargs: Dict[str, object] = {}
-    if compute_derived_metrics:
-        derived_metric_kwargs = {
-            "mode_semantic_similarity_means": None,
-            "mode_semantic_similarity_counts": None,
-            "mode_verbalised_confidence_effect_means": None,
-            "mode_verbalised_confidence_effect_counts": None,
-            "mode_uncertainty_score_means": None,
-            "mode_uncertainty_score_counts": None,
+    def _derived_metric_kwargs(sem_means, sem_counts, vce_means, vce_counts, unc_means, unc_counts):
+        if not compute_derived_metrics:
+            return {}
+        return {
+            "mode_semantic_similarity_means": sem_means,
+            "mode_semantic_similarity_counts": sem_counts,
+            "mode_verbalised_confidence_effect_means": vce_means,
+            "mode_verbalised_confidence_effect_counts": vce_counts,
+            "mode_uncertainty_score_means": unc_means,
+            "mode_uncertainty_score_counts": unc_counts,
         }
 
-    if not args.individual_layers:
+    def _score_run(run_out, scorer, questions_by_id):
         (
             results,
             mini_results,
             mode_confidence_means,
             mode_confidence_counts,
-            _,
+            used_none_cache,
             mode_responses_identical_true,
-            mode_semantic_similarity_means,
-            mode_semantic_similarity_counts,
-            mode_verbalised_confidence_effect_means,
-            mode_verbalised_confidence_effect_counts,
-            mode_uncertainty_score_means,
-            mode_uncertainty_score_counts,
-        ) = run_one_evaluation(run_layers, sentence_transformer=sentence_transformer)
-        if compute_derived_metrics:
-            derived_metric_kwargs = {
-                "mode_semantic_similarity_means": mode_semantic_similarity_means,
-                "mode_semantic_similarity_counts": mode_semantic_similarity_counts,
-                "mode_verbalised_confidence_effect_means": mode_verbalised_confidence_effect_means,
-                "mode_verbalised_confidence_effect_counts": mode_verbalised_confidence_effect_counts,
-                "mode_uncertainty_score_means": mode_uncertainty_score_means,
-                "mode_uncertainty_score_counts": mode_uncertainty_score_counts,
-            }
+            _sem_means,
+            _sem_counts,
+            vce_means,
+            vce_counts,
+            _unc_means,
+            _unc_counts,
+            pending,
+        ) = run_out
+        sem_means, sem_counts, unc_means, unc_counts = apply_deferred_blockwise_scores(
+            results,
+            mini_results,
+            pending,
+            scorer,
+            questions_by_id,
+        )
+        return (
+            results,
+            mini_results,
+            mode_confidence_means,
+            mode_confidence_counts,
+            used_none_cache,
+            mode_responses_identical_true,
+            sem_means,
+            sem_counts,
+            vce_means,
+            vce_counts,
+            unc_means,
+            unc_counts,
+        )
+
+    if not args.individual_layers:
+        run_out = run_one_evaluation(run_layers)
+        del model
+        release_cuda_cache()
+        similarity_scorer = None
+        questions_by_id = None
+        if run_out[-1]:
+            similarity_scorer, questions_by_id = open_semantic_similarity_scorer(
+                args.semantic_similarity_method,
+                device,
+                args.input_h5,
+            )
+        try:
+            (
+                results,
+                mini_results,
+                mode_confidence_means,
+                mode_confidence_counts,
+                _,
+                mode_responses_identical_true,
+                sem_means,
+                sem_counts,
+                vce_means,
+                vce_counts,
+                unc_means,
+                unc_counts,
+            ) = _score_run(run_out, similarity_scorer, questions_by_id)
+        finally:
+            if similarity_scorer is not None:
+                similarity_scorer.close()
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
         with open(mini_output_json_path(out_path), "w", encoding="utf-8") as f:
@@ -1364,7 +1448,7 @@ def main() -> None:
             config_txt_path(out_path),
             args=args,
             device=device,
-            model_n_layers=int(model.cfg.n_layers),
+            model_n_layers=language_model_n_layers,
             ablate_layers=run_layers,
             prompt_indices=prompt_indices,
             low_conf_count=len(low_ids),
@@ -1374,64 +1458,88 @@ def main() -> None:
             mode_confidence_counts=mode_confidence_counts,
             mode_responses_identical_true=mode_responses_identical_true,
             finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
-            **derived_metric_kwargs,
+            **_derived_metric_kwargs(sem_means, sem_counts, vce_means, vce_counts, unc_means, unc_counts),
         )
+        if compute_derived_metrics:
+            write_zero_fill_config_file(config_txt_path(out_path), apply_blockwise_zero_fill(results))
         logging.info("Saved full outputs to %s", out_path)
         return
 
     os.makedirs(individual_root, exist_ok=True)
     none_cache = build_none_cache() if "none" in args.ablation_mode else None
-    per_layer_mode_means: Dict[int, Dict[str, Dict[str, Optional[float]]]] = {}
+    staged_layers = []
     for layer_idx in run_layers:
         layer_dir = os.path.join(individual_root, str(layer_idx))
         os.makedirs(layer_dir, exist_ok=True)
-        layer_out_path = os.path.join(layer_dir, "ablation_results.json")
-        (
-            layer_results,
-            layer_mini_results,
-            layer_mode_means,
-            layer_mode_counts,
-            used_none_cache,
-            layer_identical_true,
-            layer_semantic_similarity_means,
-            layer_semantic_similarity_counts,
-            layer_verbalised_confidence_effect_means,
-            layer_verbalised_confidence_effect_counts,
-            layer_uncertainty_score_means,
-            layer_uncertainty_score_counts,
-        ) = run_one_evaluation([layer_idx], cached_none=none_cache, sentence_transformer=sentence_transformer)
-        if compute_derived_metrics:
-            derived_metric_kwargs = {
-                "mode_semantic_similarity_means": layer_semantic_similarity_means,
-                "mode_semantic_similarity_counts": layer_semantic_similarity_counts,
-                "mode_verbalised_confidence_effect_means": layer_verbalised_confidence_effect_means,
-                "mode_verbalised_confidence_effect_counts": layer_verbalised_confidence_effect_counts,
-                "mode_uncertainty_score_means": layer_uncertainty_score_means,
-                "mode_uncertainty_score_counts": layer_uncertainty_score_counts,
-            }
-        if none_cache is None and used_none_cache["train"] and used_none_cache["validation"]:
-            none_cache = used_none_cache
-        per_layer_mode_means[int(layer_idx)] = layer_mode_means
-        with open(layer_out_path, "w", encoding="utf-8") as f:
-            json.dump(layer_results, f, ensure_ascii=False, indent=2)
-        with open(mini_output_json_path(layer_out_path), "w", encoding="utf-8") as f:
-            json.dump(layer_mini_results, f, ensure_ascii=False, indent=2)
-        write_config_txt(
-            config_txt_path(layer_out_path),
-            args=args,
-            device=device,
-            model_n_layers=int(model.cfg.n_layers),
-            ablate_layers=[layer_idx],
-            prompt_indices=prompt_indices,
-            low_conf_count=len(low_ids),
-            high_conf_count=len(high_ids),
-            h5_example_count=len(examples_h5),
-            mode_confidence_means=layer_mode_means,
-            mode_confidence_counts=layer_mode_counts,
-            mode_responses_identical_true=layer_identical_true,
-            finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
-            **derived_metric_kwargs,
+        staged_layers.append(
+            (
+                os.path.join(layer_dir, "ablation_results.json"),
+                layer_idx,
+                run_one_evaluation([layer_idx], cached_none=none_cache),
+            )
         )
+        if none_cache is None:
+            used_none_cache = staged_layers[-1][2][4]
+            if used_none_cache["train"] and used_none_cache["validation"]:
+                none_cache = used_none_cache
+    del model
+    release_cuda_cache()
+    similarity_scorer = None
+    questions_by_id = None
+    if any(run_out[-1] for _path, _idx, run_out in staged_layers):
+        similarity_scorer, questions_by_id = open_semantic_similarity_scorer(
+            args.semantic_similarity_method,
+            device,
+            args.input_h5,
+        )
+    per_layer_mode_means: Dict[int, Dict[str, Dict[str, Optional[float]]]] = {}
+    try:
+        for layer_out_path, layer_idx, run_out in staged_layers:
+            (
+                layer_results,
+                layer_mini_results,
+                layer_mode_means,
+                layer_mode_counts,
+                _used_none_cache,
+                layer_identical_true,
+                sem_means,
+                sem_counts,
+                vce_means,
+                vce_counts,
+                unc_means,
+                unc_counts,
+            ) = _score_run(run_out, similarity_scorer, questions_by_id)
+            per_layer_mode_means[int(layer_idx)] = layer_mode_means
+            with open(layer_out_path, "w", encoding="utf-8") as f:
+                json.dump(layer_results, f, ensure_ascii=False, indent=2)
+            with open(mini_output_json_path(layer_out_path), "w", encoding="utf-8") as f:
+                json.dump(layer_mini_results, f, ensure_ascii=False, indent=2)
+            write_config_txt(
+                config_txt_path(layer_out_path),
+                args=args,
+                device=device,
+                model_n_layers=language_model_n_layers,
+                ablate_layers=[layer_idx],
+                prompt_indices=prompt_indices,
+                low_conf_count=len(low_ids),
+                high_conf_count=len(high_ids),
+                h5_example_count=len(examples_h5),
+                mode_confidence_means=layer_mode_means,
+                mode_confidence_counts=layer_mode_counts,
+                mode_responses_identical_true=layer_identical_true,
+                finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+                **_derived_metric_kwargs(
+                    sem_means, sem_counts, vce_means, vce_counts, unc_means, unc_counts
+                ),
+            )
+            if compute_derived_metrics:
+                write_zero_fill_config_file(
+                    config_txt_path(layer_out_path),
+                    apply_blockwise_zero_fill(layer_results),
+                )
+    finally:
+        if similarity_scorer is not None:
+            similarity_scorer.close()
 
     summary_path = os.path.join(individual_root, "mode_confidence_summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:

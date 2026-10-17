@@ -17,10 +17,10 @@ uptime
 
 python3 ./ans_gen/generate_answers_h5.py \
   --model_name google/gemma-3-12b-it \
-  --num_samples 3000 \
+  --num_samples 200 \
   --answerable_only \
   --collect_attn_block_embeddings \
   --collect_mlp_block_embeddings \
   --collect_qkvo_embeddings \
   --collect_concat_embeddings \
-  --dataset math
+  --dataset trivia_qa

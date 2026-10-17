@@ -66,10 +66,18 @@ def _read_component_probability_span(
     expected_probability_tokens: int,
     ex_id: str,
     component: str,
+    linguistic_confidence_prompt: bool = False,
 ) -> np.ndarray:
     """Return ``(n_selected_layers, T, d_model)`` for one example/component."""
     n_tok = _h5_list_length(tok_group)
-    if not _is_expected_or_plus_two(n_tok, expected_probability_tokens):
+    if linguistic_confidence_prompt:
+        if n_tok < expected_probability_tokens:
+            raise ValueError(
+                f"Example {ex_id} embeddings_probability/{component} len={n_tok}; "
+                f"expected at least {expected_probability_tokens} "
+                "(linguistic confidence span)."
+            )
+    elif not _is_expected_or_plus_two(n_tok, expected_probability_tokens):
         raise ValueError(
             f"Example {ex_id} embeddings_probability/{component} len={n_tok}; "
             f"expected {expected_probability_tokens} or {expected_probability_tokens + 2}."
@@ -118,6 +126,7 @@ def compute_probability_subblock_group_means_streaming(
     low_conf_threshold: float,
     high_conf_threshold: float,
     mean_from_low_confidence: bool,
+    linguistic_confidence_prompt: bool = False,
     log_every: int = 50,
 ) -> Tuple[Dict[str, Dict[str, np.ndarray]], set[str], set[str], int]:
     """Stream H5 and compute probability-span attn/mlp means for one confidence group.
@@ -202,6 +211,7 @@ def compute_probability_subblock_group_means_streaming(
                         expected_probability_tokens=expected_probability_tokens,
                         ex_id=ex_id_str,
                         component=component,
+                        linguistic_confidence_prompt=linguistic_confidence_prompt,
                     )
                     if sums[component] is None:
                         sums[component] = np.zeros(span.shape, dtype=np.float64)

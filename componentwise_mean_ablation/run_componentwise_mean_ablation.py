@@ -7,9 +7,11 @@ subblocks at mode-dependent token spans during greedy decoding.
 attn ln1 from H5 res, and MLP RMSNorm in) or output (hook_z / concat,
 hook_attn_out from H5 attn after ln1_post on sandwich Gemma, and hook_mlp_out).
 
-Means are computed separately for high- and low-confidence H5 examples, then
-applied cross-group: high-confidence generations receive the low-confidence
-mean, and vice versa. All units listed in --ablate_heads are patched together.
+Means are computed separately for high- and low-confidence H5 examples. By
+default they are applied cross-group: high-confidence generations receive the
+low-confidence mean, and vice versa. --ablate_with_same_confidence instead
+patches each group with its own mean (within-group control). All units listed
+in --ablate_heads are patched together.
 """
 
 from __future__ import annotations
@@ -36,20 +38,12 @@ if str(REPO_ROOT) not in sys.path:
 
 from blockwise_zero_ablation.run_blockwise_zero_ablation import (
     BRIEF_PROMPTS,
-    CONFIDENCE_PROMPT,
     _absolute_all_pre_guess_positions,
     _absolute_guess_span_positions,
-    _absolute_guess_then_guess_probability_positions,
-    _absolute_pre_probability_positions,
-    _absolute_prob_except_last_token_positions,
-    _absolute_prob_last_token_only_positions,
-    _absolute_prob_positions,
-    _absolute_prob_positions_at_row_indices,
     construct_fewshot_prompt_from_indices,
     greedy_generate,
     load_eval_dataset,
     parse_ablate_layers,
-    parse_mode_confidence_from_response,
     split_answerable_indices,
 )
 from headwise_mean_ablation.run_headwise_mean_ablation import (
@@ -86,12 +80,43 @@ from layerwise_mean_ablation.run_mean_ablation import (
     probability_row_indices_for_mode,
     validate_last_a_panl_and_pc_mode,
 )
-
+from semantic_similarity_metrics import (
+    add_semantic_similarity_method_arg,
+    open_semantic_similarity_scorer,
+    release_cuda_cache,
+    semantic_similarity_config_lines,
+    semantic_similarity_model_name,
+)
+from mass_mean_probe.run_mass_mean_probe import (
+    CONFIDENCE_PROMPT_LINGUISTIC,
+    CONFIDENCE_PROMPT_NUMERIC,
+    SEMANTIC_SIMILARITY_MODES,
+    _absolute_pre_probability_positions,
+    _absolute_prob_last_token_only,
+    _absolute_prob_marker_except_last_token,
+    _absolute_prob_positions,
+    _absolute_prob_positions_at_row_indices,
+    _mean_and_count,
+    apply_componentwise_zero_fill,
+    compute_uncertainty_score,
+    compute_verbalised_confidence_effect,
+    write_zero_fill_config_file,
+    configure_prefix_tokens_for_model as configure_mass_mean_prefix_tokens,
+    parse_mode_confidence_from_response,
+    parse_semantic_answer_from_response,
+)
+import mass_mean_probe.run_mass_mean_probe as _mass_mean_probe_mod
 
 OPPOSITE_GROUP = {
     "low_confidence": "high_confidence",
     "high_confidence": "low_confidence",
 }
+
+
+def mean_source_for_group(group_name: str, ablate_with_same_confidence: bool) -> str:
+    return group_name if ablate_with_same_confidence else OPPOSITE_GROUP[group_name]
+
+
 SCALAR_SOURCES = ("prompt_mean", "sem_answer_mean", "probability_value_mean")
 LIST_SOURCES = ("guess", "probability")
 ALL_SOURCES = SCALAR_SOURCES + LIST_SOURCES
@@ -121,11 +146,19 @@ ABLATION_MODES_DEFAULT = [
     "guess_then_guess_probability_mean_replace",
     "probability_value_mean_replace",
     "current_generated_token_mean_replace",
+    "generated_tokens_mean_replace",
 ]
 MODES_NEEDING_PROBABILITY_EXTRA = frozenset(
     {
         "extended_probability_last_token_mean_replace",
         "probability_pre_and_post_period_digit_mean_replace",
+    }
+)
+MODES_INCOMPATIBLE_WITH_LINGUISTIC = frozenset(
+    {
+        "extended_probability_last_token_mean_replace",
+        "probability_pre_and_post_period_digit_mean_replace",
+        "probability_value_mean_replace",
     }
 )
 
@@ -162,6 +195,61 @@ def attach_output_log(run_root: str) -> str:
     )
     logging.getLogger().addHandler(file_handler)
     return output_log_path
+
+
+def _empty_derived_metric_lists(ablation_modes: Sequence[str]) -> Dict[str, List[float]]:
+    return {mode_name: [] for mode_name in ablation_modes if mode_name != "none"}
+
+
+def _append_derived_metric_lines(
+    lines: List[str],
+    *,
+    ablation_modes: Sequence[str],
+    semantic_similarity_values: Dict[str, List[float]],
+    verbalised_confidence_effect_values: Dict[str, List[float]],
+    uncertainty_score_values: Dict[str, List[float]],
+) -> None:
+    for mode_name in ablation_modes:
+        if mode_name == "none":
+            continue
+        sem_mean, sem_count = _mean_and_count(semantic_similarity_values.get(mode_name, []))
+        vce_mean, vce_count = _mean_and_count(verbalised_confidence_effect_values.get(mode_name, []))
+        unc_mean, unc_count = _mean_and_count(uncertainty_score_values.get(mode_name, []))
+        if sem_mean is None and vce_mean is None and unc_mean is None:
+            continue
+        parts = [f"{mode_name}__{ABLATION_UNIT_KEY}"]
+        if sem_mean is not None:
+            parts.append(f"semantic_similarity={sem_mean:.6f} ({sem_count})")
+        if vce_mean is not None:
+            parts.append(f"verbalised_confidence_effect={vce_mean:.6f} ({vce_count})")
+        if unc_mean is not None:
+            parts.append(f"uncertainty_score={unc_mean:.6f} ({unc_count})")
+        lines.append(" ".join(parts))
+
+
+def _attach_derived_metrics_to_mode_summary(
+    modes_out: Dict[str, dict],
+    *,
+    semantic_similarity_values: Dict[str, List[float]],
+    verbalised_confidence_effect_values: Dict[str, List[float]],
+    uncertainty_score_values: Dict[str, List[float]],
+) -> Dict[str, dict]:
+    for mode_name, entry in modes_out.items():
+        if mode_name == "none":
+            continue
+        sem_mean, sem_count = _mean_and_count(semantic_similarity_values.get(mode_name, []))
+        vce_mean, vce_count = _mean_and_count(verbalised_confidence_effect_values.get(mode_name, []))
+        unc_mean, unc_count = _mean_and_count(uncertainty_score_values.get(mode_name, []))
+        if sem_mean is not None or sem_count:
+            entry["mean_semantic_similarity"] = sem_mean
+            entry["semantic_similarity_sample_count"] = sem_count
+        if vce_mean is not None or vce_count:
+            entry["mean_verbalised_confidence_effect"] = vce_mean
+            entry["verbalised_confidence_effect_sample_count"] = vce_count
+        if unc_mean is not None or unc_count:
+            entry["mean_uncertainty_score"] = unc_mean
+            entry["uncertainty_score_sample_count"] = unc_count
+    return modes_out
 
 
 def mode_to_output_key(mode: str) -> str:
@@ -311,6 +399,40 @@ def _d_model_row(
     return np.asarray(row, dtype=np.float32)
 
 
+def _h5_probability_token_budget(
+    *,
+    expected_probability_tokens: int,
+    expected_confidence_tokens: int,
+    linguistic_confidence_prompt: bool,
+) -> int:
+    return expected_confidence_tokens if linguistic_confidence_prompt else expected_probability_tokens
+
+
+def _split_probability_rows(
+    raw,
+    *,
+    field_name: str,
+    component: str,
+    budget: int,
+    linguistic_confidence_prompt: bool,
+) -> Tuple[List[np.ndarray], Optional[List[np.ndarray]]]:
+    if not isinstance(raw, list):
+        raise ValueError(f"{field_name}/{component} is not a list.")
+    if linguistic_confidence_prompt:
+        if len(raw) < budget:
+            raise ValueError(
+                f"{field_name}/{component} len={len(raw)}; expected at least {budget} "
+                "(linguistic confidence span)."
+            )
+        return raw[:budget], None
+    if not _is_expected_or_plus_two(len(raw), budget):
+        raise ValueError(
+            f"{field_name}/{component} len={len(raw)}; expected {budget} or {budget + 2}."
+        )
+    extra_tokens = raw[budget:] if len(raw) == budget + 2 else None
+    return raw[:budget], extra_tokens
+
+
 def _split_source_token_list(
     raw,
     *,
@@ -319,6 +441,8 @@ def _split_source_token_list(
     component: str,
     expected_guess_tokens: int,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int = 5,
+    linguistic_confidence_prompt: bool = False,
 ) -> Tuple[List[np.ndarray], Optional[List[np.ndarray]]]:
     extra_tokens: Optional[List[np.ndarray]] = None
     if source_name == "guess":
@@ -329,17 +453,18 @@ def _split_source_token_list(
             )
         return raw, None
     if source_name == "probability":
-        if not isinstance(raw, list) or not _is_expected_or_plus_two(
-            len(raw), expected_probability_tokens
-        ):
-            raise ValueError(
-                f"{field_name}/{component} len={0 if not isinstance(raw, list) else len(raw)}; "
-                f"expected {expected_probability_tokens} or {expected_probability_tokens + 2}."
-            )
-        tokens = raw[:expected_probability_tokens]
-        if len(raw) == expected_probability_tokens + 2:
-            extra_tokens = raw[expected_probability_tokens:]
-        return tokens, extra_tokens
+        budget = _h5_probability_token_budget(
+            expected_probability_tokens=expected_probability_tokens,
+            expected_confidence_tokens=expected_confidence_tokens,
+            linguistic_confidence_prompt=linguistic_confidence_prompt,
+        )
+        return _split_probability_rows(
+            raw,
+            field_name=field_name,
+            component=component,
+            budget=budget,
+            linguistic_confidence_prompt=linguistic_confidence_prompt,
+        )
     return [raw], None
 
 
@@ -354,6 +479,8 @@ def _extract_qkv_source_arrays(
     d_head: int,
     expected_guess_tokens: int,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int = 5,
+    linguistic_confidence_prompt: bool = False,
 ) -> Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray], Dict[int, np.ndarray], Optional[Dict[str, Dict[int, np.ndarray]]]]:
     field_name = SOURCE_TO_FIELD[source_name]
     expect_list = source_name in LIST_SOURCES
@@ -377,27 +504,29 @@ def _extract_qkv_source_arrays(
             raise ValueError(f"{field_name}/v len mismatch; expected {expected_guess_tokens}.")
         q_tokens, k_tokens, v_tokens = q_raw, k_raw, v_raw
     elif source_name == "probability":
-        if not isinstance(q_raw, list) or not _is_expected_or_plus_two(len(q_raw), expected_probability_tokens):
-            raise ValueError(
-                f"{field_name}/q len={0 if not isinstance(q_raw, list) else len(q_raw)}; "
-                f"expected {expected_probability_tokens} or {expected_probability_tokens + 2}."
-            )
+        budget = _h5_probability_token_budget(
+            expected_probability_tokens=expected_probability_tokens,
+            expected_confidence_tokens=expected_confidence_tokens,
+            linguistic_confidence_prompt=linguistic_confidence_prompt,
+        )
+        q_tokens, extra_q_tokens_opt = _split_probability_rows(
+            q_raw,
+            field_name=field_name,
+            component="q",
+            budget=budget,
+            linguistic_confidence_prompt=linguistic_confidence_prompt,
+        )
         if not isinstance(k_raw, list) or len(k_raw) != len(q_raw):
             raise ValueError(f"{field_name}/k length {0 if not isinstance(k_raw, list) else len(k_raw)} != q.")
         if not isinstance(v_raw, list) or len(v_raw) != len(q_raw):
             raise ValueError(f"{field_name}/v length {0 if not isinstance(v_raw, list) else len(v_raw)} != q.")
-        q_tokens = q_raw[:expected_probability_tokens]
-        k_tokens = k_raw[:expected_probability_tokens]
-        v_tokens = v_raw[:expected_probability_tokens]
-        if len(q_raw) == expected_probability_tokens + 2:
-            extra = {
-                "q": {},
-                "k": {},
-                "v": {},
-            }
-            extra_q_tokens = q_raw[expected_probability_tokens:]
-            extra_k_tokens = k_raw[expected_probability_tokens:]
-            extra_v_tokens = v_raw[expected_probability_tokens:]
+        k_tokens = k_raw[: len(q_tokens)]
+        v_tokens = v_raw[: len(q_tokens)]
+        extra_q_tokens = extra_q_tokens_opt or []
+        extra_k_tokens = k_raw[budget:] if extra_q_tokens_opt is not None else []
+        extra_v_tokens = v_raw[budget:] if extra_q_tokens_opt is not None else []
+        if extra_q_tokens_opt is not None:
+            extra = {"q": {}, "k": {}, "v": {}}
     else:
         q_tokens, k_tokens, v_tokens = [q_raw], [k_raw], [v_raw]
         extra_q_tokens = extra_k_tokens = extra_v_tokens = []
@@ -451,6 +580,8 @@ def _extract_z_source_arrays(
     d_head: int,
     expected_guess_tokens: int,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int = 5,
+    linguistic_confidence_prompt: bool = False,
 ) -> Tuple[Dict[int, np.ndarray], Optional[Dict[int, np.ndarray]]]:
     field_name = SOURCE_TO_FIELD[source_name]
     expect_list = source_name in LIST_SOURCES
@@ -461,7 +592,7 @@ def _extract_z_source_arrays(
         field_name=field_name,
         component="concat",
         expected_guess_tokens=expected_guess_tokens,
-        expected_probability_tokens=expected_probability_tokens,
+        expected_probability_tokens=expected_probability_tokens, expected_confidence_tokens=expected_confidence_tokens, linguistic_confidence_prompt=linguistic_confidence_prompt,
     )
     extra: Optional[Dict[int, np.ndarray]] = None if extra_tokens is None else {}
     z_out: Dict[int, np.ndarray] = {}
@@ -489,6 +620,8 @@ def _extract_d_model_source_arrays(
     d_model: int,
     expected_guess_tokens: int,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int = 5,
+    linguistic_confidence_prompt: bool = False,
     component: str,
 ) -> Tuple[Dict[int, np.ndarray], Optional[Dict[int, np.ndarray]]]:
     field_name = SOURCE_TO_FIELD[source_name]
@@ -500,7 +633,7 @@ def _extract_d_model_source_arrays(
         field_name=field_name,
         component=component,
         expected_guess_tokens=expected_guess_tokens,
-        expected_probability_tokens=expected_probability_tokens,
+        expected_probability_tokens=expected_probability_tokens, expected_confidence_tokens=expected_confidence_tokens, linguistic_confidence_prompt=linguistic_confidence_prompt,
     )
     extra: Optional[Dict[int, np.ndarray]] = None if extra_tokens is None else {}
     out: Dict[int, np.ndarray] = {}
@@ -527,6 +660,8 @@ def _extract_mlp_source_arrays(
     d_model: int,
     expected_guess_tokens: int,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int = 5,
+    linguistic_confidence_prompt: bool = False,
     intervention_site: str = "input",
 ) -> Tuple[Dict[int, np.ndarray], Optional[Dict[int, np.ndarray]]]:
     field_name = SOURCE_TO_FIELD[source_name]
@@ -539,6 +674,8 @@ def _extract_mlp_source_arrays(
             d_model=d_model,
             expected_guess_tokens=expected_guess_tokens,
             expected_probability_tokens=expected_probability_tokens,
+            expected_confidence_tokens=expected_confidence_tokens,
+            linguistic_confidence_prompt=linguistic_confidence_prompt,
             component="mlp",
         )
 
@@ -558,23 +695,26 @@ def _extract_mlp_source_arrays(
             raise ValueError(f"{field_name}/attn len mismatch; expected {expected_guess_tokens}.")
         res_tokens, attn_tokens = res_raw, attn_raw
     elif source_name == "probability":
-        if not isinstance(res_raw, list) or not _is_expected_or_plus_two(
-            len(res_raw), expected_probability_tokens
-        ):
-            raise ValueError(
-                f"{field_name}/res len={0 if not isinstance(res_raw, list) else len(res_raw)}; "
-                f"expected {expected_probability_tokens} or {expected_probability_tokens + 2}."
-            )
+        res_tokens, extra_res_opt = _split_probability_rows(
+            res_raw,
+            field_name=field_name,
+            component="res",
+            budget=_h5_probability_token_budget(
+                expected_probability_tokens=expected_probability_tokens,
+                expected_confidence_tokens=expected_confidence_tokens,
+                linguistic_confidence_prompt=linguistic_confidence_prompt,
+            ),
+            linguistic_confidence_prompt=linguistic_confidence_prompt,
+        )
         if not isinstance(attn_raw, list) or len(attn_raw) != len(res_raw):
             raise ValueError(
                 f"{field_name}/attn length {0 if not isinstance(attn_raw, list) else len(attn_raw)} != res."
             )
-        res_tokens = res_raw[:expected_probability_tokens]
-        attn_tokens = attn_raw[:expected_probability_tokens]
-        if len(res_raw) == expected_probability_tokens + 2:
+        attn_tokens = attn_raw[: len(res_tokens)]
+        extra_res = extra_res_opt or []
+        extra_attn = attn_raw[len(res_tokens):] if extra_res_opt is not None else []
+        if extra_res_opt is not None:
             extra = {}
-            extra_res = res_raw[expected_probability_tokens:]
-            extra_attn = attn_raw[expected_probability_tokens:]
     else:
         res_tokens, attn_tokens = [res_raw], [attn_raw]
 
@@ -606,6 +746,8 @@ def stream_group_means_and_eval_ids(
     d_model: int,
     expected_guess_tokens: int,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int = 5,
+    linguistic_confidence_prompt: bool = False,
     low_conf_threshold: float,
     high_conf_threshold: float,
     split_id_to_index: Dict[str, Dict[str, int]],
@@ -738,7 +880,7 @@ def stream_group_means_and_eval_ids(
                             n_heads=n_heads,
                             d_head=d_head,
                             expected_guess_tokens=expected_guess_tokens,
-                            expected_probability_tokens=expected_probability_tokens,
+                            expected_probability_tokens=expected_probability_tokens, expected_confidence_tokens=expected_confidence_tokens, linguistic_confidence_prompt=linguistic_confidence_prompt,
                         )
                         z_by_source[source_name] = z_out
                         if extra is not None:
@@ -762,7 +904,7 @@ def stream_group_means_and_eval_ids(
                             n_kv_heads=n_kv_heads,
                             d_head=d_head,
                             expected_guess_tokens=expected_guess_tokens,
-                            expected_probability_tokens=expected_probability_tokens,
+                            expected_probability_tokens=expected_probability_tokens, expected_confidence_tokens=expected_confidence_tokens, linguistic_confidence_prompt=linguistic_confidence_prompt,
                         )
                         q_by_source[source_name] = q_out
                         k_by_source[source_name] = k_out
@@ -784,7 +926,7 @@ def stream_group_means_and_eval_ids(
                             mlp_layers=mlp_layers,
                             d_model=d_model,
                             expected_guess_tokens=expected_guess_tokens,
-                            expected_probability_tokens=expected_probability_tokens,
+                            expected_probability_tokens=expected_probability_tokens, expected_confidence_tokens=expected_confidence_tokens, linguistic_confidence_prompt=linguistic_confidence_prompt,
                             intervention_site=intervention_site,
                         )
                         mlp_by_source[source_name] = mlp_out
@@ -812,7 +954,7 @@ def stream_group_means_and_eval_ids(
                             layers=attn_block_layers,
                             d_model=d_model,
                             expected_guess_tokens=expected_guess_tokens,
-                            expected_probability_tokens=expected_probability_tokens,
+                            expected_probability_tokens=expected_probability_tokens, expected_confidence_tokens=expected_confidence_tokens, linguistic_confidence_prompt=linguistic_confidence_prompt,
                             component=attn_block_component,
                         )
                         attn_block_by_source[source_name] = attn_out
@@ -1127,6 +1269,9 @@ def _positions_and_replacements_for_mode(
     source_means: Dict[str, torch.Tensor],
     expected_guess_tokens: int,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int = 5,
+    linguistic_confidence_prompt: bool = False,
+    broadcast_probability_first_token: bool = False,
 ) -> Tuple[List[int], List[torch.Tensor]]:
     prompt_mean = source_means["prompt_mean"]
     guess = source_means["guess"]
@@ -1135,32 +1280,62 @@ def _positions_and_replacements_for_mode(
     probability_value_mean = source_means["probability_value_mean"]
     probability_extra = source_means.get("probability_extra")
 
+    def _broadcast_or(
+        positions: List[int],
+        vectors: List[torch.Tensor],
+    ) -> Tuple[List[int], List[torch.Tensor]]:
+        if not positions:
+            return [], []
+        if broadcast_probability_first_token:
+            if int(probability.shape[0]) < 1:
+                raise ValueError("Expected at least one probability row to broadcast.")
+            return positions, [probability[0]] * len(positions)
+        return positions, vectors
+
     if mode == "probability_tokens_mean_replace":
         positions = _absolute_prob_positions(
-            prompt_len, decoded_tokens, expected_probability_tokens=expected_probability_tokens
+            prompt_len,
+            decoded_tokens,
+            expected_probability_tokens=expected_probability_tokens,
+            expected_confidence_tokens=expected_confidence_tokens,
+            linguistic_confidence_prompt=linguistic_confidence_prompt,
         )
+        if broadcast_probability_first_token:
+            return _broadcast_or(positions, [])
         n = min(len(positions), int(probability.shape[0]))
         return positions[:n], [probability[i] for i in range(n)]
 
     if mode in PROBABILITY_ROW_INDEX_MODES:
-        row_indices = probability_row_indices_for_mode(mode, model_name)
+        row_indices = probability_row_indices_for_mode(
+            mode,
+            model_name,
+            linguistic_confidence_prompt=linguistic_confidence_prompt,
+        )
         positions = _absolute_prob_positions_at_row_indices(
             prompt_len,
             decoded_tokens,
             row_indices,
             expected_probability_tokens=expected_probability_tokens,
+            expected_confidence_tokens=expected_confidence_tokens,
+            linguistic_confidence_prompt=linguistic_confidence_prompt,
         )
         if not positions:
             return [], []
+        if broadcast_probability_first_token:
+            return _broadcast_or(positions, [])
         return positions, [probability[i] for i in row_indices]
 
     if mode == "probability_last_token_mean_replace":
-        positions = _absolute_prob_last_token_only_positions(
-            prompt_len, decoded_tokens, expected_probability_tokens=expected_probability_tokens
+        positions = _absolute_prob_last_token_only(
+            prompt_len,
+            decoded_tokens,
+            expected_probability_tokens=expected_probability_tokens,
+            expected_confidence_tokens=expected_confidence_tokens,
+            linguistic_confidence_prompt=linguistic_confidence_prompt,
         )
         if not positions:
             return [], []
-        return [positions[0]], [probability[-1]]
+        return _broadcast_or([positions[0]], [probability[-1]])
 
     if mode == "extended_probability_last_token_mean_replace":
         positions = _absolute_extended_prob_last_token_only_positions(
@@ -1168,16 +1343,20 @@ def _positions_and_replacements_for_mode(
         )
         if not positions or probability_extra is None or int(probability_extra.shape[0]) < 2:
             return [], []
-        return [positions[0]], [probability_extra[1]]
+        return _broadcast_or([positions[0]], [probability_extra[1]])
 
     if mode == "probability_pre_and_post_period_digit_mean_replace":
-        last_pos = _absolute_prob_last_token_only_positions(
-            prompt_len, decoded_tokens, expected_probability_tokens=expected_probability_tokens
+        last_pos = _absolute_prob_last_token_only(
+            prompt_len,
+            decoded_tokens,
+            expected_probability_tokens=expected_probability_tokens,
+            expected_confidence_tokens=expected_confidence_tokens,
+            linguistic_confidence_prompt=linguistic_confidence_prompt,
         )
         extra_pos = _absolute_extended_prob_last_token_only_positions(
             prompt_len, decoded_tokens, expected_probability_tokens=expected_probability_tokens
         )
-        positions: List[int] = []
+        positions = []
         vectors: List[torch.Tensor] = []
         if last_pos:
             positions.append(last_pos[0])
@@ -1185,12 +1364,18 @@ def _positions_and_replacements_for_mode(
         if extra_pos and probability_extra is not None and int(probability_extra.shape[0]) >= 2:
             positions.append(extra_pos[0])
             vectors.append(probability_extra[1])
-        return positions, vectors
+        return _broadcast_or(positions, vectors)
 
     if mode == "probability_span_except_last_token_mean_replace":
-        positions = _absolute_prob_except_last_token_positions(
-            prompt_len, decoded_tokens, expected_probability_tokens=expected_probability_tokens
+        positions = _absolute_prob_marker_except_last_token(
+            prompt_len,
+            decoded_tokens,
+            expected_probability_tokens=expected_probability_tokens,
+            expected_confidence_tokens=expected_confidence_tokens,
+            linguistic_confidence_prompt=linguistic_confidence_prompt,
         )
+        if broadcast_probability_first_token:
+            return _broadcast_or(positions, [])
         n = min(len(positions), max(0, int(probability.shape[0]) - 1))
         return positions[:n], [probability[i] for i in range(n)]
 
@@ -1198,6 +1383,8 @@ def _positions_and_replacements_for_mode(
         positions = _absolute_guess_span_positions(
             prompt_len, decoded_tokens, expected_guess_tokens=expected_guess_tokens
         )
+        if broadcast_probability_first_token:
+            return _broadcast_or(positions[: min(len(positions), int(guess.shape[0]))], [])
         n = min(len(positions), int(guess.shape[0]))
         return positions[:n], [guess[i] for i in range(n)]
 
@@ -1218,14 +1405,14 @@ def _positions_and_replacements_for_mode(
         for i in range(n_guess):
             positions.append(guess_positions[i])
             vectors.append(guess[i])
-        return positions, vectors
+        return _broadcast_or(positions, vectors)
 
     if mode == "all_pre_probability_tokens_mean_replace":
         spans = _absolute_pre_probability_positions(
             prompt_len,
             decoded_tokens,
             expected_guess_tokens=expected_guess_tokens,
-            expected_probability_tokens=expected_probability_tokens,
+            expected_probability_tokens=expected_probability_tokens, expected_confidence_tokens=expected_confidence_tokens, linguistic_confidence_prompt=linguistic_confidence_prompt,
         )
         if spans is None:
             return [], []
@@ -1241,6 +1428,9 @@ def _positions_and_replacements_for_mode(
         for pos in spans["sem_answer"]:
             positions.append(pos)
             vectors.append(sem_answer_mean)
+        if broadcast_probability_first_token:
+            positions.extend(spans["probability"])
+            return _broadcast_or(positions, [])
         n_prob = min(len(spans["probability"]), int(probability.shape[0]))
         for i in range(n_prob):
             positions.append(spans["probability"][i])
@@ -1251,20 +1441,32 @@ def _positions_and_replacements_for_mode(
         guess_positions = _absolute_guess_span_positions(
             prompt_len, decoded_tokens, expected_guess_tokens=expected_guess_tokens
         )
-        all_positions = _absolute_guess_then_guess_probability_positions(
-            prompt_len,
-            decoded_tokens,
-            expected_guess_tokens=expected_guess_tokens,
-            expected_probability_tokens=expected_probability_tokens,
-        )
-        prob_positions = all_positions[len(guess_positions) :]
         positions = []
         vectors = []
         n_guess = min(len(guess_positions), int(guess.shape[0]))
         for i in range(n_guess):
             positions.append(guess_positions[i])
             vectors.append(guess[i])
-        n_prob = min(len(prob_positions), int(probability.shape[0]))
+        prob_positions = _absolute_prob_positions(
+            prompt_len,
+            decoded_tokens,
+            expected_probability_tokens=expected_probability_tokens,
+            expected_confidence_tokens=expected_confidence_tokens,
+            linguistic_confidence_prompt=linguistic_confidence_prompt,
+        )
+        if broadcast_probability_first_token:
+            positions.extend(prob_positions)
+            return _broadcast_or(positions, [])
+        if linguistic_confidence_prompt:
+            n_pos = len(prob_positions)
+            if n_pos > int(probability.shape[0]):
+                raise ValueError(
+                    f"Linguistic confidence span has {n_pos} token positions but H5 mean has "
+                    f"{int(probability.shape[0])} probability rows."
+                )
+            n_prob = n_pos
+        else:
+            n_prob = min(len(prob_positions), int(probability.shape[0]))
         for i in range(n_prob):
             positions.append(prob_positions[i])
             vectors.append(probability[i])
@@ -1281,13 +1483,21 @@ def _positions_and_replacements_for_mode(
         if not positions:
             return [], []
         vectors = [probability[-1]] + [probability_value_mean] * (len(positions) - 1)
-        return positions, vectors
+        return _broadcast_or(positions, vectors)
 
     if mode == "current_generated_token_mean_replace":
         current_abs_pos = prompt_len + len(decoded_tokens) - 1
         if current_abs_pos < 0:
             return [], []
-        return [current_abs_pos], [probability[-1]]
+        return _broadcast_or([current_abs_pos], [probability[-1]])
+
+    if mode == "generated_tokens_mean_replace":
+        seq_len = prompt_len + len(decoded_tokens)
+        if seq_len <= 0 or int(probability.shape[0]) < 1:
+            return [], []
+        positions = list(range(prompt_len - 1, seq_len))
+        vec = probability[0]
+        return positions, [vec] * len(positions)
 
     raise ValueError(f"Unsupported mode for mean replacement: {mode!r}")
 
@@ -1305,6 +1515,8 @@ def build_qkv_input_mean_replace_hooks(
     v_means: Dict[int, Dict[int, Dict[str, torch.Tensor]]],
     expected_guess_tokens: int,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int = 5,
+    linguistic_confidence_prompt: bool = False,
 ) -> List[Tuple[str, Callable]]:
     hooks: List[Tuple[str, Callable]] = []
 
@@ -1341,7 +1553,7 @@ def build_qkv_input_mean_replace_hooks(
                     decoded_tokens=decoded_tokens,
                     source_means=head_means,
                     expected_guess_tokens=expected_guess_tokens,
-                    expected_probability_tokens=expected_probability_tokens,
+                    expected_probability_tokens=expected_probability_tokens, expected_confidence_tokens=expected_confidence_tokens, linguistic_confidence_prompt=linguistic_confidence_prompt,
                 )
                 for abs_pos, vector in zip(positions, vectors):
                     if 0 <= abs_pos < activation.shape[1]:
@@ -1434,6 +1646,8 @@ def mlp_input_mean_replace_pre_hooks(
     mlp_means: Dict[int, Dict[str, torch.Tensor]],
     expected_guess_tokens: int,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int = 5,
+    linguistic_confidence_prompt: bool = False,
 ) -> Iterator[None]:
     handles = []
 
@@ -1450,7 +1664,7 @@ def mlp_input_mean_replace_pre_hooks(
                 decoded_tokens=decoded_tokens_provider(),
                 source_means=layer_means,
                 expected_guess_tokens=expected_guess_tokens,
-                expected_probability_tokens=expected_probability_tokens,
+                expected_probability_tokens=expected_probability_tokens, expected_confidence_tokens=expected_confidence_tokens, linguistic_confidence_prompt=linguistic_confidence_prompt,
             )
             if not positions:
                 return None
@@ -1494,6 +1708,8 @@ def attn_input_mean_replace_pre_hooks(
     attn_block_means: Dict[int, Dict[str, torch.Tensor]],
     expected_guess_tokens: int,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int = 5,
+    linguistic_confidence_prompt: bool = False,
 ) -> Iterator[None]:
     handles = []
 
@@ -1510,7 +1726,7 @@ def attn_input_mean_replace_pre_hooks(
                 decoded_tokens=decoded_tokens_provider(),
                 source_means=layer_means,
                 expected_guess_tokens=expected_guess_tokens,
-                expected_probability_tokens=expected_probability_tokens,
+                expected_probability_tokens=expected_probability_tokens, expected_confidence_tokens=expected_confidence_tokens, linguistic_confidence_prompt=linguistic_confidence_prompt,
             )
             if not positions:
                 return None
@@ -1552,6 +1768,8 @@ def build_z_output_mean_replace_hooks(
     z_means: Dict[int, Dict[int, Dict[str, torch.Tensor]]],
     expected_guess_tokens: int,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int = 5,
+    linguistic_confidence_prompt: bool = False,
 ) -> List[Tuple[str, Callable]]:
     hooks: List[Tuple[str, Callable]] = []
 
@@ -1587,7 +1805,7 @@ def build_z_output_mean_replace_hooks(
                     decoded_tokens=decoded_tokens,
                     source_means=head_means,
                     expected_guess_tokens=expected_guess_tokens,
-                    expected_probability_tokens=expected_probability_tokens,
+                    expected_probability_tokens=expected_probability_tokens, expected_confidence_tokens=expected_confidence_tokens, linguistic_confidence_prompt=linguistic_confidence_prompt,
                 )
                 for abs_pos, vector in zip(positions, vectors):
                     if 0 <= abs_pos < activation.shape[1]:
@@ -1633,6 +1851,8 @@ def build_mlp_output_mean_replace_hooks(
     mlp_means: Dict[int, Dict[str, torch.Tensor]],
     expected_guess_tokens: int,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int = 5,
+    linguistic_confidence_prompt: bool = False,
 ) -> List[Tuple[str, Callable]]:
     hooks: List[Tuple[str, Callable]] = []
 
@@ -1646,7 +1866,7 @@ def build_mlp_output_mean_replace_hooks(
                 decoded_tokens=decoded_tokens_provider(),
                 source_means=layer_means,
                 expected_guess_tokens=expected_guess_tokens,
-                expected_probability_tokens=expected_probability_tokens,
+                expected_probability_tokens=expected_probability_tokens, expected_confidence_tokens=expected_confidence_tokens, linguistic_confidence_prompt=linguistic_confidence_prompt,
             )
             if not positions:
                 return activation
@@ -1687,6 +1907,8 @@ def build_attn_output_mean_replace_hooks(
     attn_block_means: Dict[int, Dict[str, torch.Tensor]],
     expected_guess_tokens: int,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int = 5,
+    linguistic_confidence_prompt: bool = False,
 ) -> List[Tuple[str, Callable]]:
     hooks: List[Tuple[str, Callable]] = []
 
@@ -1700,7 +1922,7 @@ def build_attn_output_mean_replace_hooks(
                 decoded_tokens=decoded_tokens_provider(),
                 source_means=layer_means,
                 expected_guess_tokens=expected_guess_tokens,
-                expected_probability_tokens=expected_probability_tokens,
+                expected_probability_tokens=expected_probability_tokens, expected_confidence_tokens=expected_confidence_tokens, linguistic_confidence_prompt=linguistic_confidence_prompt,
             )
             if not positions:
                 return activation
@@ -1746,6 +1968,8 @@ def greedy_generate_componentwise_mean_ablated(
     source_means: Dict[str, object],
     expected_guess_tokens: int,
     expected_probability_tokens: int,
+    expected_confidence_tokens: int = 5,
+    linguistic_confidence_prompt: bool = False,
 ) -> Tuple[str, List[str]]:
     tokens = model.to_tokens(local_prompt)
     prompt_len = int(tokens.shape[1])
@@ -1766,7 +1990,7 @@ def greedy_generate_componentwise_mean_ablated(
                     selected_heads_by_layer=selected_heads_by_layer,
                     z_means=source_means["z"],  # type: ignore[arg-type]
                     expected_guess_tokens=expected_guess_tokens,
-                    expected_probability_tokens=expected_probability_tokens,
+                    expected_probability_tokens=expected_probability_tokens, expected_confidence_tokens=expected_confidence_tokens, linguistic_confidence_prompt=linguistic_confidence_prompt,
                 )
             )
         if attn_block_layers:
@@ -1779,7 +2003,7 @@ def greedy_generate_componentwise_mean_ablated(
                     attn_block_layers=attn_block_layers,
                     attn_block_means=source_means["attn_block"],  # type: ignore[arg-type]
                     expected_guess_tokens=expected_guess_tokens,
-                    expected_probability_tokens=expected_probability_tokens,
+                    expected_probability_tokens=expected_probability_tokens, expected_confidence_tokens=expected_confidence_tokens, linguistic_confidence_prompt=linguistic_confidence_prompt,
                 )
             )
         if mlp_layers:
@@ -1792,7 +2016,7 @@ def greedy_generate_componentwise_mean_ablated(
                     mlp_layers=mlp_layers,
                     mlp_means=source_means["mlp"],  # type: ignore[arg-type]
                     expected_guess_tokens=expected_guess_tokens,
-                    expected_probability_tokens=expected_probability_tokens,
+                    expected_probability_tokens=expected_probability_tokens, expected_confidence_tokens=expected_confidence_tokens, linguistic_confidence_prompt=linguistic_confidence_prompt,
                 )
             )
         if not hooks:
@@ -1821,7 +2045,7 @@ def greedy_generate_componentwise_mean_ablated(
                 k_means=source_means["k"],  # type: ignore[arg-type]
                 v_means=source_means["v"],  # type: ignore[arg-type]
                 expected_guess_tokens=expected_guess_tokens,
-                expected_probability_tokens=expected_probability_tokens,
+                expected_probability_tokens=expected_probability_tokens, expected_confidence_tokens=expected_confidence_tokens, linguistic_confidence_prompt=linguistic_confidence_prompt,
             )
         )
     if not hooks and not mlp_layers and not attn_block_layers:
@@ -1841,7 +2065,7 @@ def greedy_generate_componentwise_mean_ablated(
                     decoded_tokens_provider=_decoded_tokens_provider,
                     attn_block_means=source_means["attn_block"],  # type: ignore[arg-type]
                     expected_guess_tokens=expected_guess_tokens,
-                    expected_probability_tokens=expected_probability_tokens,
+                    expected_probability_tokens=expected_probability_tokens, expected_confidence_tokens=expected_confidence_tokens, linguistic_confidence_prompt=linguistic_confidence_prompt,
                 )
             )
         if mlp_layers:
@@ -1855,7 +2079,7 @@ def greedy_generate_componentwise_mean_ablated(
                     decoded_tokens_provider=_decoded_tokens_provider,
                     mlp_means=source_means["mlp"],  # type: ignore[arg-type]
                     expected_guess_tokens=expected_guess_tokens,
-                    expected_probability_tokens=expected_probability_tokens,
+                    expected_probability_tokens=expected_probability_tokens, expected_confidence_tokens=expected_confidence_tokens, linguistic_confidence_prompt=linguistic_confidence_prompt,
                 )
             )
         return greedy_generate(
@@ -1898,6 +2122,9 @@ def write_config_txt(
     mode_identical: Dict[str, Dict[str, int]],
     by_none_mode_confidence: Dict[str, Dict[str, Dict[str, object]]],
     finished_at: str,
+    mode_semantic_similarity_values: Optional[Dict[str, Dict[str, List[float]]]] = None,
+    mode_verbalised_confidence_effect_values: Optional[Dict[str, Dict[str, List[float]]]] = None,
+    mode_uncertainty_score_values: Optional[Dict[str, Dict[str, List[float]]]] = None,
 ) -> None:
     lines = [
         "Componentwise Mean Ablation Configuration",
@@ -1930,9 +2157,10 @@ def write_config_txt(
         "",
         "[Ablation]",
         f"intervention_site={args.intervention_site}",
-        "mean_protocol=cross_group",
-        "mean_source_for_low_confidence=high_confidence",
-        "mean_source_for_high_confidence=low_confidence",
+        f"ablate_with_same_confidence={args.ablate_with_same_confidence}",
+        f"mean_protocol={'same_group' if args.ablate_with_same_confidence else 'cross_group'}",
+        f"mean_source_for_low_confidence={mean_source_for_group('low_confidence', args.ablate_with_same_confidence)}",
+        f"mean_source_for_high_confidence={mean_source_for_group('high_confidence', args.ablate_with_same_confidence)}",
         f"ablation_mode={args.ablation_mode}",
         f"ablate_layers_spec={args.ablate_layers}",
         f"ablate_layers_resolved={','.join(str(layer) for layer in ablate_layers)}",
@@ -1944,7 +2172,11 @@ def write_config_txt(
         f"num_ablated_attn_blocks={len(attn_block_layers)}",
         f"ablation_unit={ABLATION_UNIT_KEY}",
         f"skip_one_confidence={args.skip_one_confidence}",
+        *semantic_similarity_config_lines(args.semantic_similarity_method),
+        f"semantic_similarity_modes={sorted(m for m in args.ablation_mode if m in SEMANTIC_SIMILARITY_MODES)}",
         f"expected_probability_tokens={args.expected_probability_tokens}",
+        f"expected_confidence_tokens={args.expected_confidence_tokens}",
+        f"linguistic_confidence_prompt={args.linguistic_confidence_prompt}",
         f"expected_guess_tokens={args.expected_guess_tokens}",
         f"low_conf_threshold={args.low_conf_threshold}",
         f"high_conf_threshold={args.high_conf_threshold}",
@@ -1986,6 +2218,22 @@ def write_config_txt(
                 int(skipped_one_confidence.get(group_name, 0)) if args.skip_one_confidence else None
             ),
         )
+        if mode_semantic_similarity_values is not None:
+            _append_derived_metric_lines(
+                lines,
+                ablation_modes=args.ablation_mode,
+                semantic_similarity_values=mode_semantic_similarity_values.get(group_name, {}),
+                verbalised_confidence_effect_values=(
+                    mode_verbalised_confidence_effect_values.get(group_name, {})
+                    if mode_verbalised_confidence_effect_values
+                    else {}
+                ),
+                uncertainty_score_values=(
+                    mode_uncertainty_score_values.get(group_name, {})
+                    if mode_uncertainty_score_values
+                    else {}
+                ),
+            )
         lines.append("")
         group_buckets = by_none_mode_confidence.get(group_name, {})
         for bucket_name in NONE_MODE_CONFIDENCE_BUCKETS:
@@ -2029,6 +2277,9 @@ def build_summary(
     mode_delta: Dict[str, Dict[str, RunningMean]],
     mode_identical: Dict[str, Dict[str, int]],
     by_none_mode_confidence: Dict[str, Dict[str, Dict[str, object]]],
+    mode_semantic_similarity_values: Optional[Dict[str, Dict[str, List[float]]]] = None,
+    mode_verbalised_confidence_effect_values: Optional[Dict[str, Dict[str, List[float]]]] = None,
+    mode_uncertainty_score_values: Optional[Dict[str, Dict[str, List[float]]]] = None,
 ) -> dict:
     groups: Dict[str, dict] = {}
     for group_name in CONFIDENCE_GROUPS:
@@ -2039,6 +2290,21 @@ def build_summary(
             delta=mode_delta[group_name],
             identical=mode_identical[group_name],
         )
+        if mode_semantic_similarity_values is not None:
+            _attach_derived_metrics_to_mode_summary(
+                modes_out,
+                semantic_similarity_values=mode_semantic_similarity_values.get(group_name, {}),
+                verbalised_confidence_effect_values=(
+                    mode_verbalised_confidence_effect_values.get(group_name, {})
+                    if mode_verbalised_confidence_effect_values
+                    else {}
+                ),
+                uncertainty_score_values=(
+                    mode_uncertainty_score_values.get(group_name, {})
+                    if mode_uncertainty_score_values
+                    else {}
+                ),
+            )
         none_mode_buckets: Dict[str, dict] = {}
         group_buckets = by_none_mode_confidence.get(group_name, {})
         for bucket_name in NONE_MODE_CONFIDENCE_BUCKETS:
@@ -2061,7 +2327,9 @@ def build_summary(
             "qkv_mean_count": int(qkv_mean_counts.get(group_name, 0)),
             "mlp_mean_count": int(mlp_mean_counts.get(group_name, 0)),
             "attn_block_mean_count": int(attn_block_mean_counts.get(group_name, 0)),
-            "mean_source_group": OPPOSITE_GROUP[group_name],
+            "mean_source_group": mean_source_for_group(
+                group_name, args.ablate_with_same_confidence
+            ),
             "modes": modes_out,
             "by_none_mode_confidence": none_mode_buckets,
         }
@@ -2071,7 +2339,8 @@ def build_summary(
         "input_h5": args.input_h5,
         "h5_example_count": h5_example_count,
         "intervention_site": args.intervention_site,
-        "mean_protocol": "cross_group",
+        "ablate_with_same_confidence": bool(args.ablate_with_same_confidence),
+        "mean_protocol": "same_group" if args.ablate_with_same_confidence else "cross_group",
         "ablate_layers": list(ablate_layers),
         "ablate_heads": format_ablate_units(selected_heads_by_layer, mlp_layers, attn_block_layers),
         "ablate_mlp_layers": list(mlp_layers),
@@ -2080,7 +2349,15 @@ def build_summary(
         "num_ablated_mlp_layers": len(mlp_layers),
         "num_ablated_attn_blocks": len(attn_block_layers),
         "ablation_modes": list(args.ablation_mode),
+        "semantic_similarity_method": args.semantic_similarity_method,
+        "semantic_similarity_model": semantic_similarity_model_name(args.semantic_similarity_method),
+        "semantic_similarity_modes": [
+            mode_name for mode_name in args.ablation_mode if mode_name in SEMANTIC_SIMILARITY_MODES
+        ],
         "skip_one_confidence": bool(args.skip_one_confidence),
+        "expected_probability_tokens": args.expected_probability_tokens,
+        "expected_confidence_tokens": args.expected_confidence_tokens,
+        "linguistic_confidence_prompt": bool(args.linguistic_confidence_prompt),
         "low_conf_threshold": args.low_conf_threshold,
         "high_conf_threshold": args.high_conf_threshold,
         "groups": groups,
@@ -2092,7 +2369,8 @@ def main() -> None:
         description=(
             "Simultaneous componentwise mean ablation: patch selected head Q/K/V or hook_z, "
             "whole attention blocks (ln1 / hook_attn_out), and/or MLP RMSNorm inputs or "
-            "hook_mlp_out with the opposite confidence group's mean."
+            "hook_mlp_out with the opposite confidence group's mean by default, or the same "
+            "group's mean when --ablate_with_same_confidence is set."
         )
     )
     parser.add_argument("--model_name", type=str, default="mistralai/Mistral-7B-Instruct-v0.1")
@@ -2157,8 +2435,18 @@ def main() -> None:
     parser.add_argument("--low_conf_threshold", type=float, default=0.1)
     parser.add_argument("--high_conf_threshold", type=float, default=0.9)
     parser.add_argument("--expected_probability_tokens", type=int, default=7)
+    parser.add_argument(
+        "--expected_confidence_tokens",
+        type=int,
+        default=5,
+        help=(
+            "When --linguistic_confidence_prompt, expected number of completion tokens in the Confidence: "
+            "span for position parsing checks and truncation (instead of --expected_probability_tokens)."
+        ),
+    )
     parser.add_argument("--expected_guess_tokens", type=int, default=5)
     parser.add_argument("--parse_mode_verbalised_confidence", action=argparse.BooleanOptionalAction, default=True)
+    add_semantic_similarity_method_arg(parser)
     parser.add_argument(
         "--skip_one_confidence",
         action=argparse.BooleanOptionalAction,
@@ -2166,6 +2454,24 @@ def main() -> None:
         help=(
             "If true, skip remaining ablation modes for examples whose none/baseline "
             "verbalised confidence is 1.0. Requires 'none' in --ablation_mode."
+        ),
+    )
+    parser.add_argument(
+        "--ablate_with_same_confidence",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If true, ablate examples from the same confidence group used for the mean "
+            "(within-group control). If false (default), ablate the opposite group."
+        ),
+    )
+    parser.add_argument(
+        "--linguistic_confidence_prompt",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If true, use the natural-language Confidence: prompt and map phrases to numeric confidence; "
+            "if false (default), use the numeric Probability: prompt and float parsing."
         ),
     )
     parser.add_argument("--output_json", type=str, default=None)
@@ -2177,7 +2483,18 @@ def main() -> None:
         raise ValueError("Please include 'none' in --ablation_mode for baseline comparison.")
     if args.skip_one_confidence and "none" not in args.ablation_mode:
         raise ValueError("--skip_one_confidence requires 'none' in --ablation_mode.")
-    validate_last_a_panl_and_pc_mode(args.model_name, args.ablation_mode)
+    if args.linguistic_confidence_prompt:
+        incompatible = sorted(MODES_INCOMPATIBLE_WITH_LINGUISTIC.intersection(args.ablation_mode))
+        if incompatible:
+            raise ValueError(
+                "--linguistic_confidence_prompt is incompatible with digit-specific modes: "
+                + ", ".join(incompatible)
+            )
+    validate_last_a_panl_and_pc_mode(
+        args.model_name,
+        args.ablation_mode,
+        linguistic_confidence_prompt=args.linguistic_confidence_prompt,
+    )
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -2187,6 +2504,13 @@ def main() -> None:
     attach_output_log(run_root)
 
     _sync_prefix_tokens_for_model(args.model_name)
+    configure_mass_mean_prefix_tokens(args.model_name)
+    if args.linguistic_confidence_prompt and not _mass_mean_probe_mod.CONFIDENCE_PREFIX_TOKENS:
+        raise ValueError(
+            "--linguistic_confidence_prompt requires a non-empty Confidence: prefix table "
+            f"for --model_name={args.model_name!r}. Fill GEMMA/QWEN_CONFIDENCE_PREFIX_TOKENS "
+            "in process_generations_more_embs_from_h5.py or use Mistral."
+        )
 
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     torch_dtype = dtype_map[args.dtype]
@@ -2307,6 +2631,8 @@ def main() -> None:
         d_model=model_d_model,
         expected_guess_tokens=args.expected_guess_tokens,
         expected_probability_tokens=args.expected_probability_tokens,
+        expected_confidence_tokens=args.expected_confidence_tokens,
+        linguistic_confidence_prompt=args.linguistic_confidence_prompt,
         low_conf_threshold=args.low_conf_threshold,
         high_conf_threshold=args.high_conf_threshold,
         split_id_to_index=split_id_to_index,
@@ -2378,9 +2704,25 @@ def main() -> None:
     }
     group_metrics = {group_name: _empty_group_metrics(args.ablation_mode) for group_name in CONFIDENCE_GROUPS}
 
+    compute_derived_metrics = "none" in args.ablation_mode and len(args.ablation_mode) > 1
+    collect_semantic_similarity = compute_derived_metrics and any(
+        m in SEMANTIC_SIMILARITY_MODES for m in args.ablation_mode
+    )
+
+    mode_semantic_similarity_values: Dict[str, Dict[str, List[float]]] = {
+        group_name: _empty_derived_metric_lists(args.ablation_mode) for group_name in CONFIDENCE_GROUPS
+    }
+    mode_verbalised_confidence_effect_values: Dict[str, Dict[str, List[float]]] = {
+        group_name: _empty_derived_metric_lists(args.ablation_mode) for group_name in CONFIDENCE_GROUPS
+    }
+    mode_uncertainty_score_values: Dict[str, Dict[str, List[float]]] = {
+        group_name: _empty_derived_metric_lists(args.ablation_mode) for group_name in CONFIDENCE_GROUPS
+    }
+    pending_semantic_similarity: List[Tuple[str, str, str, str, str, str, str]] = []
+
     for group_name in CONFIDENCE_GROUPS:
         metrics = group_metrics[group_name]
-        source_group = OPPOSITE_GROUP[group_name]
+        source_group = mean_source_for_group(group_name, args.ablate_with_same_confidence)
         source_means = group_torch_means[source_group]
         logging.info(
             "Ablating group=%s (%d selected H5 ids) with %s %s means; "
@@ -2414,7 +2756,12 @@ def main() -> None:
                         f"Example id {ex_id} selected from H5 but missing in {split_name} split."
                     )
                 example = eval_ds[int(ds_idx)]
-                local_prompt = fewshot_prefix + CONFIDENCE_PROMPT + example["question"]
+                confidence_prompt = (
+                    CONFIDENCE_PROMPT_LINGUISTIC
+                    if args.linguistic_confidence_prompt
+                    else CONFIDENCE_PROMPT_NUMERIC
+                )
+                local_prompt = fewshot_prefix + confidence_prompt + example["question"]
                 entry = {"question": example["question"]}
 
                 baseline_response, _ = greedy_generate(
@@ -2424,10 +2771,13 @@ def main() -> None:
                     fwd_hooks=None,
                 )
                 baseline_mode_confidence = (
-                    parse_mode_confidence_from_response(baseline_response)
+                    parse_mode_confidence_from_response(
+                        baseline_response, linguistic_prompt=args.linguistic_confidence_prompt
+                    )
                     if args.parse_mode_verbalised_confidence
                     else None
                 )
+                baseline_semantic_answer = parse_semantic_answer_from_response(baseline_response)
                 skip_remaining_modes = (
                     args.skip_one_confidence
                     and baseline_mode_confidence is not None
@@ -2452,10 +2802,13 @@ def main() -> None:
                 for mode_name in args.ablation_mode:
                     key = mode_to_output_key(mode_name)
                     if mode_name == "none":
-                        entry[key] = {
+                        none_entry = {
                             "response": baseline_response,
                             "verbalised_confidence": baseline_mode_confidence,
                         }
+                        if baseline_semantic_answer is not None:
+                            none_entry["semantic_answer"] = baseline_semantic_answer
+                        entry[key] = none_entry
                         if baseline_mode_confidence is not None and not skip_remaining_modes:
                             metrics["confidence"][mode_name].update(float(baseline_mode_confidence))
                         if bucket_metrics is not None and baseline_mode_confidence is not None:
@@ -2480,9 +2833,13 @@ def main() -> None:
                         source_means=source_means,
                         expected_guess_tokens=args.expected_guess_tokens,
                         expected_probability_tokens=args.expected_probability_tokens,
+                        expected_confidence_tokens=args.expected_confidence_tokens,
+                        linguistic_confidence_prompt=args.linguistic_confidence_prompt,
                     )
                     parsed_mode_confidence = (
-                        parse_mode_confidence_from_response(response)
+                        parse_mode_confidence_from_response(
+                            response, linguistic_prompt=args.linguistic_confidence_prompt
+                        )
                         if args.parse_mode_verbalised_confidence
                         else None
                     )
@@ -2507,15 +2864,49 @@ def main() -> None:
                             confidence_delta=confidence_delta,
                             responses_identical=responses_identical,
                         )
-                    entry[key] = {
-                        ABLATION_UNIT_KEY: {
-                            "response": response,
-                            "verbalised_confidence": parsed_mode_confidence,
-                            "confidence_delta": confidence_delta,
-                            "responses_identical": responses_identical,
-                            "mean_source_group": source_group,
-                        }
+                    mode_entry = {
+                        "response": response,
+                        "verbalised_confidence": parsed_mode_confidence,
+                        "confidence_delta": confidence_delta,
+                        "responses_identical": responses_identical,
+                        "mean_source_group": source_group,
                     }
+                    mode_semantic_answer = parse_semantic_answer_from_response(response)
+                    if mode_semantic_answer is not None:
+                        mode_entry["semantic_answer"] = mode_semantic_answer
+                    if (
+                        compute_derived_metrics
+                        and parsed_mode_confidence is not None
+                        and baseline_mode_confidence is not None
+                    ):
+                        vce = compute_verbalised_confidence_effect(
+                            float(baseline_mode_confidence),
+                            float(parsed_mode_confidence),
+                            mean_from_low_confidence=(group_name == "high_confidence"),
+                        )
+                        if vce is not None:
+                            mode_entry["verbalised_confidence_effect"] = vce
+                            mode_verbalised_confidence_effect_values[group_name][mode_name].append(
+                                float(vce)
+                            )
+                    if (
+                        collect_semantic_similarity
+                        and mode_name in SEMANTIC_SIMILARITY_MODES
+                        and baseline_semantic_answer is not None
+                        and mode_semantic_answer is not None
+                    ):
+                        pending_semantic_similarity.append(
+                            (
+                                group_name,
+                                split_name,
+                                ex_id,
+                                key,
+                                mode_name,
+                                str(baseline_semantic_answer),
+                                str(mode_semantic_answer),
+                            )
+                        )
+                    entry[key] = {ABLATION_UNIT_KEY: mode_entry}
                     logging.info(
                         "[%s %s %d/%d] %s %s/%s first line: %r",
                         group_name,
@@ -2530,6 +2921,47 @@ def main() -> None:
 
                 results_mini[group_name][split_name][ex_id] = entry
                 metrics["evaluated_count"] += 1
+
+    del model
+    release_cuda_cache()
+
+    similarity_scorer = None
+    questions_by_id = None
+    if collect_semantic_similarity and pending_semantic_similarity:
+        similarity_scorer, questions_by_id = open_semantic_similarity_scorer(
+            args.semantic_similarity_method,
+            device,
+            args.input_h5,
+        )
+    try:
+        if pending_semantic_similarity and similarity_scorer is not None:
+            similarities = similarity_scorer.score_answers(
+                example_ids=[task[2] for task in pending_semantic_similarity],
+                correct_answers=[task[-2] for task in pending_semantic_similarity],
+                llm_outputs=[task[-1] for task in pending_semantic_similarity],
+                questions_by_id=questions_by_id,
+            )
+            for task, similarity in zip(pending_semantic_similarity, similarities):
+                group_name, split_name, ex_id, mode_key, mode_name, _baseline_text, _mode_text = task
+                mode_entry = results_mini[group_name][split_name][ex_id][mode_key][ABLATION_UNIT_KEY]
+                mode_entry["semantic_similarity"] = similarity
+                mode_semantic_similarity_values[group_name][mode_name].append(similarity)
+                vce = mode_entry.get("verbalised_confidence_effect")
+                if vce is not None:
+                    uncertainty = compute_uncertainty_score(similarity, float(vce))
+                    mode_entry["uncertainty_score"] = uncertainty
+                    mode_uncertainty_score_values[group_name][mode_name].append(uncertainty)
+    finally:
+        if similarity_scorer is not None:
+            similarity_scorer.close()
+
+    derived_metric_kwargs: Dict[str, object] = {}
+    if compute_derived_metrics:
+        derived_metric_kwargs = {
+            "mode_semantic_similarity_values": mode_semantic_similarity_values,
+            "mode_verbalised_confidence_effect_values": mode_verbalised_confidence_effect_values,
+            "mode_uncertainty_score_values": mode_uncertainty_score_values,
+        }
 
     evaluated_counts = {
         group_name: int(group_metrics[group_name]["evaluated_count"]) for group_name in CONFIDENCE_GROUPS
@@ -2582,35 +3014,40 @@ def main() -> None:
         mode_identical=mode_identical,
         by_none_mode_confidence=by_none_mode_confidence,
         finished_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+        **derived_metric_kwargs,
     )
     summary_path = summary_json_path(out_path)
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(
-            build_summary(
-                run_root=run_root,
-                args=args,
-                ablate_layers=run_layers,
-                selected_heads_by_layer=selected_heads_by_layer,
-                mlp_layers=mlp_layers,
-                attn_block_layers=attn_block_layers,
-                num_selected_layer_head_pairs=num_selected_layer_head_pairs,
-                low_conf_count=low_conf_count,
-                high_conf_count=high_conf_count,
-                h5_example_count=h5_example_count,
-                qkv_mean_counts=qkv_mean_counts,
-                mlp_mean_counts=mlp_mean_counts,
-                attn_block_mean_counts=attn_block_mean_counts,
-                evaluated_counts=evaluated_counts,
-                skipped_one_confidence=skipped_one_confidence,
-                mode_confidence=mode_confidence,
-                mode_delta=mode_delta,
-                mode_identical=mode_identical,
-                by_none_mode_confidence=by_none_mode_confidence,
-            ),
-            f,
-            ensure_ascii=False,
-            indent=2,
+    summary_payload = build_summary(
+        run_root=run_root,
+        args=args,
+        ablate_layers=run_layers,
+        selected_heads_by_layer=selected_heads_by_layer,
+        mlp_layers=mlp_layers,
+        attn_block_layers=attn_block_layers,
+        num_selected_layer_head_pairs=num_selected_layer_head_pairs,
+        low_conf_count=low_conf_count,
+        high_conf_count=high_conf_count,
+        h5_example_count=h5_example_count,
+        qkv_mean_counts=qkv_mean_counts,
+        mlp_mean_counts=mlp_mean_counts,
+        attn_block_mean_counts=attn_block_mean_counts,
+        evaluated_counts=evaluated_counts,
+        skipped_one_confidence=skipped_one_confidence,
+        mode_confidence=mode_confidence,
+        mode_delta=mode_delta,
+        mode_identical=mode_identical,
+        by_none_mode_confidence=by_none_mode_confidence,
+        **derived_metric_kwargs,
+    )
+    if compute_derived_metrics:
+        zero_fill_rows, _attached = apply_componentwise_zero_fill(
+            summary_payload,
+            results_mini,
+            ablation_unit=ABLATION_UNIT_KEY,
         )
+        write_zero_fill_config_file(config_txt_path(out_path), zero_fill_rows)
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary_payload, f, ensure_ascii=False, indent=2)
     logging.info("Saved mini outputs to %s", out_path)
     logging.info("Wrote %s", config_txt_path(out_path))
     logging.info("Wrote %s", summary_path)

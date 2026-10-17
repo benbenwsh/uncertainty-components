@@ -78,8 +78,8 @@ uptime
 # math, mistral
 python3 ./subblock_tokenwise_mass_mean_shift/run_subblock_tokenwise_mass_mean_shift.py \
   --model_name mistralai/Mistral-7B-Instruct-v0.1 \
-  --input_h5 ./process_generations/processed_generations_more_h5/3_math_mistral_extended_with_concat_train/train_verbalised_embeddings.h5 \
-  --dataset math \
+  --input_h5 ./process_generations/processed_generations_more_h5/3_trivia_mistral_linguistic_train/balanced/train_verbalised_embeddings.h5 \
+  --dataset trivia_qa \
   --no-enable_brief \
   --num_samples 22 \
   --device cuda:0 \

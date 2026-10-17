@@ -44,6 +44,7 @@ from pathlib import Path
 
 import h5py
 import numpy as np
+import torch
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parent
@@ -219,8 +220,19 @@ def configure_prefix_tokens_for_model(model_name: str) -> None:
 def _tensor_to_numpy(obj):
     if isinstance(obj, np.ndarray):
         return obj
+    if torch.is_tensor(obj):
+        tensor = obj.detach().cpu()
+        # NumPy has no bfloat16; float16 can also fail depending on NumPy/PyTorch build.
+        if tensor.dtype in (torch.bfloat16, torch.float16):
+            tensor = tensor.float()
+        return tensor.numpy()
     if hasattr(obj, "cpu") and hasattr(obj, "numpy"):
-        return obj.cpu().numpy()
+        tensor = obj.cpu()
+        dtype_name = str(getattr(tensor, "dtype", ""))
+        if "bfloat16" in dtype_name or dtype_name.endswith("float16"):
+            if hasattr(tensor, "float"):
+                tensor = tensor.float()
+        return tensor.numpy()
     if hasattr(obj, "numpy"):
         return obj.numpy()
     return np.asarray(obj)
@@ -298,6 +310,40 @@ def parse_guess_and_probability_indices(
         return None
 
     return (last_guess_token_index, first_prob_token_index, end_prob_token_index)
+
+
+L_VS_UN_SPAN_INDEX = 6
+
+
+def _is_piece_token_decode(decoded: str, piece: str) -> bool:
+    """True if decoded token content is exactly ``piece``, optionally with surrounding whitespace."""
+    if decoded == piece:
+        return True
+    return decoded.strip() == piece and piece in decoded
+
+
+def linguistic_span_token_is_l_or_un(
+    decoded_tokens: list,
+    span_index: int = L_VS_UN_SPAN_INDEX,
+) -> bool:
+    """Keep iff the Confidence: span token at ``span_index`` decodes as ``L`` or ``Un``.
+
+    Same keep/skip rule as DLA ``L_vs_Un``: parse the Confidence: prefix, then check
+    ``decoded_tokens[first_prob_token_index + span_index]``.
+    """
+    if not decoded_tokens:
+        return False
+    parsed = parse_guess_and_probability_indices(
+        decoded_tokens, linguistic_confidence_prompt=True
+    )
+    if parsed is None:
+        return False
+    _last_guess, first_prob, _end_prob = parsed
+    abs_idx = int(first_prob) + int(span_index)
+    if abs_idx < 0 or abs_idx >= len(decoded_tokens):
+        return False
+    token = decoded_tokens[abs_idx]
+    return _is_piece_token_decode(token, "L") or _is_piece_token_decode(token, "Un")
 
 
 _EOS_DECODED_TOKENS = frozenset(

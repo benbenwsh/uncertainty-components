@@ -40,7 +40,9 @@ python3 ./layerwise_mean_ablation/run_mean_ablation.py \
   --ablate_layers 0 \
   --expected_guess_tokens 3 \
   --expected_probability_tokens 5 \
+  --low_conf_threshold 0.2 \
+  --high_conf_threshold 0.8 \
   --all_confidence_group_pairs \
-  --ablation_mode none semantic_answer_mean_replace semantic_answer_including_first_prob_mean_replace
+  --ablation_mode none semantic_answer_mean_replace semantic_answer_including_first_prob_mean_replace last_a_mean_replace
 
   

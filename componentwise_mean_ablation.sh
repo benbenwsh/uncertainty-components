@@ -22,11 +22,12 @@ python3 ./componentwise_mean_ablation/run_componentwise_mean_ablation.py \
   --num_samples 30 \
   --device cuda:0 \
   --dtype bfloat16 \
-  --ablate_heads m42,m47,a45.h3,m44,m43,a47.h8,a47.h7,m33,m40,a43.h9 \
+  --ablate_heads a17,m7,m11,m9,a2 \
   --dataset trivia_qa \
   --low_conf_threshold 0.2 \
   --high_conf_threshold 0.8 \
   --expected_guess_tokens 3 \
   --expected_probability_tokens 5 \
   --intervention_site output \
-  --ablation_mode none probability_pre_and_post_period_digit_mean_replace extended_probability_last_token_mean_replace probability_last_token_mean_replace
+  --ablate_with_same_confidence \
+  --ablation_mode none last_a_mean_replace \

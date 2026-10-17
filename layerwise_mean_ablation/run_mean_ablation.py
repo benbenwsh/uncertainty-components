@@ -21,6 +21,7 @@ import logging
 import os
 import random
 import re
+import sys
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
@@ -33,6 +34,19 @@ from datasets import Dataset
 from transformers import AutoTokenizer
 from transformer_lens import HookedTransformer
 from transformer_lens.weight_processing import ProcessWeights
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from semantic_similarity_metrics import (  # noqa: E402
+    add_semantic_similarity_method_arg,
+    batch_compute_semantic_similarities as _batch_compute_semantic_similarities,
+    load_sentence_transformer_for_metrics as _load_sentence_transformer_for_metrics,
+    open_semantic_similarity_scorer,
+    release_cuda_cache,
+    semantic_similarity_config_lines,
+)
 
 # ---------------------------------------------------------------------------
 # Prompts (match generate_answers_with_confidence.py / utils defaults)
@@ -155,10 +169,12 @@ PROBABILITY_ROW_INDEX_MODES = frozenset({
 _PC_INDEX_MODES = frozenset({LAST_A_PANL_AND_PC_MODE, PC_MODE})
 
 
-def _pc_row_index(model_name: str) -> int:
+def _pc_row_index(model_name: str, *, linguistic_confidence_prompt: bool = False) -> int:
     if model_name == "mistralai/Mistral-7B-Instruct-v0.1":
-        return 6
+        return 4 if linguistic_confidence_prompt else 6
     if model_name == "google/gemma-3-12b-it":
+        if linguistic_confidence_prompt:
+            raise ValueError(f"PC-index ablation modes are not defined for {model_name}")
         return 3
     if model_name == "Qwen/Qwen2.5-32B-Instruct":
         raise ValueError(f"PC-index ablation modes are not defined for {model_name}")
@@ -168,7 +184,12 @@ def _pc_row_index(model_name: str) -> int:
     )
 
 
-def probability_row_indices_for_mode(mode: str, model_name: str) -> Tuple[int, ...]:
+def probability_row_indices_for_mode(
+    mode: str,
+    model_name: str,
+    *,
+    linguistic_confidence_prompt: bool = False,
+) -> Tuple[int, ...]:
     if mode == LAST_A_MODE:
         return (0,)
     if mode == LAST_A_AND_PANL_MODE:
@@ -176,15 +197,26 @@ def probability_row_indices_for_mode(mode: str, model_name: str) -> Tuple[int, .
     if mode == PANL_MODE:
         return (1,)
     if mode == LAST_A_PANL_AND_PC_MODE:
-        return (0, 1, _pc_row_index(model_name))
+        return (0, 1, _pc_row_index(model_name, linguistic_confidence_prompt=linguistic_confidence_prompt))
     if mode == PC_MODE:
-        return (_pc_row_index(model_name),)
+        return (_pc_row_index(model_name, linguistic_confidence_prompt=linguistic_confidence_prompt),)
     raise ValueError(f"Unknown probability-row-index ablation mode: {mode!r}")
 
 
-def validate_last_a_panl_and_pc_mode(model_name: str, ablation_modes: Sequence[str]) -> None:
+def validate_last_a_panl_and_pc_mode(
+    model_name: str,
+    ablation_modes: Sequence[str],
+    *,
+    linguistic_confidence_prompt: bool = False,
+) -> None:
     requested_pc_modes = [mode for mode in ablation_modes if mode in _PC_INDEX_MODES]
-    if requested_pc_modes and model_name == "Qwen/Qwen2.5-32B-Instruct":
+    if not requested_pc_modes:
+        return
+    if model_name == "Qwen/Qwen2.5-32B-Instruct":
+        raise ValueError(
+            f"{', '.join(requested_pc_modes)} is not defined for {model_name}"
+        )
+    if linguistic_confidence_prompt and model_name == "google/gemma-3-12b-it":
         raise ValueError(
             f"{', '.join(requested_pc_modes)} is not defined for {model_name}"
         )
@@ -472,6 +504,7 @@ def write_config_txt(
         f"num_ablated_layers={len(ablate_layers)}",
         f"expected_probability_tokens={args.expected_probability_tokens}",
         f"parse_mode_verbalised_confidence={parse_mode_verbalised_confidence}",
+        *semantic_similarity_config_lines(args.semantic_similarity_method),
         f"low_conf_threshold={args.low_conf_threshold}",
         f"high_conf_threshold={args.high_conf_threshold}",
         f"low_conf_selected_count={low_conf_count}",
@@ -569,6 +602,7 @@ def write_individual_layer_summary_and_plot(
         f"mean_source_group={mean_source_group}",
         f"ablation_target_group={ablation_target_group}",
         f"parse_mode_verbalised_confidence={args.parse_mode_verbalised_confidence}",
+        *semantic_similarity_config_lines(args.semantic_similarity_method),
         "",
     ]
     if "none" in args.ablation_mode:
@@ -720,25 +754,14 @@ def compute_uncertainty_score(semantic_similarity: float, verbalised_confidence_
 
 
 def load_sentence_transformer_for_metrics(model_name: str = DEFAULT_SEMANTIC_SIMILARITY_MODEL):
-    from sentence_transformers import SentenceTransformer
-
-    return SentenceTransformer(model_name)
+    return _load_sentence_transformer_for_metrics(model_name)
 
 
 def batch_compute_semantic_similarities(
     sentence_model,
     pairs: Sequence[Tuple[str, str]],
 ) -> List[float]:
-    if not pairs:
-        return []
-    from sentence_transformers import util
-
-    texts_a = [text_a for text_a, _text_b in pairs]
-    texts_b = [_text_b for _text_a, _text_b in pairs]
-    emb_a = sentence_model.encode(texts_a, convert_to_tensor=True)
-    emb_b = sentence_model.encode(texts_b, convert_to_tensor=True)
-    sims = util.cos_sim(emb_a, emb_b).diag()
-    return [max(0.0, float(sim.item())) for sim in sims]
+    return _batch_compute_semantic_similarities(sentence_model, pairs)
 
 
 def _mean_and_count(values: Sequence[float]) -> Tuple[Optional[float], int]:
@@ -1089,6 +1112,7 @@ def compute_verbalised_embedding_group_means(
     mean_from_low_confidence: bool,
     new_h5_format: bool = False,
     h5_res_indices: Optional[Sequence[int]] = None,
+    linguistic_confidence_prompt: bool = False,
 ) -> Tuple[Dict[str, np.ndarray], set[str], set[str]]:
     """Build per-layer mean replacement vectors for verbalised-embedding regions.
 
@@ -1102,7 +1126,9 @@ def compute_verbalised_embedding_group_means(
 
     ``embeddings_probability`` lists may have length ``expected_probability_tokens``
     or ``expected_probability_tokens + 2``; only the first
-    ``expected_probability_tokens`` rows are used.
+    ``expected_probability_tokens`` rows are used. With
+    ``linguistic_confidence_prompt``, lists may be longer than the budget
+    (variable phrase extras); require at least that many rows and truncate.
 
     By default H5 ``res`` rows are ``ablate_layers + 1`` (skip embedding; resid-post
     of TransformerLens block i is ``res[i + 1]``). Pass ``h5_res_indices`` to index
@@ -1180,7 +1206,14 @@ def compute_verbalised_embedding_group_means(
         emb_guess = emb_guess[:expected_guess_tokens]
         if not isinstance(emb_prob, list):
             raise ValueError(f"Example {ex_id} responses/0/embeddings_probability must be a list.")
-        if not _is_expected_or_plus_two(len(emb_prob), expected_probability_tokens):
+        if linguistic_confidence_prompt:
+            if len(emb_prob) < expected_probability_tokens:
+                raise ValueError(
+                    f"Example {ex_id} embeddings_probability len={len(emb_prob)}; "
+                    f"expected at least {expected_probability_tokens} "
+                    "(linguistic confidence span)."
+                )
+        elif not _is_expected_or_plus_two(len(emb_prob), expected_probability_tokens):
             raise ValueError(
                 f"Example {ex_id} embeddings_probability len={len(emb_prob)}; "
                 f"expected {expected_probability_tokens} or {expected_probability_tokens + 2}."
@@ -2486,10 +2519,12 @@ def main() -> None:
             "only H5 probability row 0 (last answer token). last_a_and_panl_mean_replace: rows 0 and 1 "
             "(last answer token and post-answer newline). "
             "last_a_panl_and_pc_mean_replace: rows 0, 1, and a model-specific pre-confidence index "
-            "(Mistral 6, Gemma 3; unsupported for Qwen). "
+            "(numeric: Mistral 6, Gemma 3; linguistic: Mistral 4; unsupported for Qwen and for "
+            "Gemma with --linguistic_confidence_prompt). "
             "panl_mean_replace: only H5 probability row 1 (post-answer newline). "
             "pc_mean_replace: only the model-specific pre-confidence index "
-            "(Mistral 6, Gemma 3; unsupported for Qwen). "
+            "(numeric: Mistral 6, Gemma 3; linguistic: Mistral 4; unsupported for Qwen and for "
+            "Gemma with --linguistic_confidence_prompt). "
             "all_pre_probability_tokens_mean_replace: "
             "replace resid at prompt + Guess + semantic-answer + Probability marker positions. "
             "guess_tokens_mean_replace: replace resid only at the Guess: prefix span (per-position means). "
@@ -2556,6 +2591,7 @@ def main() -> None:
             "store comparison metadata in output JSON, and write per-mode means to config.txt."
         ),
     )
+    add_semantic_similarity_method_arg(parser)
     parser.add_argument(
         "--output_json",
         type=str,
@@ -2730,7 +2766,6 @@ def main() -> None:
         ablation_target_ids: set[str],
         mean_from_low_confidence: bool,
         cached_none: Optional[Dict[str, Dict[str, Dict[str, object]]]] = None,
-        sentence_transformer=None,
     ) -> Tuple[
         Dict[str, dict],
         Dict[str, dict],
@@ -2744,6 +2779,7 @@ def main() -> None:
         Dict[str, int],
         Dict[str, Optional[float]],
         Dict[str, int],
+        List[Tuple[str, str, str, str, str]],
     ]:
         if layer_to_verbalised_embedding_means_eval is not None:
             for layer_idx in layer_to_verbalised_embedding_means_eval:
@@ -3164,7 +3200,8 @@ def main() -> None:
 
                         if (
                             mode in GUESS_SPAN_ABLATION_MODES
-                            and sentence_transformer is not None
+                            and "none" in args.ablation_mode
+                            and len(args.ablation_mode) > 1
                             and baseline_semantic_answer is not None
                             and mode_semantic_answer is not None
                         ):
@@ -3180,27 +3217,6 @@ def main() -> None:
 
                 results[split_name][ex_id] = entry
                 mini_results[split_name][ex_id] = mini_entry
-
-        if pending_semantic_similarity and sentence_transformer is not None:
-            pairs = [(baseline_text, mode_text) for _split, _ex, _key, baseline_text, mode_text in pending_semantic_similarity]
-            similarities = batch_compute_semantic_similarities(sentence_transformer, pairs)
-            mode_key_to_mode = {mode_to_output_key(mode): mode for mode in modes if mode != "none"}
-            for task, similarity in zip(pending_semantic_similarity, similarities):
-                split_name, ex_id, mode_key, _baseline_text, _mode_text = task
-                mode_name = mode_key_to_mode.get(mode_key)
-                if mode_name is None:
-                    continue
-                entry = results[split_name][ex_id][mode_key]
-                mini_entry = mini_results[split_name][ex_id][mode_key]
-                entry["semantic_similarity"] = similarity
-                mini_entry["semantic_similarity"] = similarity
-                mode_semantic_similarity_values[mode_name].append(similarity)
-                vce = entry.get("verbalised_confidence_effect")
-                if vce is not None:
-                    uncertainty = compute_uncertainty_score(similarity, float(vce))
-                    entry["uncertainty_score"] = uncertainty
-                    mini_entry["uncertainty_score"] = uncertainty
-                    mode_uncertainty_score_values[mode_name].append(uncertainty)
 
         mode_confidence_means: Dict[str, Optional[float]] = {}
         mode_confidence_counts: Dict[str, int] = {}
@@ -3241,6 +3257,7 @@ def main() -> None:
             mode_verbalised_confidence_effect_counts,
             mode_uncertainty_score_means,
             mode_uncertainty_score_counts,
+            pending_semantic_similarity,
         )
 
     # Compute the output for baseline none mode (no ablation) so individual-layer runs can reuse the same baseline.
@@ -3277,14 +3294,7 @@ def main() -> None:
     out_path = resolve_output_json_path(args.output_json)
     run_root = os.path.dirname(out_path)
 
-    sentence_transformer = None
-    if "none" in args.ablation_mode and len(args.ablation_mode) > 1:
-        if any(mode in GUESS_SPAN_ABLATION_MODES for mode in args.ablation_mode):
-            logging.info(
-                "Loading sentence-transformers model %s for semantic_similarity.",
-                DEFAULT_SEMANTIC_SIMILARITY_MODEL,
-            )
-            sentence_transformer = load_sentence_transformer_for_metrics()
+    language_model_n_layers = int(model.cfg.n_layers)
 
     none_cache_by_target: Dict[str, Dict[str, Dict[str, Dict[str, object]]]] = {}
     precompute_none = "none" in args.ablation_mode and (
@@ -3340,7 +3350,7 @@ def main() -> None:
             config_out_path,
             args=args,
             device=device,
-            model_n_layers=model.cfg.n_layers,
+            model_n_layers=language_model_n_layers,
             ablate_layers=ablate_layers_for_config,
             prompt_indices=prompt_indices,
             low_conf_count=len(low_ids),
@@ -3356,7 +3366,55 @@ def main() -> None:
             all_confidence_group_pairs=args.all_confidence_group_pairs,
             **derived_metric_kwargs,
         )
+        from mass_mean_probe.run_mass_mean_probe import (  # noqa: WPS433
+            apply_layerwise_zero_fill,
+            write_zero_fill_config_file,
+        )
+
+        write_zero_fill_config_file(config_out_path, apply_layerwise_zero_fill(results))
         logging.info("Wrote %s", config_out_path)
+
+    def apply_deferred_layerwise_scores(results, mini_results, pending, scorer, questions_by_id):
+        sem_values = {mode_name: [] for mode_name in args.ablation_mode if mode_name != "none"}
+        unc_values = {mode_name: [] for mode_name in args.ablation_mode if mode_name != "none"}
+        if pending and scorer is not None:
+            similarities = scorer.score_answers(
+                example_ids=[task[1] for task in pending],
+                correct_answers=[task[-2] for task in pending],
+                llm_outputs=[task[-1] for task in pending],
+                questions_by_id=questions_by_id,
+            )
+            mode_key_to_mode = {
+                mode_to_output_key(mode_name): mode_name
+                for mode_name in args.ablation_mode
+                if mode_name != "none"
+            }
+            for task, similarity in zip(pending, similarities):
+                split_name, ex_id, mode_key, _baseline_text, _mode_text = task
+                mode_name = mode_key_to_mode.get(mode_key)
+                if mode_name is None:
+                    continue
+                entry = results[split_name][ex_id][mode_key]
+                mini_entry = mini_results[split_name][ex_id][mode_key]
+                entry["semantic_similarity"] = similarity
+                mini_entry["semantic_similarity"] = similarity
+                sem_values[mode_name].append(similarity)
+                vce = entry.get("verbalised_confidence_effect")
+                if vce is not None:
+                    uncertainty = compute_uncertainty_score(similarity, float(vce))
+                    entry["uncertainty_score"] = uncertainty
+                    mini_entry["uncertainty_score"] = uncertainty
+                    unc_values[mode_name].append(uncertainty)
+        sem_means: Dict[str, Optional[float]] = {}
+        sem_counts: Dict[str, int] = {}
+        unc_means: Dict[str, Optional[float]] = {}
+        unc_counts: Dict[str, int] = {}
+        for mode_name in args.ablation_mode:
+            if mode_name == "none":
+                continue
+            sem_means[mode_name], sem_counts[mode_name] = _mean_and_count(sem_values[mode_name])
+            unc_means[mode_name], unc_counts[mode_name] = _mean_and_count(unc_values[mode_name])
+        return sem_means, sem_counts, unc_means, unc_counts
 
     def derived_metrics_from_eval(
         mode_semantic_similarity_means,
@@ -3378,6 +3436,7 @@ def main() -> None:
         }
 
     if not args.individual_layers:
+        staged_runs = []
         for combo_name, mean_from_low, same in combos:
             _source_group, target_group = resolve_confidence_groups(
                 mean_from_low_confidence=mean_from_low,
@@ -3401,45 +3460,80 @@ def main() -> None:
                 "low_confidence" if mean_from_low else "high_confidence",
                 target_group,
             )
-            (
-                results,
-                mini_results,
-                mode_confidence_means,
-                mode_confidence_counts,
-                _,
-                mode_responses_identical_true,
-                mode_semantic_similarity_means,
-                mode_semantic_similarity_counts,
-                mode_verbalised_confidence_effect_means,
-                mode_verbalised_confidence_effect_counts,
-                mode_uncertainty_score_means,
-                mode_uncertainty_score_counts,
-            ) = run_one_evaluation(
-                layer_means,
-                combo_target_ids,
-                mean_from_low,
-                cached_none=none_cache_by_target.get(target_group),
-                sentence_transformer=sentence_transformer,
+            staged_runs.append(
+                (
+                    combo_json_path,
+                    mean_from_low,
+                    same,
+                    run_one_evaluation(
+                        layer_means,
+                        combo_target_ids,
+                        mean_from_low,
+                        cached_none=none_cache_by_target.get(target_group),
+                    ),
+                )
             )
-            persist_run_outputs(
-                combo_json_path,
-                results=results,
-                mini_results=mini_results,
-                ablate_layers_for_config=ablate_layers,
-                mean_from_low_confidence=mean_from_low,
-                ablate_with_same_confidence=same,
-                mode_confidence_means=mode_confidence_means,
-                mode_confidence_counts=mode_confidence_counts,
-                mode_responses_identical_true=mode_responses_identical_true,
-                derived_metric_kwargs=derived_metrics_from_eval(
-                    mode_semantic_similarity_means,
-                    mode_semantic_similarity_counts,
+        del model
+        release_cuda_cache()
+        similarity_scorer = None
+        questions_by_id = None
+        if any(run_out[-1] for _path, _low, _same, run_out in staged_runs):
+            similarity_scorer, questions_by_id = open_semantic_similarity_scorer(
+                args.semantic_similarity_method,
+                device,
+                args.input_h5,
+            )
+        try:
+            for combo_json_path, mean_from_low, same, run_out in staged_runs:
+                (
+                    results,
+                    mini_results,
+                    mode_confidence_means,
+                    mode_confidence_counts,
+                    _,
+                    mode_responses_identical_true,
+                    _sem_means,
+                    _sem_counts,
                     mode_verbalised_confidence_effect_means,
                     mode_verbalised_confidence_effect_counts,
+                    _unc_means,
+                    _unc_counts,
+                    pending_semantic_similarity,
+                ) = run_out
+                (
+                    mode_semantic_similarity_means,
+                    mode_semantic_similarity_counts,
                     mode_uncertainty_score_means,
                     mode_uncertainty_score_counts,
-                ),
-            )
+                ) = apply_deferred_layerwise_scores(
+                    results,
+                    mini_results,
+                    pending_semantic_similarity,
+                    similarity_scorer,
+                    questions_by_id,
+                )
+                persist_run_outputs(
+                    combo_json_path,
+                    results=results,
+                    mini_results=mini_results,
+                    ablate_layers_for_config=ablate_layers,
+                    mean_from_low_confidence=mean_from_low,
+                    ablate_with_same_confidence=same,
+                    mode_confidence_means=mode_confidence_means,
+                    mode_confidence_counts=mode_confidence_counts,
+                    mode_responses_identical_true=mode_responses_identical_true,
+                    derived_metric_kwargs=derived_metrics_from_eval(
+                        mode_semantic_similarity_means,
+                        mode_semantic_similarity_counts,
+                        mode_verbalised_confidence_effect_means,
+                        mode_verbalised_confidence_effect_counts,
+                        mode_uncertainty_score_means,
+                        mode_uncertainty_score_counts,
+                    ),
+                )
+        finally:
+            if similarity_scorer is not None:
+                similarity_scorer.close()
         return
 
     run_root_norm = run_root.rstrip(os.sep)
@@ -3448,6 +3542,7 @@ def main() -> None:
     individual_root = os.path.join(results_root, "individual_layers", run_id)
     os.makedirs(individual_root, exist_ok=True)
 
+    staged_combos = []
     for combo_name, mean_from_low, same in combos:
         _source_group, target_group = resolve_confidence_groups(
             mean_from_low_confidence=mean_from_low,
@@ -3469,64 +3564,100 @@ def main() -> None:
             "low_confidence" if mean_from_low else "high_confidence",
             target_group,
         )
-
-        per_layer_mode_means: Dict[int, Dict[str, Optional[float]]] = {}
+        layer_runs = []
         for layer_idx in run_layers:
             logging.info("Running individual-layer ablation for layer %d (%s)", layer_idx, combo_name or "single")
             layer_dir = os.path.join(combo_root, str(layer_idx))
             os.makedirs(layer_dir, exist_ok=True)
             layer_pre_map = None if layer_means is None else {layer_idx: layer_means[layer_idx]}
-            (
-                results,
-                mini_results,
-                mode_confidence_means,
-                mode_confidence_counts,
-                _,
-                mode_responses_identical_true,
-                mode_semantic_similarity_means,
-                mode_semantic_similarity_counts,
-                mode_verbalised_confidence_effect_means,
-                mode_verbalised_confidence_effect_counts,
-                mode_uncertainty_score_means,
-                mode_uncertainty_score_counts,
-            ) = run_one_evaluation(
-                layer_pre_map,
-                combo_target_ids,
-                mean_from_low,
-                cached_none=cached_none,
-                sentence_transformer=sentence_transformer,
+            layer_runs.append(
+                (
+                    layer_dir,
+                    layer_idx,
+                    run_one_evaluation(
+                        layer_pre_map,
+                        combo_target_ids,
+                        mean_from_low,
+                        cached_none=cached_none,
+                    ),
+                )
             )
-            per_layer_mode_means[layer_idx] = mode_confidence_means
-            persist_run_outputs(
-                os.path.join(layer_dir, "ablation_results.json"),
-                results=results,
-                mini_results=mini_results,
-                ablate_layers_for_config=[layer_idx],
-                mean_from_low_confidence=mean_from_low,
-                ablate_with_same_confidence=same,
-                mode_confidence_means=mode_confidence_means,
-                mode_confidence_counts=mode_confidence_counts,
-                mode_responses_identical_true=mode_responses_identical_true,
-                derived_metric_kwargs=derived_metrics_from_eval(
-                    mode_semantic_similarity_means,
-                    mode_semantic_similarity_counts,
+        staged_combos.append((combo_root, mean_from_low, same, layer_runs))
+
+    del model
+    release_cuda_cache()
+    similarity_scorer = None
+    questions_by_id = None
+    if any(run_out[-1] for _root, _low, _same, layer_runs in staged_combos for _dir, _idx, run_out in layer_runs):
+        similarity_scorer, questions_by_id = open_semantic_similarity_scorer(
+            args.semantic_similarity_method,
+            device,
+            args.input_h5,
+        )
+    try:
+        for combo_root, mean_from_low, same, layer_runs in staged_combos:
+            per_layer_mode_means: Dict[int, Dict[str, Optional[float]]] = {}
+            for layer_dir, layer_idx, run_out in layer_runs:
+                (
+                    results,
+                    mini_results,
+                    mode_confidence_means,
+                    mode_confidence_counts,
+                    _,
+                    mode_responses_identical_true,
+                    _sem_means,
+                    _sem_counts,
                     mode_verbalised_confidence_effect_means,
                     mode_verbalised_confidence_effect_counts,
+                    _unc_means,
+                    _unc_counts,
+                    pending_semantic_similarity,
+                ) = run_out
+                (
+                    mode_semantic_similarity_means,
+                    mode_semantic_similarity_counts,
                     mode_uncertainty_score_means,
                     mode_uncertainty_score_counts,
-                ),
+                ) = apply_deferred_layerwise_scores(
+                    results,
+                    mini_results,
+                    pending_semantic_similarity,
+                    similarity_scorer,
+                    questions_by_id,
+                )
+                per_layer_mode_means[layer_idx] = mode_confidence_means
+                persist_run_outputs(
+                    os.path.join(layer_dir, "ablation_results.json"),
+                    results=results,
+                    mini_results=mini_results,
+                    ablate_layers_for_config=[layer_idx],
+                    mean_from_low_confidence=mean_from_low,
+                    ablate_with_same_confidence=same,
+                    mode_confidence_means=mode_confidence_means,
+                    mode_confidence_counts=mode_confidence_counts,
+                    mode_responses_identical_true=mode_responses_identical_true,
+                    derived_metric_kwargs=derived_metrics_from_eval(
+                        mode_semantic_similarity_means,
+                        mode_semantic_similarity_counts,
+                        mode_verbalised_confidence_effect_means,
+                        mode_verbalised_confidence_effect_counts,
+                        mode_uncertainty_score_means,
+                        mode_uncertainty_score_counts,
+                    ),
+                )
+            write_individual_layer_summary_and_plot(
+                combo_root,
+                args=args,
+                model_n_layers=language_model_n_layers,
+                run_layers=run_layers,
+                mean_from_low_confidence=mean_from_low,
+                ablate_with_same_confidence=same,
+                all_confidence_group_pairs=args.all_confidence_group_pairs,
+                per_layer_mode_means=per_layer_mode_means,
             )
-
-        write_individual_layer_summary_and_plot(
-            combo_root,
-            args=args,
-            model_n_layers=model.cfg.n_layers,
-            run_layers=run_layers,
-            mean_from_low_confidence=mean_from_low,
-            ablate_with_same_confidence=same,
-            all_confidence_group_pairs=args.all_confidence_group_pairs,
-            per_layer_mode_means=per_layer_mode_means,
-        )
+    finally:
+        if similarity_scorer is not None:
+            similarity_scorer.close()
 
 
 if __name__ == "__main__":

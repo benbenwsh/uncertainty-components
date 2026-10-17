@@ -10,10 +10,21 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import sys
 from typing import Dict, Optional, Sequence, Tuple
 
 import h5py
 import numpy as np
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from process_generations.process_generations_more_embs_from_h5 import (
+    L_VS_UN_SPAN_INDEX,
+    configure_prefix_tokens_for_model,
+    linguistic_span_token_is_l_or_un,
+)
 
 
 def _h5_list_length(group_obj: h5py.Group) -> int:
@@ -44,6 +55,53 @@ def _check_probability_span_length(
             f"Example {ex_id} {loc} len={n_tok}; "
             f"expected {expected_probability_tokens} or {expected_probability_tokens + 2}."
         )
+
+
+def _decode_h5_string(value) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    if isinstance(value, np.ndarray) and value.ndim == 0:
+        return _decode_h5_string(value.item())
+    return str(value)
+
+
+def read_decoded_tokens(r0: h5py.Group) -> Optional[list[str]]:
+    node = r0.get("decoded_tokens")
+    if node is None:
+        return None
+    if isinstance(node, h5py.Group):
+        if node.attrs.get("__type__") == "none":
+            return None
+        length = _h5_list_length(node)
+        if length <= 0:
+            return None
+        out: list[str] = []
+        for i in range(length):
+            item = node.get(str(i))
+            if item is None or not isinstance(item, h5py.Dataset):
+                return None
+            out.append(_decode_h5_string(item[()]))
+        return out
+    if not isinstance(node, h5py.Dataset):
+        return None
+    data = node[()]
+    if isinstance(data, np.ndarray):
+        if data.ndim == 0:
+            text = _decode_h5_string(data.item())
+            return [text] if text else None
+        tokens = [_decode_h5_string(x) for x in data.tolist()]
+        return tokens if tokens else None
+    text = _decode_h5_string(data)
+    return [text] if text else None
+
+
+def _example_passes_l_vs_un(r0: h5py.Group, tok_group: Optional[h5py.Group]) -> bool:
+    if tok_group is None or _h5_list_length(tok_group) <= L_VS_UN_SPAN_INDEX:
+        return False
+    decoded = read_decoded_tokens(r0)
+    if not decoded:
+        return False
+    return linguistic_span_token_is_l_or_un(decoded)
 
 
 def _read_verbalised_confidence(r0: h5py.Group) -> Optional[float]:
@@ -260,6 +318,8 @@ def compute_probability_mass_mean_direction_streaming(
     new_h5_format: bool = True,
     log_every: int = 50,
     allow_at_least_expected: bool = False,
+    l_vs_un: bool = False,
+    model_name: str | None = None,
 ) -> Tuple[np.ndarray, set[str], set[str], int, int]:
     """Stream H5 and compute probability-span mass-mean direction.
 
@@ -274,6 +334,11 @@ def compute_probability_mass_mean_direction_streaming(
     h5_example_count :
         Total examples present under ``examples/``.
     """
+    if l_vs_un:
+        if not model_name:
+            raise ValueError("l_vs_un=True requires model_name to configure Confidence: prefix tokens.")
+        configure_prefix_tokens_for_model(model_name)
+
     path = Path(input_h5)
     sum_low: Optional[np.ndarray] = None  # float64 accumulator
     sum_high: Optional[np.ndarray] = None
@@ -286,6 +351,7 @@ def compute_probability_mass_mean_direction_streaming(
     used = 0
     skipped_mid = 0
     skipped_bad = 0
+    skipped_l_vs_un = 0
 
     with h5py.File(path, "r") as h5_file:
         if "examples" not in h5_file:
@@ -319,10 +385,6 @@ def compute_probability_mass_mean_direction_streaming(
                     continue
                 is_low = conf <= low_conf_threshold
                 is_high = conf >= high_conf_threshold
-                if is_low:
-                    low_ids.add(ex_id_str)
-                if is_high:
-                    high_ids.add(ex_id_str)
                 if not (is_low or is_high):
                     skipped_mid += 1
                     continue
@@ -333,6 +395,14 @@ def compute_probability_mass_mean_direction_streaming(
                         f"Example {ex_id_str} missing embeddings_probability"
                         f"{'/res' if new_h5_format else ''}."
                     )
+                if l_vs_un and not _example_passes_l_vs_un(r0, tok_group):
+                    skipped_l_vs_un += 1
+                    skipped_bad += 1
+                    continue
+                if is_low:
+                    low_ids.add(ex_id_str)
+                if is_high:
+                    high_ids.add(ex_id_str)
                 span, n_layers = _read_probability_span(
                     tok_group,
                     expected_probability_tokens=expected_probability_tokens,
@@ -391,6 +461,12 @@ def compute_probability_mass_mean_direction_streaming(
         skipped_mid,
         skipped_bad,
     )
+    if l_vs_un:
+        logging.info(
+            "L_vs_Un skipped %d examples whose span-index-%d token was not L or Un.",
+            skipped_l_vs_un,
+            L_VS_UN_SPAN_INDEX,
+        )
     return direction, low_ids, high_ids, int(n_layers), h5_example_count
 
 
@@ -403,6 +479,8 @@ def compute_probability_subblock_mass_mean_directions_streaming(
     components: Sequence[str] = SUBBLOCK_COMPONENTS,
     log_every: int = 50,
     allow_at_least_expected: bool = False,
+    l_vs_un: bool = False,
+    model_name: str | None = None,
 ) -> Tuple[Dict[str, np.ndarray], set[str], set[str], int, int]:
     """Stream H5 and compute attn/mlp probability-span mass-mean directions.
 
@@ -417,6 +495,11 @@ def compute_probability_subblock_mass_mean_directions_streaming(
     h5_example_count :
         Total examples present under ``examples/``.
     """
+    if l_vs_un:
+        if not model_name:
+            raise ValueError("l_vs_un=True requires model_name to configure Confidence: prefix tokens.")
+        configure_prefix_tokens_for_model(model_name)
+
     path = Path(input_h5)
     comps = list(components)
     if not comps:
@@ -432,6 +515,7 @@ def compute_probability_subblock_mass_mean_directions_streaming(
     used = 0
     skipped_mid = 0
     skipped_bad = 0
+    skipped_l_vs_un = 0
 
     with h5py.File(path, "r") as h5_file:
         if "examples" not in h5_file:
@@ -465,13 +549,22 @@ def compute_probability_subblock_mass_mean_directions_streaming(
                     continue
                 is_low = conf <= low_conf_threshold
                 is_high = conf >= high_conf_threshold
+                if not (is_low or is_high):
+                    skipped_mid += 1
+                    continue
+
+                if l_vs_un:
+                    span_group = _probability_component_group(r0, "res")
+                    if span_group is None:
+                        span_group = _probability_component_group(r0, comps[0])
+                    if not _example_passes_l_vs_un(r0, span_group):
+                        skipped_l_vs_un += 1
+                        skipped_bad += 1
+                        continue
                 if is_low:
                     low_ids.add(ex_id_str)
                 if is_high:
                     high_ids.add(ex_id_str)
-                if not (is_low or is_high):
-                    skipped_mid += 1
-                    continue
 
                 spans: Dict[str, np.ndarray] = {}
                 for component in comps:
@@ -559,4 +652,10 @@ def compute_probability_subblock_mass_mean_directions_streaming(
         skipped_mid,
         skipped_bad,
     )
+    if l_vs_un:
+        logging.info(
+            "L_vs_Un skipped %d examples whose span-index-%d token was not L or Un.",
+            skipped_l_vs_un,
+            L_VS_UN_SPAN_INDEX,
+        )
     return direction_by_component, low_ids, high_ids, int(n_layers), h5_example_count

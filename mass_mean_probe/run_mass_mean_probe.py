@@ -60,6 +60,14 @@ from process_generations_more_embs_from_h5 import (  # noqa: E402
     MISTRAL_CONFIDENCE_PREFIX_TOKENS,
     QWEN_CONFIDENCE_PREFIX_TOKENS,
 )
+from semantic_similarity_metrics import (  # noqa: E402
+    add_semantic_similarity_method_arg,
+    batch_compute_semantic_similarities as _batch_compute_semantic_similarities,
+    load_sentence_transformer_for_metrics as _load_sentence_transformer_for_metrics,
+    open_semantic_similarity_scorer,
+    release_cuda_cache,
+    semantic_similarity_config_lines,
+)
 from layerwise_mean_ablation.run_mean_ablation import (  # noqa: E402
     LAYER_INDEXING_NOTE,
     PROBABILITY_ROW_INDEX_MODES,
@@ -71,7 +79,11 @@ from layerwise_mean_ablation.run_mean_ablation import (  # noqa: E402
 )
 from plotting.mass_mean_probe_plots import (  # noqa: E402
     plot_mode_confidence_from_summary as _plot_mode_confidence_from_summary,
+    plot_mode_confidence_from_summary_paper as _plot_mode_confidence_from_summary_paper,
+    plot_mode_confidence_from_summary_paper_no_legend as _plot_mode_confidence_from_summary_paper_no_legend,
+    paper_no_legend_png_path,
 )
+from plotting.paper_heatmaps import paper_png_path  # noqa: E402
 
 CONFIDENCE_PROMPT_NUMERIC = (
     "Provide your best guess and the probability that it is correct (0.0 to 1.0) "
@@ -174,7 +186,10 @@ SEMANTIC_SIMILARITY_MODES = frozenset({
     "generated_tokens_mean_replace",
 })
 
-GENERATED_TOKENS_SOURCE_CHOICES = ("probability_prefix_last_token",)
+GENERATED_TOKENS_SOURCE_CHOICES = (
+    "probability_prefix_last_token",
+    "probability_prefix_first_token",
+)
 WHOLE_SEQUENCE_MODES = frozenset({
     "all_tokens_mean_replace",
     "generated_tokens_mean_replace",
@@ -429,32 +444,698 @@ def compute_uncertainty_score(semantic_similarity: float, verbalised_confidence_
     return float(semantic_similarity) * float(verbalised_confidence_effect)
 
 
-def load_sentence_transformer_for_metrics(model_name: str = DEFAULT_SEMANTIC_SIMILARITY_MODEL):
-    from sentence_transformers import SentenceTransformer
+UNPARSED_ZERO_SS_KEY = "mean_semantic_similarity_unparsed_zero"
+UNPARSED_ZERO_SS_COUNT_KEY = "semantic_similarity_unparsed_zero_sample_count"
+VCE_FROM_MEANS_KEY = "mean_verbalised_confidence_effect_from_means"
+UNCERTAINTY_FROM_MEANS_KEY = "mean_uncertainty_score_vce_times_ss"
+UNPARSED_ZERO_CONFIG_HEADER = "[Derived metrics unparsed-zero]"
 
-    return SentenceTransformer(model_name)
+
+def uncertainty_score_from_aggregate_means(
+    vce_mean: Optional[float],
+    ss_mean: Optional[float],
+) -> Optional[float]:
+    if vce_mean is None or ss_mean is None:
+        return None
+    return float(vce_mean) * float(ss_mean)
+
+
+def attach_unparsed_zero_aggregate_metrics(
+    metrics: Dict[str, object],
+    *,
+    unparsed_zero_values: Sequence[float],
+    baseline_mean_confidence: Optional[float],
+    mode_mean_confidence: Optional[float],
+    mean_from_low_confidence: bool,
+) -> None:
+    ss_mean, ss_count = _mean_and_count(unparsed_zero_values)
+    vce_from_means = None
+    if baseline_mean_confidence is not None and mode_mean_confidence is not None:
+        vce_from_means = compute_verbalised_confidence_effect(
+            float(baseline_mean_confidence),
+            float(mode_mean_confidence),
+            mean_from_low_confidence=mean_from_low_confidence,
+        )
+    metrics[UNPARSED_ZERO_SS_KEY] = ss_mean
+    metrics[UNPARSED_ZERO_SS_COUNT_KEY] = ss_count
+    metrics[VCE_FROM_MEANS_KEY] = vce_from_means
+    metrics[UNCERTAINTY_FROM_MEANS_KEY] = uncertainty_score_from_aggregate_means(
+        vce_from_means, ss_mean
+    )
+
+
+def format_unparsed_zero_metric_parts(metrics: Dict[str, object]) -> List[str]:
+    parts: List[str] = []
+    ss_mean = metrics.get(UNPARSED_ZERO_SS_KEY)
+    if ss_mean is not None:
+        parts.append(f"{UNPARSED_ZERO_SS_KEY}={float(ss_mean):.6f}")
+    vce_from_means = metrics.get(VCE_FROM_MEANS_KEY)
+    if vce_from_means is not None:
+        parts.append(f"{VCE_FROM_MEANS_KEY}={float(vce_from_means):.6f}")
+    unc_mean = metrics.get(UNCERTAINTY_FROM_MEANS_KEY)
+    if unc_mean is not None:
+        parts.append(f"{UNCERTAINTY_FROM_MEANS_KEY}={float(unc_mean):.6f}")
+    return parts
+
+
+def unparsed_zero_config_section_lines(row_lines: Sequence[str]) -> List[str]:
+    if not row_lines:
+        return []
+    return ["", UNPARSED_ZERO_CONFIG_HEADER, ""] + list(row_lines)
+
+
+def upsert_unparsed_zero_config_block(config_text: str, row_lines: Sequence[str]) -> str:
+    lines = config_text.replace("\r\n", "\n").splitlines()
+    start = None
+    end = None
+    for i, line in enumerate(lines):
+        if line.strip() != UNPARSED_ZERO_CONFIG_HEADER:
+            continue
+        start = i
+        if start > 0 and lines[start - 1].strip() == "":
+            start -= 1
+        end = len(lines)
+        for j in range(i + 1, len(lines)):
+            if lines[j].startswith("[") and lines[j].strip() != UNPARSED_ZERO_CONFIG_HEADER:
+                end = j
+                break
+        break
+    if start is not None:
+        lines = lines[:start] + lines[end:]
+    insert_at = next((i for i, line in enumerate(lines) if line.strip() == "[Run]"), len(lines))
+    while insert_at > 0 and lines[insert_at - 1].strip() == "":
+        insert_at -= 1
+    block = unparsed_zero_config_section_lines(row_lines)
+    if not block:
+        return "\n".join(lines) + "\n"
+    new_lines = lines[:insert_at] + block + [""] + lines[insert_at:]
+    return "\n".join(new_lines) + "\n"
+
+
+def probe_summary_unparsed_zero_row_lines(
+    summary_payload: Dict[str, object],
+    *,
+    modes: Sequence[str],
+    targets: Sequence[str],
+    components: Optional[Sequence[str]] = None,
+) -> List[str]:
+    row_lines: List[str] = []
+    for mode_name in modes:
+        mode_block = summary_payload.get(mode_name)
+        if not isinstance(mode_block, dict):
+            continue
+        if components is None:
+            for target in targets:
+                target_block = mode_block.get(target)
+                if not isinstance(target_block, dict):
+                    continue
+                for alpha_key, metrics in sorted(target_block.items()):
+                    if not isinstance(metrics, dict) or UNPARSED_ZERO_SS_KEY not in metrics:
+                        continue
+                    parts = [f"{mode_name} target={target} alpha={alpha_key}"]
+                    parts.extend(format_unparsed_zero_metric_parts(metrics))
+                    row_lines.append(" ".join(parts))
+            continue
+        for component in components:
+            component_block = mode_block.get(component)
+            if not isinstance(component_block, dict):
+                continue
+            for target in targets:
+                target_block = component_block.get(target)
+                if not isinstance(target_block, dict):
+                    continue
+                for alpha_key, metrics in sorted(target_block.items()):
+                    if not isinstance(metrics, dict) or UNPARSED_ZERO_SS_KEY not in metrics:
+                        continue
+                    parts = [
+                        f"{mode_name} component={component} target={target} alpha={alpha_key}"
+                    ]
+                    parts.extend(format_unparsed_zero_metric_parts(metrics))
+                    row_lines.append(" ".join(parts))
+    return row_lines
+
+
+def load_sentence_transformer_for_metrics(model_name: str = DEFAULT_SEMANTIC_SIMILARITY_MODEL):
+    return _load_sentence_transformer_for_metrics(model_name)
 
 
 def batch_compute_semantic_similarities(
     sentence_model,
     pairs: Sequence[Tuple[str, str]],
 ) -> List[float]:
-    if not pairs:
-        return []
-    from sentence_transformers import util
-
-    texts_a = [text_a for text_a, _text_b in pairs]
-    texts_b = [_text_b for _text_a, _text_b in pairs]
-    emb_a = sentence_model.encode(texts_a, convert_to_tensor=True)
-    emb_b = sentence_model.encode(texts_b, convert_to_tensor=True)
-    sims = util.cos_sim(emb_a, emb_b).diag()
-    return [max(0.0, float(sim.item())) for sim in sims]
+    return _batch_compute_semantic_similarities(sentence_model, pairs)
 
 
 def _mean_and_count(values: Sequence[float]) -> Tuple[Optional[float], int]:
     if not values:
         return None, 0
     return float(np.mean(values)), len(values)
+
+
+ZERO_FILL_SS_KEY = "mean_semantic_similarity_zero_unparsed"
+ZERO_FILL_VCE_KEY = "mean_verbalised_confidence_effect_zero_unparsed"
+ZERO_FILL_UNC_KEY = "mean_uncertainty_score_zero_unparsed"
+ZERO_FILL_COUNT_KEY = "zero_fill_sample_count"
+ZERO_FILL_CONFIG_HEADER = "[Derived metrics baseline-parsed zero-fill]"
+ZERO_FILL_CONFIG_NOTE = (
+    "Cohort: no-intervention semantic answer parsed. "
+    "Unparsed post-intervention similarity is 0. "
+    "Missing verbalised confidence effect is 0. "
+    "Uncertainty is the mean of the per-example products."
+)
+ZERO_FILL_BASELINE_KEYS = ("no_replacement", "none")
+ZERO_FILL_SKIP_EXAMPLE_KEYS = {"question", "no_replacement", "none"}
+ZERO_FILL_CONFIDENCE_GROUPS = ("low_confidence", "high_confidence")
+ZERO_FILL_TARGET_KEY_RE = re.compile(
+    r"^(?P<mode>.+)__target_(?P<target>low|high)__alpha_(?P<alpha>.+)$"
+)
+
+
+def zero_fill_similarity_and_effect(payload: dict) -> Optional[Tuple[float, float]]:
+    """Aligned ``(semantic_similarity, verbalised_confidence_effect)`` for one example.
+
+    An unparsed post-intervention answer contributes similarity ``0``. A parsed
+    answer with no stored similarity is excluded (``None``) so a missing score
+    is not treated as zero. A missing verbalised confidence effect contributes ``0``.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("semantic_answer") is None:
+        similarity = 0.0
+    else:
+        stored_similarity = payload.get("semantic_similarity")
+        if stored_similarity is None:
+            return None
+        similarity = float(stored_similarity)
+    stored_effect = payload.get("verbalised_confidence_effect")
+    effect = 0.0 if stored_effect is None else float(stored_effect)
+    return similarity, effect
+
+
+def baseline_semantic_answer_parsed(entry: dict) -> bool:
+    for key in ZERO_FILL_BASELINE_KEYS:
+        payload = entry.get(key)
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("semantic_answer") is not None:
+            return True
+        for nested in payload.values():
+            if isinstance(nested, dict) and nested.get("semantic_answer") is not None:
+                return True
+    return False
+
+
+def attach_baseline_parsed_zero_fill_metrics(
+    metrics: Dict[str, object],
+    pairs: Sequence[Tuple[float, float]],
+) -> None:
+    if not pairs:
+        return
+    similarities = [pair[0] for pair in pairs]
+    effects = [pair[1] for pair in pairs]
+    products = [pair[0] * pair[1] for pair in pairs]
+    ss_mean, sample_count = _mean_and_count(similarities)
+    vce_mean, _vce_count = _mean_and_count(effects)
+    unc_mean, _unc_count = _mean_and_count(products)
+    metrics[ZERO_FILL_SS_KEY] = ss_mean
+    metrics[ZERO_FILL_VCE_KEY] = vce_mean
+    metrics[ZERO_FILL_UNC_KEY] = unc_mean
+    metrics[ZERO_FILL_COUNT_KEY] = sample_count
+
+
+def format_zero_fill_metric_parts(metrics: Dict[str, object]) -> List[str]:
+    sample_count = metrics.get(ZERO_FILL_COUNT_KEY)
+    if not sample_count:
+        return []
+    parts: List[str] = []
+    for key in (ZERO_FILL_SS_KEY, ZERO_FILL_VCE_KEY, ZERO_FILL_UNC_KEY):
+        value = metrics.get(key)
+        if value is not None:
+            parts.append(f"{key}={float(value):.6f}")
+    parts.append(f"{ZERO_FILL_COUNT_KEY}={int(sample_count)}")
+    return parts
+
+
+def zero_fill_config_section_lines(row_lines: Sequence[str]) -> List[str]:
+    if not row_lines:
+        return []
+    return ["", ZERO_FILL_CONFIG_HEADER, ZERO_FILL_CONFIG_NOTE, ""] + list(row_lines)
+
+
+def upsert_zero_fill_config_block(config_text: str, row_lines: Sequence[str]) -> str:
+    lines = config_text.replace("\r\n", "\n").splitlines()
+    start = None
+    end = None
+    for i, line in enumerate(lines):
+        if line.strip() != ZERO_FILL_CONFIG_HEADER:
+            continue
+        start = i
+        if start > 0 and lines[start - 1].strip() == "":
+            start -= 1
+        end = len(lines)
+        for j in range(i + 1, len(lines)):
+            if lines[j].startswith("[") and lines[j].strip() != ZERO_FILL_CONFIG_HEADER:
+                end = j
+                break
+        break
+    if start is not None:
+        lines = lines[:start] + lines[end:]
+    while lines and lines[-1].strip() == "":
+        lines.pop()
+    block = zero_fill_config_section_lines(row_lines)
+    if not block:
+        return "\n".join(lines) + ("\n" if lines else "")
+    return "\n".join(lines + block) + "\n"
+
+
+def write_zero_fill_config_file(path: str, row_lines: Sequence[str]) -> bool:
+    if not row_lines or not os.path.isfile(path):
+        return False
+    with open(path, "r", encoding="utf-8") as handle:
+        config_text = handle.read()
+    updated = upsert_zero_fill_config_block(config_text, row_lines)
+    if updated == config_text:
+        return False
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(updated)
+    return True
+
+
+def _zero_fill_row(prefix: str, pairs: Sequence[Tuple[float, float]], metrics: Optional[dict] = None) -> Optional[str]:
+    destination: dict = metrics if isinstance(metrics, dict) else {}
+    attach_baseline_parsed_zero_fill_metrics(destination, pairs)
+    parts = format_zero_fill_metric_parts(destination)
+    if not parts:
+        return None
+    return prefix + " " + " ".join(parts)
+
+
+def _is_zero_fill_intervention_payload(payload: object) -> bool:
+    return isinstance(payload, dict) and (
+        "response" in payload or "verbalised_confidence" in payload or "semantic_answer" in payload
+    )
+
+
+def _cohort_pairs_for_cell(payloads: Sequence[dict]) -> Optional[List[Tuple[float, float]]]:
+    """Pairs for one cell, or ``None`` when scoring never ran for parsed answers."""
+    incomplete_without_scores = False
+    has_stored_similarity = False
+    pairs: List[Tuple[float, float]] = []
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        parsed_without_score = (
+            payload.get("semantic_answer") is not None and payload.get("semantic_similarity") is None
+        )
+        if payload.get("semantic_similarity") is not None:
+            has_stored_similarity = True
+        if parsed_without_score:
+            incomplete_without_scores = True
+            continue
+        pair = zero_fill_similarity_and_effect(payload)
+        if pair is not None:
+            pairs.append(pair)
+    if incomplete_without_scores and not has_stored_similarity:
+        return None
+    return pairs
+
+
+def _iter_split_example_entries(results: dict):
+    if not isinstance(results, dict):
+        return
+    for split_map in results.values():
+        if not isinstance(split_map, dict):
+            continue
+        for entry in split_map.values():
+            if isinstance(entry, dict):
+                yield entry
+
+
+def _iter_componentwise_entries(results: dict):
+    if not isinstance(results, dict):
+        return
+    for group_name in ZERO_FILL_CONFIDENCE_GROUPS:
+        group_map = results.get(group_name)
+        if not isinstance(group_map, dict):
+            continue
+        for split_map in group_map.values():
+            if not isinstance(split_map, dict):
+                continue
+            for entry in split_map.values():
+                if isinstance(entry, dict):
+                    yield group_name, entry
+
+
+def collect_residual_zero_fill_pairs(
+    results: dict,
+) -> Dict[Tuple[str, str, str], List[Tuple[float, float]]]:
+    payloads_by_cell: Dict[Tuple[str, str, str], List[dict]] = {}
+    for entry in _iter_split_example_entries(results):
+        if not baseline_semantic_answer_parsed(entry):
+            continue
+        for key, payload in entry.items():
+            match = ZERO_FILL_TARGET_KEY_RE.match(str(key))
+            if not match or not _is_zero_fill_intervention_payload(payload):
+                continue
+            cell = (match.group("mode"), match.group("target"), match.group("alpha"))
+            payloads_by_cell.setdefault(cell, []).append(payload)
+    pairs_by_cell: Dict[Tuple[str, str, str], List[Tuple[float, float]]] = {}
+    for cell, payloads in payloads_by_cell.items():
+        pairs = _cohort_pairs_for_cell(payloads)
+        if pairs:
+            pairs_by_cell[cell] = pairs
+    return pairs_by_cell
+
+
+def collect_subblock_zero_fill_pairs(
+    results: dict,
+) -> Dict[Tuple[str, str, str, str], List[Tuple[float, float]]]:
+    payloads_by_cell: Dict[Tuple[str, str, str, str], List[dict]] = {}
+    for entry in _iter_split_example_entries(results):
+        if not baseline_semantic_answer_parsed(entry):
+            continue
+        for key, payload in entry.items():
+            match = ZERO_FILL_TARGET_KEY_RE.match(str(key))
+            if not match or not isinstance(payload, dict) or _is_zero_fill_intervention_payload(payload):
+                continue
+            for component, sub_entry in payload.items():
+                if not isinstance(sub_entry, dict):
+                    continue
+                cell = (
+                    match.group("mode"),
+                    str(component),
+                    match.group("target"),
+                    match.group("alpha"),
+                )
+                payloads_by_cell.setdefault(cell, []).append(sub_entry)
+    pairs_by_cell: Dict[Tuple[str, str, str, str], List[Tuple[float, float]]] = {}
+    for cell, payloads in payloads_by_cell.items():
+        pairs = _cohort_pairs_for_cell(payloads)
+        if pairs:
+            pairs_by_cell[cell] = pairs
+    return pairs_by_cell
+
+
+def collect_componentwise_zero_fill_pairs(
+    results: dict,
+) -> Dict[Tuple[str, str], List[Tuple[float, float]]]:
+    payloads_by_cell: Dict[Tuple[str, str], List[dict]] = {}
+    for group_name, entry in _iter_componentwise_entries(results):
+        if not baseline_semantic_answer_parsed(entry):
+            continue
+        for mode_key, mode_val in entry.items():
+            if mode_key in ZERO_FILL_SKIP_EXAMPLE_KEYS or not isinstance(mode_val, dict):
+                continue
+            if _is_zero_fill_intervention_payload(mode_val):
+                continue
+            for unit_val in mode_val.values():
+                if not isinstance(unit_val, dict):
+                    continue
+                if _is_zero_fill_intervention_payload(unit_val):
+                    payloads_by_cell.setdefault((group_name, str(mode_key)), []).append(unit_val)
+                    continue
+                for alpha_key, alpha_entry in unit_val.items():
+                    if not isinstance(alpha_entry, dict):
+                        continue
+                    tracker = f"{mode_key}__{alpha_key}"
+                    payloads_by_cell.setdefault((group_name, tracker), []).append(alpha_entry)
+    pairs_by_cell: Dict[Tuple[str, str], List[Tuple[float, float]]] = {}
+    for cell, payloads in payloads_by_cell.items():
+        pairs = _cohort_pairs_for_cell(payloads)
+        if pairs:
+            pairs_by_cell[cell] = pairs
+    return pairs_by_cell
+
+
+def collect_layerwise_zero_fill_pairs(results: dict) -> Dict[str, List[Tuple[float, float]]]:
+    payloads_by_mode: Dict[str, List[dict]] = {}
+    for entry in _iter_split_example_entries(results):
+        if not baseline_semantic_answer_parsed(entry):
+            continue
+        for mode_key, payload in entry.items():
+            if mode_key in ZERO_FILL_SKIP_EXAMPLE_KEYS or not _is_zero_fill_intervention_payload(payload):
+                continue
+            payloads_by_mode.setdefault(str(mode_key), []).append(payload)
+    pairs_by_mode: Dict[str, List[Tuple[float, float]]] = {}
+    for mode_key, payloads in payloads_by_mode.items():
+        pairs = _cohort_pairs_for_cell(payloads)
+        if pairs:
+            pairs_by_mode[mode_key] = pairs
+    return pairs_by_mode
+
+
+def collect_blockwise_zero_fill_pairs(
+    results: dict,
+) -> Dict[Tuple[str, str], List[Tuple[float, float]]]:
+    payloads_by_cell: Dict[Tuple[str, str], List[dict]] = {}
+    for entry in _iter_split_example_entries(results):
+        if not baseline_semantic_answer_parsed(entry):
+            continue
+        for mode_key, payload in entry.items():
+            if mode_key in ZERO_FILL_SKIP_EXAMPLE_KEYS or not isinstance(payload, dict):
+                continue
+            if _is_zero_fill_intervention_payload(payload):
+                continue
+            for subblock, sub_entry in payload.items():
+                if not isinstance(sub_entry, dict):
+                    continue
+                payloads_by_cell.setdefault((str(mode_key), str(subblock)), []).append(sub_entry)
+    pairs_by_cell: Dict[Tuple[str, str], List[Tuple[float, float]]] = {}
+    for cell, payloads in payloads_by_cell.items():
+        pairs = _cohort_pairs_for_cell(payloads)
+        if pairs:
+            pairs_by_cell[cell] = pairs
+    return pairs_by_cell
+
+
+def _lookup_residual_metrics(summary: dict, mode: str, target: str, alpha: str) -> Optional[dict]:
+    mode_block = summary.get(mode) if isinstance(summary, dict) else None
+    if not isinstance(mode_block, dict):
+        return None
+    target_block = mode_block.get(target)
+    if not isinstance(target_block, dict):
+        return None
+    metrics = target_block.get(alpha)
+    return metrics if isinstance(metrics, dict) else None
+
+
+def _lookup_subblock_metrics(
+    summary: dict,
+    mode: str,
+    component: str,
+    target: str,
+    alpha: str,
+) -> Optional[dict]:
+    mode_block = summary.get(mode) if isinstance(summary, dict) else None
+    if not isinstance(mode_block, dict):
+        return None
+    component_block = mode_block.get(component)
+    if not isinstance(component_block, dict):
+        return None
+    target_block = component_block.get(target)
+    if not isinstance(target_block, dict):
+        return None
+    metrics = target_block.get(alpha)
+    return metrics if isinstance(metrics, dict) else None
+
+
+def _lookup_componentwise_metrics(summary: dict, group_name: str, tracker: str) -> Optional[dict]:
+    groups = summary.get("groups") if isinstance(summary, dict) else None
+    if not isinstance(groups, dict):
+        return None
+    group_block = groups.get(group_name)
+    if not isinstance(group_block, dict):
+        return None
+    modes = group_block.get("modes")
+    if not isinstance(modes, dict):
+        return None
+    metrics = modes.get(tracker)
+    return metrics if isinstance(metrics, dict) else None
+
+
+def apply_residual_zero_fill(summary: dict, results: dict) -> Tuple[List[str], int]:
+    row_lines: List[str] = []
+    attached = 0
+    pairs_by_cell = collect_residual_zero_fill_pairs(results)
+    for mode, target, alpha in sorted(pairs_by_cell):
+        metrics = _lookup_residual_metrics(summary, mode, target, alpha)
+        if metrics is None:
+            metrics = {}
+        else:
+            attached += 1
+        row = _zero_fill_row(
+            f"{mode} target={target} alpha={alpha}",
+            pairs_by_cell[(mode, target, alpha)],
+            metrics,
+        )
+        if row is not None:
+            row_lines.append(row)
+    return row_lines, attached
+
+
+def apply_subblock_zero_fill(summary: dict, results: dict) -> Tuple[List[str], int]:
+    row_lines: List[str] = []
+    attached = 0
+    pairs_by_cell = collect_subblock_zero_fill_pairs(results)
+    for mode, component, target, alpha in sorted(pairs_by_cell):
+        metrics = _lookup_subblock_metrics(summary, mode, component, target, alpha)
+        if metrics is None:
+            metrics = {}
+        else:
+            attached += 1
+        row = _zero_fill_row(
+            f"{mode} component={component} target={target} alpha={alpha}",
+            pairs_by_cell[(mode, component, target, alpha)],
+            metrics,
+        )
+        if row is not None:
+            row_lines.append(row)
+    return row_lines, attached
+
+
+def apply_componentwise_zero_fill(
+    summary: dict,
+    results: dict,
+    *,
+    ablation_unit: Optional[str] = None,
+) -> Tuple[List[str], int]:
+    row_lines: List[str] = []
+    attached = 0
+    pairs_by_cell = collect_componentwise_zero_fill_pairs(results)
+    for group_name, tracker in sorted(pairs_by_cell):
+        metrics = _lookup_componentwise_metrics(summary, group_name, tracker)
+        if metrics is None:
+            metrics = {}
+        else:
+            attached += 1
+        prefix = f"{group_name} {tracker}"
+        if ablation_unit:
+            prefix = f"{prefix}__{ablation_unit}"
+        row = _zero_fill_row(prefix, pairs_by_cell[(group_name, tracker)], metrics)
+        if row is not None:
+            row_lines.append(row)
+    return row_lines, attached
+
+
+def apply_layerwise_zero_fill(results: dict) -> List[str]:
+    row_lines: List[str] = []
+    pairs_by_mode = collect_layerwise_zero_fill_pairs(results)
+    for mode_key in sorted(pairs_by_mode):
+        row = _zero_fill_row(mode_key, pairs_by_mode[mode_key])
+        if row is not None:
+            row_lines.append(row)
+    return row_lines
+
+
+def apply_blockwise_zero_fill(results: dict) -> List[str]:
+    row_lines: List[str] = []
+    pairs_by_cell = collect_blockwise_zero_fill_pairs(results)
+    for mode_key, subblock in sorted(pairs_by_cell):
+        row = _zero_fill_row(f"{mode_key}__{subblock}", pairs_by_cell[(mode_key, subblock)])
+        if row is not None:
+            row_lines.append(row)
+    return row_lines
+
+
+def residual_zero_fill_config_row_lines(
+    summary_payload: Dict[str, object],
+    *,
+    modes: Sequence[str],
+    targets: Sequence[str],
+) -> List[str]:
+    row_lines: List[str] = []
+    for mode_name in modes:
+        mode_block = summary_payload.get(mode_name)
+        if not isinstance(mode_block, dict):
+            continue
+        for target in targets:
+            target_block = mode_block.get(target)
+            if not isinstance(target_block, dict):
+                continue
+            for alpha_key, metrics in sorted(target_block.items()):
+                if not isinstance(metrics, dict):
+                    continue
+                parts = format_zero_fill_metric_parts(metrics)
+                if not parts:
+                    continue
+                row_lines.append(f"{mode_name} target={target} alpha={alpha_key} " + " ".join(parts))
+    return row_lines
+
+
+def subblock_zero_fill_config_row_lines(
+    summary_payload: Dict[str, object],
+    *,
+    modes: Sequence[str],
+    components: Sequence[str],
+    targets: Sequence[str],
+) -> List[str]:
+    row_lines: List[str] = []
+    for mode_name in modes:
+        mode_block = summary_payload.get(mode_name)
+        if not isinstance(mode_block, dict):
+            continue
+        for component in components:
+            component_block = mode_block.get(component)
+            if not isinstance(component_block, dict):
+                continue
+            for target in targets:
+                target_block = component_block.get(target)
+                if not isinstance(target_block, dict):
+                    continue
+                for alpha_key, metrics in sorted(target_block.items()):
+                    if not isinstance(metrics, dict):
+                        continue
+                    parts = format_zero_fill_metric_parts(metrics)
+                    if not parts:
+                        continue
+                    row_lines.append(
+                        f"{mode_name} component={component} target={target} alpha={alpha_key} "
+                        + " ".join(parts)
+                    )
+    return row_lines
+
+
+def detect_zero_fill_results_kind(results: dict) -> Optional[str]:
+    if not isinstance(results, dict):
+        return None
+    if any(isinstance(results.get(name), dict) and results.get(name) for name in ZERO_FILL_CONFIDENCE_GROUPS):
+        return "componentwise"
+    for entry in _iter_split_example_entries(results):
+        for key, payload in entry.items():
+            if key in ZERO_FILL_SKIP_EXAMPLE_KEYS or not isinstance(payload, dict):
+                continue
+            if ZERO_FILL_TARGET_KEY_RE.match(str(key)):
+                if _is_zero_fill_intervention_payload(payload):
+                    return "residual"
+                return "subblock"
+            if _is_zero_fill_intervention_payload(payload):
+                return "layerwise"
+            for nested in payload.values():
+                if _is_zero_fill_intervention_payload(nested):
+                    return "blockwise"
+    return None
+
+
+def zero_fill_rows_for_results(
+    summary: dict,
+    results: dict,
+    *,
+    ablation_unit: Optional[str] = None,
+) -> Tuple[Optional[str], List[str], int]:
+    kind = detect_zero_fill_results_kind(results)
+    if kind == "residual":
+        rows, attached = apply_residual_zero_fill(summary, results)
+    elif kind == "subblock":
+        rows, attached = apply_subblock_zero_fill(summary, results)
+    elif kind == "componentwise":
+        rows, attached = apply_componentwise_zero_fill(summary, results, ablation_unit=ablation_unit)
+    elif kind == "layerwise":
+        rows, attached = apply_layerwise_zero_fill(results), 0
+    elif kind == "blockwise":
+        rows, attached = apply_blockwise_zero_fill(results), 0
+    else:
+        return None, [], 0
+    return kind, rows, attached
 
 
 def _entry_key_for_mode_target_alpha(mode: str, target: str, alpha: float) -> str:
@@ -474,6 +1155,9 @@ def write_config_txt(
     h5_example_count: int,
     finished_at: str,
     summary_payload: Optional[Dict[str, object]] = None,
+    direction_low_conf_count: Optional[int] = None,
+    direction_high_conf_count: Optional[int] = None,
+    direction_h5_example_count: Optional[int] = None,
 ) -> None:
     lines = [
         "Mass Mean Probe Configuration",
@@ -487,6 +1171,12 @@ def write_config_txt(
         "",
         "[Data]",
         f"input_h5={args.input_h5}",
+        *direction_h5_config_lines(
+            args,
+            direction_low_conf_count=direction_low_conf_count,
+            direction_high_conf_count=direction_high_conf_count,
+            direction_h5_example_count=direction_h5_example_count,
+        ),
         f"dataset={args.dataset}",
         f"new_h5_format={args.new_h5_format}",
         f"h5_example_count={h5_example_count}",
@@ -521,6 +1211,7 @@ def write_config_txt(
         f"normalize_span_directions={args.normalize_span_directions}",
         f"parse_mode_verbalised_confidence={args.parse_mode_verbalised_confidence}",
         f"linguistic_confidence_prompt={args.linguistic_confidence_prompt}",
+        *semantic_similarity_config_lines(args.semantic_similarity_method),
         f"low_conf_threshold={args.low_conf_threshold}",
         f"high_conf_threshold={args.high_conf_threshold}",
         f"low_conf_selected_count={low_conf_count}",
@@ -553,7 +1244,26 @@ def write_config_txt(
                     if unc_mean is not None:
                         parts.append(f"mean_uncertainty_score={float(unc_mean):.6f}")
                     lines.append(" ".join(parts))
+        lines.extend(
+            unparsed_zero_config_section_lines(
+                probe_summary_unparsed_zero_row_lines(
+                    summary_payload,
+                    modes=[m for m in args.ablation_mode if m != "none"],
+                    targets=args.ablation_targets,
+                )
+            )
+        )
     lines.extend(["", "[Run]", f"finished_at={finished_at}"])
+    if summary_payload is not None:
+        lines.extend(
+            zero_fill_config_section_lines(
+                residual_zero_fill_config_row_lines(
+                    summary_payload,
+                    modes=[m for m in args.ablation_mode if m != "none"],
+                    targets=args.ablation_targets,
+                )
+            )
+        )
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -569,6 +1279,9 @@ def _build_summary_json(
     mode_semantic_similarity_values: Optional[Dict[str, Dict[str, Dict[float, List[float]]]]] = None,
     mode_verbalised_confidence_effect_values: Optional[Dict[str, Dict[str, Dict[float, List[float]]]]] = None,
     mode_uncertainty_score_values: Optional[Dict[str, Dict[str, Dict[float, List[float]]]]] = None,
+    mode_semantic_similarity_unparsed_zero_values: Optional[
+        Dict[str, Dict[str, Dict[float, List[float]]]]
+    ] = None,
 ) -> Dict[str, object]:
     summary: Dict[str, object] = {}
     for mode in non_none_modes:
@@ -594,6 +1307,7 @@ def _build_summary_json(
                     sem_mean, sem_count = _mean_and_count(sem_values)
                     alpha_metrics["mean_semantic_similarity"] = sem_mean
                     alpha_metrics["semantic_similarity_sample_count"] = sem_count
+                vce_mean: Optional[float] = None
                 if mode_verbalised_confidence_effect_values is not None:
                     vce_values = mode_verbalised_confidence_effect_values.get(mode, {}).get(target, {}).get(alpha, [])
                     vce_mean, vce_count = _mean_and_count(vce_values)
@@ -604,6 +1318,21 @@ def _build_summary_json(
                     unc_mean, unc_count = _mean_and_count(unc_values)
                     alpha_metrics["mean_uncertainty_score"] = unc_mean
                     alpha_metrics["uncertainty_score_sample_count"] = unc_count
+                if mode_semantic_similarity_unparsed_zero_values is not None and mode in SEMANTIC_SIMILARITY_MODES:
+                    zero_values = (
+                        mode_semantic_similarity_unparsed_zero_values.get(mode, {})
+                        .get(target, {})
+                        .get(alpha, [])
+                    )
+                    baseline_vals = baseline_values_by_target.get(target, [])
+                    baseline_mean = float(np.mean(baseline_vals)) if baseline_vals else None
+                    attach_unparsed_zero_aggregate_metrics(
+                        alpha_metrics,
+                        unparsed_zero_values=zero_values,
+                        baseline_mean_confidence=baseline_mean,
+                        mode_mean_confidence=mean_conf,
+                        mean_from_low_confidence=(target == "high"),
+                    )
                 per_alpha_payload[alpha_key] = alpha_metrics
             mode_payload[target] = per_alpha_payload
         summary[mode] = mode_payload
@@ -639,13 +1368,21 @@ def write_summary_plots_from_json(
         if not isinstance(mode_payload, dict):
             continue
         plot_path = os.path.join(output_dir, f"verbalised_confidence_vs_alpha__{mode_name}.png")
-        _plot_mode_confidence_from_summary(
+        plot_kwargs = dict(
             mode_name=mode_name,
             mode_payload=mode_payload,
             ablation_targets=ablation_targets,
-            output_path=plot_path,
             low_conf_threshold=low_conf_threshold,
             high_conf_threshold=high_conf_threshold,
+        )
+        _plot_mode_confidence_from_summary(output_path=plot_path, **plot_kwargs)
+        _plot_mode_confidence_from_summary_paper(
+            output_path=str(paper_png_path(plot_path)),
+            **plot_kwargs,
+        )
+        _plot_mode_confidence_from_summary_paper_no_legend(
+            output_path=str(paper_no_legend_png_path(plot_path)),
+            **plot_kwargs,
         )
 
 
@@ -826,6 +1563,96 @@ def load_examples_h5(path: Path) -> Dict[str, dict]:
     return examples
 
 
+def validate_direction_input_h5_args(args: argparse.Namespace) -> None:
+    has_direction_h5 = bool(getattr(args, "direction_input_h5", None))
+    direction_low = getattr(args, "direction_low_conf_threshold", None)
+    direction_high = getattr(args, "direction_high_conf_threshold", None)
+    if has_direction_h5:
+        if direction_low is None or direction_high is None:
+            raise ValueError(
+                "--direction_low_conf_threshold and --direction_high_conf_threshold are "
+                "required when --direction_input_h5 is set."
+            )
+        return
+    if direction_low is not None or direction_high is not None:
+        raise ValueError(
+            "--direction_low_conf_threshold and --direction_high_conf_threshold require "
+            "--direction_input_h5."
+        )
+
+
+def collect_low_high_ids_from_examples(
+    examples_h5: Dict[str, dict],
+    *,
+    low_conf_threshold: float,
+    high_conf_threshold: float,
+) -> Tuple[set[str], set[str]]:
+    low_ids: set[str] = set()
+    high_ids: set[str] = set()
+    for ex_id, ex_obj in examples_h5.items():
+        responses = ex_obj.get("responses")
+        if not isinstance(responses, list) or len(responses) != 1:
+            raise ValueError(
+                f"Example {ex_id} must have exactly one response, got "
+                f"{0 if responses is None else len(responses)}."
+            )
+        resp0 = responses[0]
+        if not isinstance(resp0, dict):
+            raise ValueError(f"Example {ex_id} responses/0 is not a dict.")
+        conf = float(resp0.get("verbalised_confidence"))
+        if conf <= low_conf_threshold:
+            low_ids.add(ex_id)
+        if conf >= high_conf_threshold:
+            high_ids.add(ex_id)
+    return low_ids, high_ids
+
+
+def add_direction_input_h5_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--direction_input_h5",
+        type=str,
+        default=None,
+        help=(
+            "Optional H5 used only to build the mass-mean steering vector. When unset, "
+            "--input_h5 is used for both the direction and eval example selection."
+        ),
+    )
+    parser.add_argument(
+        "--direction_low_conf_threshold",
+        type=float,
+        default=None,
+        help="Low-confidence threshold for --direction_input_h5. Required when that flag is set.",
+    )
+    parser.add_argument(
+        "--direction_high_conf_threshold",
+        type=float,
+        default=None,
+        help="High-confidence threshold for --direction_input_h5. Required when that flag is set.",
+    )
+
+
+def direction_h5_config_lines(
+    args: argparse.Namespace,
+    *,
+    direction_low_conf_count: Optional[int] = None,
+    direction_high_conf_count: Optional[int] = None,
+    direction_h5_example_count: Optional[int] = None,
+) -> List[str]:
+    lines = [
+        f"direction_input_h5={args.direction_input_h5}",
+        f"direction_low_conf_threshold={args.direction_low_conf_threshold}",
+        f"direction_high_conf_threshold={args.direction_high_conf_threshold}",
+    ]
+    if args.direction_input_h5:
+        if direction_h5_example_count is not None:
+            lines.append(f"direction_h5_example_count={direction_h5_example_count}")
+        if direction_low_conf_count is not None:
+            lines.append(f"direction_low_conf_selected_count={direction_low_conf_count}")
+        if direction_high_conf_count is not None:
+            lines.append(f"direction_high_conf_selected_count={direction_high_conf_count}")
+    return lines
+
+
 def parse_ablate_layers(spec: str, n_layers: int) -> List[int]:
     spec = spec.strip()
     if "-" in spec and "," not in spec:
@@ -901,15 +1728,10 @@ def _absolute_prob_positions(
         expected_confidence_tokens=expected_confidence_tokens,
         extend_probability_span=extend_probability_span,
     )
-    logging.info(f"rel_positions: {rel_positions}")
-    logging.info(f"span_budget: {span_budget}, length of rel_positions: {len(rel_positions)}")
-    logging.info(f"prompt_len: {prompt_len}, decoded_tokens length: {len(decoded_tokens)}")
     if not _is_expected_or_plus_two(len(rel_positions), span_budget):
         return []
     rel_positions = rel_positions[:span_budget]
-    final_tokens = [_completion_token_index_to_abs_pos(prompt_len, pos) for pos in rel_positions]
-    logging.info(f"final_tokens: {final_tokens}")
-    return final_tokens
+    return [_completion_token_index_to_abs_pos(prompt_len, pos) for pos in rel_positions]
 
 
 def _absolute_prob_positions_at_row_indices(
@@ -1240,8 +2062,13 @@ def _generated_token_direction_for_source(
     *,
     dtype: torch.dtype,
 ) -> torch.Tensor:
+    probability = layer_delta["probability"]
+    if int(probability.shape[0]) < 1:
+        raise ValueError("Expected at least one probability direction row.")
     if source == "probability_prefix_last_token":
-        return layer_delta["probability"][-1].to(dtype)
+        return probability[-1].to(dtype)
+    if source == "probability_prefix_first_token":
+        return probability[0].to(dtype)
     raise ValueError(f"Unknown generated_tokens_source: {source!r}")
 
 
@@ -1253,11 +2080,15 @@ def _apply_steering_at_positions_with_generated_source(
     prompt_len: int,
     generated_tokens_source: str,
 ) -> torch.Tensor:
-    prompt_vec = layer_delta["prompt_mean"].to(activation.dtype)
     generated_vec = _generated_token_direction_for_source(
         layer_delta,
         generated_tokens_source,
         dtype=activation.dtype,
+    )
+    prompt_vec = (
+        generated_vec
+        if generated_tokens_source == "probability_prefix_first_token"
+        else layer_delta["prompt_mean"].to(activation.dtype)
     )
     for abs_pos in positions:
         if not (0 <= abs_pos < activation.shape[1]):
@@ -1317,7 +2148,11 @@ def _direction_mode_activation_applier_builder(
             return _apply_probability_tokens_mean_replace
 
         if mode in PROBABILITY_ROW_INDEX_MODES:
-            row_indices = probability_row_indices_for_mode(mode, model_name)
+            row_indices = probability_row_indices_for_mode(
+                mode,
+                model_name,
+                linguistic_confidence_prompt=linguistic_confidence_prompt,
+            )
 
             def _apply_probability_row_indices_mean_replace(
                 activation: torch.Tensor,
@@ -1979,6 +2814,7 @@ def main() -> None:
         choices=list(SUPPORTED_MODEL_NAMES),
     )
     parser.add_argument("--input_h5", type=str, required=True, help="Path to *_verbalised_embeddings.h5 file.")
+    add_direction_input_h5_args(parser)
     parser.add_argument(
         "--new_h5_format",
         action=argparse.BooleanOptionalAction,
@@ -1997,7 +2833,7 @@ def main() -> None:
         "--dataset",
         type=str,
         default="trivia_qa",
-        choices=["trivia_qa", "squad", "bioasq", "nq", "svamp", "gsm8k"],
+        choices=["trivia_qa", "squad", "bioasq", "nq", "svamp", "gsm8k", "math"],
     )
     parser.add_argument(
         "--num_samples",
@@ -2084,10 +2920,12 @@ def main() -> None:
             "(last answer token and post-answer newline). "
             "last_a_panl_and_pc_mean_replace: same gating as probability_tokens_mean_replace but only "
             "H5 probability rows 0, 1, and a model-specific pre-confidence index "
-            "(Mistral 6, Gemma 3; unsupported for Qwen). "
+            "(numeric: Mistral 6, Gemma 3; linguistic: Mistral 4; unsupported for Qwen and for "
+            "Gemma with --linguistic_confidence_prompt). "
             "panl_mean_replace: only H5 probability row 1 (post-answer newline). "
             "pc_mean_replace: only the model-specific pre-confidence index "
-            "(Mistral 6, Gemma 3; unsupported for Qwen). "
+            "(numeric: Mistral 6, Gemma 3; linguistic: Mistral 4; unsupported for Qwen and for "
+            "Gemma with --linguistic_confidence_prompt). "
             "semantic_answer_mean_replace: no-op until Guess/Probability(or Confidence) parse "
             "succeeds, then perturb only semantic-answer tokens using the shared "
             "sem_answer_mean direction. "
@@ -2110,10 +2948,11 @@ def main() -> None:
         default=["probability_prefix_last_token"],
         choices=list(GENERATED_TOKENS_SOURCE_CHOICES),
         help=(
-            "Generated-token direction source for all_tokens_mean_replace and "
-            "generated_tokens_mean_replace. Prompt positions always use prompt_mean; every "
-            "non-prompt position uses the selected source. Currently only "
-            "probability_prefix_last_token (probability[-1]) is supported."
+            "Direction source for all_tokens_mean_replace and generated_tokens_mean_replace. "
+            "probability_prefix_last_token (default): prompt_mean on prompt positions, "
+            "probability[-1] on every other patched position. "
+            "probability_prefix_first_token: probability[0] at every patched position, "
+            "including earlier prompt tokens (matches componentwise generated_tokens_mean_replace)."
         ),
     )
     parser.add_argument(
@@ -2159,6 +2998,7 @@ def main() -> None:
         default=True,
         help="Parse verbalised confidence from generated responses and report aggregate means.",
     )
+    add_semantic_similarity_method_arg(parser)
     parser.add_argument(
         "--linguistic_confidence_prompt",
         action=argparse.BooleanOptionalAction,
@@ -2179,7 +3019,12 @@ def main() -> None:
     )
     args = parser.parse_args()
     configure_prefix_tokens_for_model(args.model_name)
-    validate_last_a_panl_and_pc_mode(args.model_name, args.ablation_mode)
+    validate_last_a_panl_and_pc_mode(
+        args.model_name,
+        args.ablation_mode,
+        linguistic_confidence_prompt=args.linguistic_confidence_prompt,
+    )
+    validate_direction_input_h5_args(args)
     if args.linguistic_confidence_prompt and not CONFIDENCE_PREFIX_TOKENS:
         raise ValueError(
             "--linguistic_confidence_prompt requires a non-empty Confidence: prefix table "
@@ -2259,16 +3104,43 @@ def main() -> None:
     ablate_layers = parse_ablate_layers(args.ablate_layers, model.cfg.n_layers + 1)
 
     examples_h5 = load_examples_h5(Path(args.input_h5))
-    mean_low, mean_high, direction, low_ids, high_ids = compute_low_high_span_means_and_directions(
-        examples_h5,
-        ablate_layers,
-        low_conf_threshold=args.low_conf_threshold,
-        high_conf_threshold=args.high_conf_threshold,
-        expected_probability_tokens=args.expected_probability_tokens,
-        expected_guess_tokens=args.expected_guess_tokens,
-        new_h5_format=args.new_h5_format,
-        h5_res_indices=ablate_layers,
-    )
+    direction_low_conf_count: Optional[int] = None
+    direction_high_conf_count: Optional[int] = None
+    direction_h5_example_count: Optional[int] = None
+    if args.direction_input_h5:
+        low_ids, high_ids = collect_low_high_ids_from_examples(
+            examples_h5,
+            low_conf_threshold=args.low_conf_threshold,
+            high_conf_threshold=args.high_conf_threshold,
+        )
+        direction_examples_h5 = load_examples_h5(Path(args.direction_input_h5))
+        direction_h5_example_count = len(direction_examples_h5)
+        mean_low, mean_high, direction, direction_low_ids, direction_high_ids = (
+            compute_low_high_span_means_and_directions(
+                direction_examples_h5,
+                ablate_layers,
+                low_conf_threshold=float(args.direction_low_conf_threshold),
+                high_conf_threshold=float(args.direction_high_conf_threshold),
+                expected_probability_tokens=args.expected_probability_tokens,
+                expected_guess_tokens=args.expected_guess_tokens,
+                new_h5_format=args.new_h5_format,
+                h5_res_indices=ablate_layers,
+            )
+        )
+        direction_low_conf_count = len(direction_low_ids)
+        direction_high_conf_count = len(direction_high_ids)
+        del direction_examples_h5, direction_low_ids, direction_high_ids
+    else:
+        mean_low, mean_high, direction, low_ids, high_ids = compute_low_high_span_means_and_directions(
+            examples_h5,
+            ablate_layers,
+            low_conf_threshold=args.low_conf_threshold,
+            high_conf_threshold=args.high_conf_threshold,
+            expected_probability_tokens=args.expected_probability_tokens,
+            expected_guess_tokens=args.expected_guess_tokens,
+            new_h5_format=args.new_h5_format,
+            h5_res_indices=ablate_layers,
+        )
     if args.normalize_span_directions:
         # Mutates direction dict in place
         normalization_stats = normalize_direction_spans_to_unit_norm_budget(
@@ -2288,7 +3160,7 @@ def main() -> None:
 
     direction_flat_head = np.ravel(direction["probability"])[:5].tolist()
     logging.info(
-        "Loaded %d H5 examples. low_conf=%d (<=%.3f), high_conf=%d (>=%.3f), layers=%s, "
+        "Loaded %d eval H5 examples. low_conf=%d (<=%.3f), high_conf=%d (>=%.3f), layers=%s, "
         "direction.shape=%s direction.flat[:5]=%s alphas=%s",
         len(examples_h5),
         len(low_ids),
@@ -2300,6 +3172,16 @@ def main() -> None:
         direction_flat_head,
         list(args.alpha),
     )
+    if args.direction_input_h5:
+        logging.info(
+            "Direction H5 %s: low_conf=%d (<=%.3f), high_conf=%d (>=%.3f), examples=%d",
+            args.direction_input_h5,
+            int(direction_low_conf_count or 0),
+            float(args.direction_low_conf_threshold),
+            int(direction_high_conf_count or 0),
+            float(args.direction_high_conf_threshold),
+            int(direction_h5_example_count or 0),
+        )
     eval_low_ids = set(truncate_sorted_ids(low_ids, args.num_samples))
     eval_high_ids = set(truncate_sorted_ids(high_ids, args.num_samples))
     eval_ids = eval_low_ids | eval_high_ids
@@ -2314,14 +3196,10 @@ def main() -> None:
 
     out_path = resolve_output_json_path(args.output_json)
 
-    sentence_transformer = None
     compute_derived_metrics = "none" in args.ablation_mode and len(args.ablation_mode) > 1
-    if compute_derived_metrics and any(m in SEMANTIC_SIMILARITY_MODES for m in args.ablation_mode):
-        logging.info(
-            "Loading sentence-transformers model %s for semantic_similarity.",
-            DEFAULT_SEMANTIC_SIMILARITY_MODEL,
-        )
-        sentence_transformer = load_sentence_transformer_for_metrics()
+    collect_semantic_similarity = compute_derived_metrics and any(
+        m in SEMANTIC_SIMILARITY_MODES for m in args.ablation_mode
+    )
 
     results = {"train": {}, "validation": {}}
     mini_results = {"train": {}, "validation": {}}
@@ -2342,6 +3220,10 @@ def main() -> None:
         for mode in [m for m in args.ablation_mode if m != "none"]
     }
     mode_uncertainty_score_values: Dict[str, Dict[str, Dict[float, List[float]]]] = {
+        mode: {target: {float(alpha): [] for alpha in args.alpha} for target in args.ablation_targets}
+        for mode in [m for m in args.ablation_mode if m != "none"]
+    }
+    mode_semantic_similarity_unparsed_zero_values: Dict[str, Dict[str, Dict[float, List[float]]]] = {
         mode: {target: {float(alpha): [] for alpha in args.alpha} for target in args.ablation_targets}
         for mode in [m for m in args.ablation_mode if m != "none"]
     }
@@ -2512,7 +3394,7 @@ def main() -> None:
                                         float(vce)
                                     )
 
-                if sentence_transformer is not None and baseline_semantic_answer is not None:
+                if collect_semantic_similarity and baseline_semantic_answer is not None:
                     for mode in non_none_modes:
                         if mode not in SEMANTIC_SIMILARITY_MODES:
                             continue
@@ -2527,6 +3409,9 @@ def main() -> None:
                                     continue
                                 mode_semantic_answer = entry[key].get("semantic_answer")
                                 if mode_semantic_answer is None:
+                                    mode_semantic_similarity_unparsed_zero_values[mode][target][
+                                        float(alpha)
+                                    ].append(0.0)
                                     continue
                                 pending_semantic_similarity.append(
                                     (
@@ -2545,22 +3430,43 @@ def main() -> None:
             mini_results[split_name][ex_id] = mini_entry
             logging.info("[%s %d/%d] %s first line: %r", split_name, i + 1, len(selected_ids), ex_id, baseline_response[:120])
 
-    if pending_semantic_similarity and sentence_transformer is not None:
-        pairs = [(baseline_text, mode_text) for *_rest, baseline_text, mode_text in pending_semantic_similarity]
-        similarities = batch_compute_semantic_similarities(sentence_transformer, pairs)
-        for task, similarity in zip(pending_semantic_similarity, similarities):
-            split_name, ex_id, mode, target, alpha, key, _baseline_text, _mode_text = task
-            entry = results[split_name][ex_id][key]
-            mini_entry = mini_results[split_name][ex_id][key]
-            entry["semantic_similarity"] = similarity
-            mini_entry["semantic_similarity"] = similarity
-            mode_semantic_similarity_values[mode][target][alpha].append(similarity)
-            vce = entry.get("verbalised_confidence_effect")
-            if vce is not None:
-                uncertainty = compute_uncertainty_score(similarity, float(vce))
-                entry["uncertainty_score"] = uncertainty
-                mini_entry["uncertainty_score"] = uncertainty
-                mode_uncertainty_score_values[mode][target][alpha].append(uncertainty)
+    model_n_layers = int(model.cfg.n_layers)
+    del model
+    release_cuda_cache()
+
+    similarity_scorer = None
+    questions_by_id = None
+    if collect_semantic_similarity and pending_semantic_similarity:
+        similarity_scorer, questions_by_id = open_semantic_similarity_scorer(
+            args.semantic_similarity_method,
+            device,
+            args.input_h5,
+        )
+    try:
+        if pending_semantic_similarity and similarity_scorer is not None:
+            similarities = similarity_scorer.score_answers(
+                example_ids=[task[1] for task in pending_semantic_similarity],
+                correct_answers=[task[-2] for task in pending_semantic_similarity],
+                llm_outputs=[task[-1] for task in pending_semantic_similarity],
+                questions_by_id=questions_by_id,
+            )
+            for task, similarity in zip(pending_semantic_similarity, similarities):
+                split_name, ex_id, mode, target, alpha, key, _baseline_text, _mode_text = task
+                entry = results[split_name][ex_id][key]
+                mini_entry = mini_results[split_name][ex_id][key]
+                entry["semantic_similarity"] = similarity
+                mini_entry["semantic_similarity"] = similarity
+                mode_semantic_similarity_values[mode][target][alpha].append(similarity)
+                mode_semantic_similarity_unparsed_zero_values[mode][target][alpha].append(similarity)
+                vce = entry.get("verbalised_confidence_effect")
+                if vce is not None:
+                    uncertainty = compute_uncertainty_score(similarity, float(vce))
+                    entry["uncertainty_score"] = uncertainty
+                    mini_entry["uncertainty_score"] = uncertainty
+                    mode_uncertainty_score_values[mode][target][alpha].append(uncertainty)
+    finally:
+        if similarity_scorer is not None:
+            similarity_scorer.close()
 
     derived_metric_kwargs: Dict[str, object] = {}
     if compute_derived_metrics:
@@ -2568,6 +3474,7 @@ def main() -> None:
             "mode_semantic_similarity_values": mode_semantic_similarity_values,
             "mode_verbalised_confidence_effect_values": mode_verbalised_confidence_effect_values,
             "mode_uncertainty_score_values": mode_uncertainty_score_values,
+            "mode_semantic_similarity_unparsed_zero_values": mode_semantic_similarity_unparsed_zero_values,
         }
 
     summary_payload = _build_summary_json(
@@ -2579,6 +3486,8 @@ def main() -> None:
         baseline_values_by_target=baseline_values_by_target,
         **derived_metric_kwargs,
     )
+    if compute_derived_metrics:
+        apply_residual_zero_fill(summary_payload, results)
 
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
@@ -2606,7 +3515,7 @@ def main() -> None:
         config_out_path,
         args=args,
         device=device,
-        model_n_layers=model.cfg.n_layers,
+        model_n_layers=model_n_layers,
         ablate_layers=ablate_layers,
         prompt_indices=prompt_indices,
         low_conf_count=len(low_ids),
@@ -2614,6 +3523,9 @@ def main() -> None:
         h5_example_count=len(examples_h5),
         finished_at=datetime.now().astimezone().isoformat(timespec="seconds"),
         summary_payload=summary_payload if compute_derived_metrics else None,
+        direction_low_conf_count=direction_low_conf_count,
+        direction_high_conf_count=direction_high_conf_count,
+        direction_h5_example_count=direction_h5_example_count,
     )
     logging.info("Wrote %s", out_path)
     logging.info("Wrote %s", mini_out_path)
