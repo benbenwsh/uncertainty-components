@@ -8,15 +8,21 @@ residual after block k - 1):
 - ``attn_j`` for j = i .. last block: pre-norm, V, 100% attention on this
   vector (KV heads repeated onto the query heads, then O), Gemma
   post-attention RMSNorm when the model has one, then the same final-norm
-  logit lens. The lens sees the attention output itself.
+  logit lens. With ``--gain`` (default), the lens sees the source residual
+  plus that attention output. With ``--no-gain``, it sees the attention
+  output alone.
 
 Means are averaged in residual space first, matching the improved logit lens.
+With ``--ultimate`` (default), each residual row also averages the full softmax
+of the plain lens and every later attention read. ``--ultimate_detailed`` keeps
+the per-attention tables as well.
 Probabilities in this script's tables are percentages rounded to 2 decimal places.
 """
 
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 import json
@@ -133,6 +139,8 @@ class DetailRow:
     attention_block: int | None
     topk: list[TopKEntry]
     top1_probability: float
+    l2_norm: float
+    l2_norm_raw: float
 
 
 @dataclass
@@ -173,6 +181,11 @@ def _cfg_int(cfg, *names: str, default: int | None = None) -> int:
 def _probability_percent(prob: float) -> float:
     """Percentage rounded to 2 decimal places, shared by PNG text and JSON."""
     return float(f"{float(prob) * 100.0:.2f}")
+
+
+def _l2_norm_3sf(value: float) -> float:
+    """L2 norm rounded to 3 significant figures, shared by PNG text and JSON."""
+    return float(f"{float(value):.3g}")
 
 
 def _layer_weight_key(prefix: tuple[str, ...], layer_idx: int, leaf: str) -> str:
@@ -385,6 +398,21 @@ def _topk_from_probs(probs: torch.Tensor, top_k: int) -> tuple[np.ndarray, np.nd
     )
 
 
+def _topk_from_distributions(dists: np.ndarray, top_k: int) -> tuple[np.ndarray, np.ndarray]:
+    """Top-k of probability rows ``[N, V]`` without holding every row on device at once."""
+    n_rows = int(dists.shape[0])
+    top_ids = np.zeros((n_rows, top_k), dtype=np.int64)
+    top_vals = np.zeros((n_rows, top_k), dtype=np.float32)
+    for start in range(0, n_rows, LENS_ROW_CHUNK):
+        end = min(start + LENS_ROW_CHUNK, n_rows)
+        chunk = torch.as_tensor(np.ascontiguousarray(dists[start:end]), dtype=torch.float32)
+        vals, ids = torch.topk(chunk, k=top_k, dim=-1)
+        top_ids[start:end] = ids.numpy().astype(np.int64, copy=False)
+        top_vals[start:end] = vals.numpy().astype(np.float32, copy=False)
+        del chunk
+    return top_ids, top_vals
+
+
 def logit_lens_topk(
     hidden: np.ndarray,
     top_k: int,
@@ -394,8 +422,12 @@ def logit_lens_topk(
     norm_weight: torch.Tensor,
     norm_eps: float,
     softcap: float | None,
+    scatter: Callable[[int, np.ndarray], None] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Final-norm logit lens. ``hidden`` is ``[N, H]``; returns ids/probs ``[N, K]``."""
+    """Final-norm logit lens. ``hidden`` is ``[N, H]``; returns ids/probs ``[N, K]``.
+
+    ``scatter(start, probs)`` receives each chunk of full softmax rows when set.
+    """
     if hidden.ndim != 2:
         raise ValueError(f"logit_lens_topk expected [N, H], got {hidden.shape}.")
     n_rows = int(hidden.shape[0])
@@ -414,6 +446,8 @@ def logit_lens_topk(
                 softcap=softcap,
             )
             ids_chunk, vals_chunk = _topk_from_probs(probs, top_k)
+            if scatter is not None:
+                scatter(start, probs.detach().to(dtype=torch.float32).cpu().numpy())
         top_ids[start:end] = ids_chunk
         top_vals[start:end] = vals_chunk
         del hidden_t, probs
@@ -431,20 +465,32 @@ def ov_logit_lens_topk(
     norm_weight: torch.Tensor,
     norm_eps: float,
     softcap: float | None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """OV-transform ``hidden`` ``[N, H]``, then the final-norm logit lens."""
+    *,
+    gain: bool,
+    scatter: Callable[[int, np.ndarray], None] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """OV-transform ``hidden`` ``[N, H]``, then the final-norm logit lens.
+
+    When ``gain`` is true, the lens input is the source residual plus the
+    attention output. Otherwise it is the attention output alone.
+    The returned L2 norm is always the attention output alone, before the
+    final RMSNorm, whether or not the residual is added into the lens.
+    """
     if hidden.ndim != 2:
         raise ValueError(f"ov_logit_lens_topk expected [N, H], got {hidden.shape}.")
     n_rows = int(hidden.shape[0])
     top_ids = np.zeros((n_rows, top_k), dtype=np.int64)
     top_vals = np.zeros((n_rows, top_k), dtype=np.float32)
+    l2_norms = np.zeros((n_rows,), dtype=np.float32)
     for start in range(0, n_rows, LENS_ROW_CHUNK):
         end = min(start + LENS_ROW_CHUNK, n_rows)
         hidden_t = torch.as_tensor(hidden[start:end], dtype=torch.float32, device=device)
         with torch.no_grad():
             attn_out = apply_attn_ov(hidden_t, block, arch)
+            lens_input = hidden_t + attn_out if gain else attn_out
+            norm_chunk = torch.linalg.vector_norm(attn_out, ord=2, dim=-1)
             probs = _probs_from_hidden(
-                attn_out,
+                lens_input,
                 w_u=w_u,
                 b_u=b_u,
                 norm_weight=norm_weight,
@@ -452,10 +498,13 @@ def ov_logit_lens_topk(
                 softcap=softcap,
             )
             ids_chunk, vals_chunk = _topk_from_probs(probs, top_k)
+            if scatter is not None:
+                scatter(start, probs.detach().to(dtype=torch.float32).cpu().numpy())
         top_ids[start:end] = ids_chunk
         top_vals[start:end] = vals_chunk
-        del hidden_t, attn_out, probs
-    return top_ids, top_vals
+        l2_norms[start:end] = norm_chunk.detach().cpu().numpy().astype(np.float32, copy=False)
+        del hidden_t, attn_out, lens_input, norm_chunk, probs
+    return top_ids, top_vals, l2_norms
 
 
 def _detail_row(
@@ -463,6 +512,7 @@ def _detail_row(
     attention_block: int | None,
     token_ids: np.ndarray,
     probs: np.ndarray,
+    l2_norm: float,
     tokenizer,
 ) -> DetailRow:
     entries: list[TopKEntry] = []
@@ -476,11 +526,14 @@ def _detail_row(
                 probability_percent=_probability_percent(float(prob)),
             )
         )
+    raw_norm = float(l2_norm)
     return DetailRow(
         row=label,
         attention_block=attention_block,
         topk=entries,
         top1_probability=float(probs[0]),
+        l2_norm=_l2_norm_3sf(raw_norm),
+        l2_norm_raw=raw_norm,
     )
 
 
@@ -489,13 +542,15 @@ def detail_rows_for_source(
     n_blocks: int,
     plain_ids: np.ndarray,
     plain_vals: np.ndarray,
+    plain_l2: float,
     block_ids: list[np.ndarray],
     block_vals: list[np.ndarray],
+    block_l2s: list[np.ndarray],
     tokenizer,
 ) -> list[DetailRow]:
     """``None`` plus ``attn_j`` for every block ``j >= source_layer``."""
     rows = [
-        _detail_row("None", None, plain_ids, plain_vals, tokenizer),
+        _detail_row("None", None, plain_ids, plain_vals, plain_l2, tokenizer),
     ]
     if source_layer < n_blocks:
         for block_idx in range(source_layer, n_blocks):
@@ -505,6 +560,7 @@ def detail_rows_for_source(
                     block_idx,
                     block_ids[block_idx][source_layer],
                     block_vals[block_idx][source_layer],
+                    float(block_l2s[block_idx][source_layer]),
                     tokenizer,
                 )
             )
@@ -525,6 +581,7 @@ def _detail_payload(position: str, source_layer: int, rows: list[DetailRow]) -> 
             {
                 "row": row.row,
                 "attention_block": row.attention_block,
+                "l2_norm": row.l2_norm,
                 "topk": [
                     {
                         "rank": entry.rank,
@@ -548,6 +605,8 @@ def _save_detail_table_png(path: Path, rows: list[DetailRow]) -> None:
     for k in range(top_k):
         col_labels.append(f"Top-{k + 1} token")
         col_labels.append(f"Top-{k + 1} prob (%)")
+    col_labels.append("L2 norm")
+    norm_col = len(col_labels) - 1
 
     cell_text: list[list[str]] = []
     for row in rows:
@@ -555,6 +614,7 @@ def _save_detail_table_png(path: Path, rows: list[DetailRow]) -> None:
         for entry in row.topk:
             cells.append(entry.token)
             cells.append(f"{entry.probability_percent:.2f}%")
+        cells.append(f"{row.l2_norm:.3g}")
         cell_text.append(cells)
 
     fig_w = max(11.0, 2.1 * len(col_labels))
@@ -577,10 +637,19 @@ def _save_detail_table_png(path: Path, rows: list[DetailRow]) -> None:
         header_cell.set_facecolor((0.85, 0.9, 1.0, 1.0))
         header_cell.set_text_props(weight="bold")
 
+    raw_norms = [row.l2_norm_raw for row in rows]
+    norm_lo = min(raw_norms)
+    norm_hi = max(raw_norms)
+    norm_span = norm_hi - norm_lo
     for r, row in enumerate(rows):
         alpha = float(np.clip(row.top1_probability, 0.0, 1.0))
-        for c in range(1, len(col_labels)):
+        for c in range(1, norm_col):
             table[(r + 1, c)].set_facecolor((0.1, 0.3, 1.0, alpha))
+        if norm_span == 0.0:
+            red_t = 1.0
+        else:
+            red_t = (row.l2_norm_raw - norm_lo) / norm_span
+        table[(r + 1, norm_col)].set_facecolor((1.0, 1.0 - 0.85 * red_t, 1.0 - 0.85 * red_t))
 
     _disable_table_mathtext(table)
     fig.tight_layout()
@@ -588,29 +657,31 @@ def _save_detail_table_png(path: Path, rows: list[DetailRow]) -> None:
     plt.close(fig)
 
 
+def _summary_token_cell(token_ids: np.ndarray, tokenizer) -> dict:
+    return {
+        "tokens": [_format_token_decoded(tokenizer, int(token_id)) for token_id in token_ids],
+        "token_ids": [int(token_id) for token_id in token_ids],
+    }
+
+
 def summary_cells_for_position(
+    n_layers: int,
     n_blocks: int,
+    plain_ids: np.ndarray,
     block_ids: list[np.ndarray],
     tokenizer,
 ) -> tuple[list[str], list[str], list[list[dict | None]]]:
-    """Upper triangle, top-right occupied: cell (i, j) is attn_j applied to layer i."""
-    row_labels = [f"layer_{i}" for i in range(n_blocks)]
-    column_labels = [f"attn_{j}" for j in range(n_blocks)]
+    """None column plus the attention triangle. Cell (i, attn_j) is filled when j >= i."""
+    row_labels = [f"layer_{i}" for i in range(n_layers)]
+    column_labels = ["None", *[f"attn_{j}" for j in range(n_blocks)]]
     cells: list[list[dict | None]] = []
-    for source_layer in range(n_blocks):
-        row: list[dict | None] = []
+    for source_layer in range(n_layers):
+        row: list[dict | None] = [_summary_token_cell(plain_ids[source_layer], tokenizer)]
         for block_idx in range(n_blocks):
             if block_idx < source_layer:
                 row.append(None)
                 continue
-            ids = block_ids[block_idx][source_layer]
-            tokens = [_format_token_decoded(tokenizer, int(token_id)) for token_id in ids]
-            row.append(
-                {
-                    "tokens": tokens,
-                    "token_ids": [int(token_id) for token_id in ids],
-                }
-            )
+            row.append(_summary_token_cell(block_ids[block_idx][source_layer], tokenizer))
         cells.append(row)
     return row_labels, column_labels, cells
 
@@ -666,6 +737,174 @@ def _save_summary_table_png(
     plt.close(fig)
 
 
+def _comparison_topk_entries(token_ids: np.ndarray, probs: np.ndarray, tokenizer) -> list[dict]:
+    entries: list[dict] = []
+    for rank, (token_id, prob) in enumerate(zip(token_ids, probs), start=1):
+        tid = int(token_id)
+        entries.append(
+            {
+                "rank": rank,
+                "token_id": tid,
+                "token": _format_token_decoded(tokenizer, tid),
+                "probability_percent": _probability_percent(float(prob)),
+            }
+        )
+    return entries
+
+
+def _ultimate_comparison_rows(
+    plain_ids: np.ndarray,
+    plain_vals: np.ndarray,
+    ultimate_ids: np.ndarray,
+    ultimate_vals: np.ndarray,
+    tokenizer,
+) -> list[dict]:
+    rows: list[dict] = []
+    n_layers = int(plain_ids.shape[0])
+    for layer in range(n_layers):
+        rows.append(
+            {
+                "layer": layer,
+                "lens": "vanilla",
+                "row": f"layer_{layer} vanilla",
+                "topk": _comparison_topk_entries(plain_ids[layer], plain_vals[layer], tokenizer),
+                "top1_probability": float(plain_vals[layer, 0]),
+            }
+        )
+        rows.append(
+            {
+                "layer": layer,
+                "lens": "ultimate",
+                "row": f"layer_{layer} ultimate",
+                "topk": _comparison_topk_entries(
+                    ultimate_ids[layer], ultimate_vals[layer], tokenizer
+                ),
+                "top1_probability": float(ultimate_vals[layer, 0]),
+            }
+        )
+    return rows
+
+
+def _save_ultimate_compact_png(path: Path, rows: list[dict]) -> None:
+    n_layers = len(rows) // 2
+    col_labels = ["Layer", "vanilla logit lens", "ultimate attn lens"]
+    cell_text: list[list[str]] = []
+    top1 = np.zeros((n_layers, 2), dtype=np.float32)
+    for layer in range(n_layers):
+        vanilla = rows[2 * layer]
+        ultimate = rows[2 * layer + 1]
+        cell_text.append(
+            [
+                f"layer_{layer}",
+                ", ".join(entry["token"] for entry in vanilla["topk"]),
+                ", ".join(entry["token"] for entry in ultimate["topk"]),
+            ]
+        )
+        top1[layer, 0] = vanilla["top1_probability"]
+        top1[layer, 1] = ultimate["top1_probability"]
+
+    top_k = max(1, len(rows[0]["topk"]))
+    fig_w = max(12.0, 1.8 * top_k + 4.0)
+    fig_h = max(6.0, 0.4 * n_layers + 2.0)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.axis("off")
+    table = ax.table(
+        cellText=cell_text,
+        colLabels=col_labels,
+        loc="center",
+        cellLoc="center",
+        colLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1.0, 1.2)
+    for c in range(len(col_labels)):
+        header_cell = table[(0, c)]
+        header_cell.set_facecolor((0.85, 0.9, 1.0, 1.0))
+        header_cell.set_text_props(weight="bold")
+    for layer in range(n_layers):
+        for col in range(2):
+            alpha = float(np.clip(top1[layer, col], 0.0, 1.0))
+            table[(layer + 1, col + 1)].set_facecolor((0.1, 0.3, 1.0, alpha))
+    _disable_table_mathtext(table)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _save_ultimate_detail_png(path: Path, rows: list[dict]) -> None:
+    top_k = len(rows[0]["topk"])
+    col_labels = ["Row"]
+    for k in range(top_k):
+        col_labels.append(f"Top-{k + 1} token")
+        col_labels.append(f"Top-{k + 1} prob (%)")
+    cell_text: list[list[str]] = []
+    for row in rows:
+        cells = [row["row"]]
+        for entry in row["topk"]:
+            cells.append(entry["token"])
+            cells.append(f"{entry['probability_percent']:.2f}%")
+        cell_text.append(cells)
+
+    fig_w = max(11.0, 2.1 * len(col_labels))
+    fig_h = max(6.0, 0.35 * len(rows) + 2.0)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.axis("off")
+    table = ax.table(
+        cellText=cell_text,
+        colLabels=col_labels,
+        loc="center",
+        cellLoc="center",
+        colLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1.0, 1.2)
+    for c in range(len(col_labels)):
+        header_cell = table[(0, c)]
+        header_cell.set_facecolor((0.85, 0.9, 1.0, 1.0))
+        header_cell.set_text_props(weight="bold")
+    for r, row in enumerate(rows):
+        alpha = float(np.clip(row["top1_probability"], 0.0, 1.0))
+        for c in range(1, len(col_labels)):
+            table[(r + 1, c)].set_facecolor((0.1, 0.3, 1.0, alpha))
+    _disable_table_mathtext(table)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _write_ultimate_comparison(
+    pos_dir: Path,
+    label: str,
+    plain_ids: np.ndarray,
+    plain_vals: np.ndarray,
+    ultimate_ids: np.ndarray,
+    ultimate_vals: np.ndarray,
+    tokenizer,
+) -> None:
+    rows = _ultimate_comparison_rows(
+        plain_ids, plain_vals, ultimate_ids, ultimate_vals, tokenizer
+    )
+    _save_ultimate_compact_png(pos_dir / "vanilla_vs_ultimate.png", rows)
+    _save_ultimate_detail_png(pos_dir / "vanilla_vs_ultimate_detail.png", rows)
+    _write_json(
+        pos_dir / "vanilla_vs_ultimate.json",
+        {
+            "position": label,
+            "rows": [
+                {
+                    "layer": row["layer"],
+                    "lens": row["lens"],
+                    "row": row["row"],
+                    "topk": row["topk"],
+                }
+                for row in rows
+            ],
+        },
+    )
+
+
 def write_position_outputs(
     out_dir: Path,
     label: str,
@@ -673,38 +912,59 @@ def write_position_outputs(
     n_blocks: int,
     plain_ids: np.ndarray,
     plain_vals: np.ndarray,
+    plain_l2: np.ndarray,
     block_ids: list[np.ndarray],
     block_vals: list[np.ndarray],
+    block_l2s: list[np.ndarray],
     tokenizer,
+    *,
+    write_attention_details: bool,
+    ultimate_ids: np.ndarray | None = None,
+    ultimate_vals: np.ndarray | None = None,
 ) -> None:
-    """Write ``layer_<i>`` PNG/JSON for every residual row, then the summary triangle."""
+    """Write per-position tables. Attention details are optional; ultimate comparison is optional."""
     pos_dir = out_dir / label
     pos_dir.mkdir(parents=True, exist_ok=True)
-    for source_layer in range(n_layers):
-        rows = detail_rows_for_source(
-            source_layer,
-            n_blocks,
-            plain_ids[source_layer],
-            plain_vals[source_layer],
-            block_ids,
-            block_vals,
+    if write_attention_details:
+        for source_layer in range(n_layers):
+            rows = detail_rows_for_source(
+                source_layer,
+                n_blocks,
+                plain_ids[source_layer],
+                plain_vals[source_layer],
+                float(plain_l2[source_layer]),
+                block_ids,
+                block_vals,
+                block_l2s,
+                tokenizer,
+            )
+            stem = pos_dir / f"layer_{source_layer}"
+            _save_detail_table_png(stem.with_suffix(".png"), rows)
+            _write_json(stem.with_suffix(".json"), _detail_payload(label, source_layer, rows))
+
+        row_labels, column_labels, cells = summary_cells_for_position(
+            n_layers, n_blocks, plain_ids, block_ids, tokenizer
+        )
+        _save_summary_table_png(pos_dir / "summary.png", row_labels, column_labels, cells)
+        _write_json(
+            pos_dir / "summary.json",
+            {
+                "position": label,
+                "row_labels": row_labels,
+                "column_labels": column_labels,
+                "cells": cells,
+            },
+        )
+    if ultimate_ids is not None and ultimate_vals is not None:
+        _write_ultimate_comparison(
+            pos_dir,
+            label,
+            plain_ids,
+            plain_vals,
+            ultimate_ids,
+            ultimate_vals,
             tokenizer,
         )
-        stem = pos_dir / f"layer_{source_layer}"
-        _save_detail_table_png(stem.with_suffix(".png"), rows)
-        _write_json(stem.with_suffix(".json"), _detail_payload(label, source_layer, rows))
-
-    row_labels, column_labels, cells = summary_cells_for_position(n_blocks, block_ids, tokenizer)
-    _save_summary_table_png(pos_dir / "summary.png", row_labels, column_labels, cells)
-    _write_json(
-        pos_dir / "summary.json",
-        {
-            "position": label,
-            "row_labels": row_labels,
-            "column_labels": column_labels,
-            "cells": cells,
-        },
-    )
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -790,6 +1050,36 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--low_conf_threshold", type=float, default=0.1)
     parser.add_argument("--high_conf_threshold", type=float, default=0.9)
+    parser.add_argument(
+        "--gain",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "If true (default), each attn_j logit lens reads the source residual "
+            "plus that block's attention output. If false (--no-gain), it reads "
+            "the attention output alone. The None rows are unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--ultimate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "If true (default), average the full softmax of the plain logit lens "
+            "and every later attention read at each residual row, then report "
+            "that average beside the plain lens. If false (--no-ultimate), "
+            "write only the per-attention tables."
+        ),
+    )
+    parser.add_argument(
+        "--ultimate_detailed",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If true together with --ultimate, also write the per-attention "
+            "layer tables and summary. Ignored when --ultimate is off."
+        ),
+    )
     return parser
 
 
@@ -993,8 +1283,20 @@ def _run_lenses(
     norm_weight: torch.Tensor,
     norm_eps: float,
     softcap: float | None,
-) -> tuple[np.ndarray, np.ndarray, list[np.ndarray], list[np.ndarray]]:
-    """Return plain ids/vals ``[J, L, K]`` and per-block ids/vals ``[J, j+1, K]``."""
+    *,
+    gain: bool,
+    ultimate: bool,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    list[np.ndarray],
+    list[np.ndarray],
+    list[np.ndarray],
+    np.ndarray | None,
+    np.ndarray | None,
+]:
+    """Return plain ids/vals/l2, per-block ids/vals/l2, and optional ultimate top-k."""
     if not jobs:
         raise ValueError("No residual vectors to lens.")
     n_jobs = len(jobs)
@@ -1007,6 +1309,23 @@ def _run_lenses(
             )
 
     print(f"Plain logit lens on {n_jobs * n_layers} residual rows.")
+    vocab = int(w_u.shape[0])
+    ultimate_sum: np.ndarray | None = None
+    ultimate_count: np.ndarray | None = None
+    if ultimate:
+        ultimate_sum = np.zeros((n_jobs, n_layers, vocab), dtype=np.float32)
+        ultimate_count = np.zeros((n_jobs, n_layers), dtype=np.int32)
+        print(
+            "Accumulating ultimate softmax "
+            f"({n_jobs} positions x {n_layers} layers x {vocab} vocab)."
+        )
+
+    def _scatter_plain(start: int, probs: np.ndarray) -> None:
+        assert ultimate_sum is not None and ultimate_count is not None
+        end = start + int(probs.shape[0])
+        ultimate_sum.reshape(-1, vocab)[start:end] += probs
+        ultimate_count.reshape(-1)[start:end] += 1
+
     plain_batch = np.stack([job.hidden for job in jobs], axis=0).reshape(n_jobs * n_layers, hidden_dim)
     plain_ids, plain_vals = logit_lens_topk(
         plain_batch,
@@ -1017,15 +1336,28 @@ def _run_lenses(
         norm_weight=norm_weight,
         norm_eps=norm_eps,
         softcap=softcap,
+        scatter=_scatter_plain if ultimate else None,
     )
+    plain_l2 = np.linalg.norm(plain_batch, axis=-1).astype(np.float32, copy=False)
     plain_ids = plain_ids.reshape(n_jobs, n_layers, top_k)
     plain_vals = plain_vals.reshape(n_jobs, n_layers, top_k)
+    plain_l2 = plain_l2.reshape(n_jobs, n_layers)
     del plain_batch
 
     block_ids: list[np.ndarray] = []
     block_vals: list[np.ndarray] = []
+    block_l2s: list[np.ndarray] = []
     for block_idx in tqdm(range(arch.n_blocks), desc="Attention blocks"):
         n_sources = block_idx + 1
+
+        def _scatter_block(start: int, probs: np.ndarray, n_src: int = n_sources) -> None:
+            assert ultimate_sum is not None and ultimate_count is not None
+            for local, row in enumerate(range(start, start + int(probs.shape[0]))):
+                job = row // n_src
+                source = row % n_src
+                ultimate_sum[job, source] += probs[local]
+                ultimate_count[job, source] += 1
+
         source_batch = np.stack(
             [job.hidden[:n_sources] for job in jobs], axis=0
         ).reshape(n_jobs * n_sources, hidden_dim)
@@ -1033,7 +1365,7 @@ def _run_lenses(
             weight_map, arch, block_idx, device=device, norm_eps=norm_eps
         )
         try:
-            ids, vals = ov_logit_lens_topk(
+            ids, vals, l2s = ov_logit_lens_topk(
                 source_batch,
                 block,
                 arch,
@@ -1044,6 +1376,8 @@ def _run_lenses(
                 norm_weight=norm_weight,
                 norm_eps=norm_eps,
                 softcap=softcap,
+                gain=gain,
+                scatter=_scatter_block if ultimate else None,
             )
         finally:
             del block
@@ -1051,9 +1385,32 @@ def _run_lenses(
                 torch.cuda.empty_cache()
         block_ids.append(ids.reshape(n_jobs, n_sources, top_k))
         block_vals.append(vals.reshape(n_jobs, n_sources, top_k))
-        del source_batch, ids, vals
+        block_l2s.append(l2s.reshape(n_jobs, n_sources))
+        del source_batch, ids, vals, l2s
 
-    return plain_ids, plain_vals, block_ids, block_vals
+    ultimate_ids: np.ndarray | None = None
+    ultimate_vals: np.ndarray | None = None
+    if ultimate_sum is not None and ultimate_count is not None:
+        if int(ultimate_count.min()) < 1:
+            raise ValueError("Ultimate softmax count is zero for at least one residual row.")
+        ultimate_sum /= ultimate_count.astype(np.float32)[:, :, None]
+        flat_ids, flat_vals = _topk_from_distributions(
+            ultimate_sum.reshape(n_jobs * n_layers, vocab), top_k
+        )
+        ultimate_ids = flat_ids.reshape(n_jobs, n_layers, top_k)
+        ultimate_vals = flat_vals.reshape(n_jobs, n_layers, top_k)
+        del ultimate_sum, flat_ids, flat_vals
+
+    return (
+        plain_ids,
+        plain_vals,
+        plain_l2,
+        block_ids,
+        block_vals,
+        block_l2s,
+        ultimate_ids,
+        ultimate_vals,
+    )
 
 
 def _write_config_txt(
@@ -1086,6 +1443,9 @@ def _write_config_txt(
         f"split_confidence_groups: {args.split_confidence_groups}",
         f"low_conf_threshold: {args.low_conf_threshold}",
         f"high_conf_threshold: {args.high_conf_threshold}",
+        f"gain: {args.gain}",
+        f"ultimate: {args.ultimate}",
+        f"ultimate_detailed: {args.ultimate_detailed}",
         f"Valid examples: {corpus.valid_examples}",
         f"Total token positions: {len(corpus.token_labels)}",
         f"Token labels: {', '.join(corpus.token_labels)}",
@@ -1098,8 +1458,17 @@ def _write_config_txt(
         f"Post-attention RMSNorm: {arch.use_post_attention_norm}",
         "OV read: input RMSNorm, V, 100% attention (repeat KV heads), O, "
         "optional post-attention RMSNorm, then final RMSNorm and unembedding.",
-        "Lens input is the attention output; the residual is not added back.",
+        (
+            "Lens input for attn rows is the source residual plus the attention output."
+            if args.gain
+            else "Lens input for attn rows is the attention output alone."
+        ),
         "Probabilities are percentages rounded to 2 decimal places.",
+        (
+            "Ultimate lens averages the full softmax of the plain lens and every later attention read."
+            if args.ultimate
+            else "Ultimate lens is off."
+        ),
         f"Vocab size: {vocab_size}",
         f"Elapsed seconds: {elapsed_seconds:.2f}",
     ]
@@ -1132,6 +1501,12 @@ def main() -> None:
             "Warning: ignoring --l_vs_un because --linguistic_confidence_prompt is off.",
             file=sys.stderr,
         )
+    if args.ultimate_detailed and not args.ultimate:
+        print(
+            "Warning: ignoring --ultimate_detailed because --ultimate is off.",
+            file=sys.stderr,
+        )
+        args.ultimate_detailed = False
     if bool(args.linguistic_confidence_prompt) and bool(args.l_vs_un):
         configure_prefix_tokens_for_model(args.model_name_or_path)
     token_labels = _canonical_token_labels(
@@ -1221,7 +1596,7 @@ def main() -> None:
             ex_dir = examples_dir / f"example_{i + 1}"
             jobs.extend(_jobs_for_store(store, ex_dir, token_labels))
 
-    plain_ids, plain_vals, block_ids, block_vals = _run_lenses(
+    plain_ids, plain_vals, plain_l2, block_ids, block_vals, block_l2s, ultimate_ids, ultimate_vals = _run_lenses(
         jobs,
         arch,
         weight_map,
@@ -1232,8 +1607,11 @@ def main() -> None:
         norm_weight=norm_weight,
         norm_eps=norm_eps,
         softcap=softcap,
+        gain=bool(args.gain),
+        ultimate=bool(args.ultimate),
     )
 
+    write_attention_details = (not args.ultimate) or bool(args.ultimate_detailed)
     for job_idx, job in enumerate(tqdm(jobs, desc="Writing tables")):
         write_position_outputs(
             job.out_dir,
@@ -1242,9 +1620,14 @@ def main() -> None:
             n_blocks=arch.n_blocks,
             plain_ids=plain_ids[job_idx],
             plain_vals=plain_vals[job_idx],
+            plain_l2=plain_l2[job_idx],
             block_ids=[ids[job_idx] for ids in block_ids],
             block_vals=[vals[job_idx] for vals in block_vals],
+            block_l2s=[norms[job_idx] for norms in block_l2s],
             tokenizer=tokenizer,
+            write_attention_details=write_attention_details,
+            ultimate_ids=None if ultimate_ids is None else ultimate_ids[job_idx],
+            ultimate_vals=None if ultimate_vals is None else ultimate_vals[job_idx],
         )
 
     elapsed = time.perf_counter() - start_time
