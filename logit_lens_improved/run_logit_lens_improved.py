@@ -416,8 +416,25 @@ def _probs_from_hidden(
     norm_weight: torch.Tensor,
     norm_eps: float,
     softcap: float | None = None,
+    apply_norm: bool | torch.Tensor = True,
 ) -> torch.Tensor:
-    hidden = _apply_rmsnorm(hidden, norm_weight=norm_weight, norm_eps=norm_eps)
+    """Unembed ``hidden`` ``[N, H]``.
+
+    ``apply_norm`` is ``True`` for every row, ``False`` for none, or a length-``N``
+    bool tensor. The last residual row stored from ``output_hidden_states`` is
+    already the final RMSNorm output, so callers skip the norm on that row.
+    """
+    if isinstance(apply_norm, torch.Tensor):
+        if apply_norm.dtype != torch.bool or apply_norm.shape != (hidden.shape[0],):
+            raise ValueError(
+                f"apply_norm must be bool[{hidden.shape[0]}], got {tuple(apply_norm.shape)} "
+                f"dtype={apply_norm.dtype}."
+            )
+        if bool(apply_norm.any()):
+            normed = _apply_rmsnorm(hidden, norm_weight=norm_weight, norm_eps=norm_eps)
+            hidden = torch.where(apply_norm[:, None], normed, hidden)
+    elif apply_norm:
+        hidden = _apply_rmsnorm(hidden, norm_weight=norm_weight, norm_eps=norm_eps)
     logits = hidden @ w_u.T
     if b_u is not None:
         logits = logits + b_u
@@ -745,8 +762,18 @@ def _compute_topk(
     norm_weight: torch.Tensor,
     norm_eps: float,
     softcap: float | None = None,
+    *,
+    skip_norm_last_row: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     hidden_t = torch.as_tensor(hidden, dtype=torch.float32, device=device)
+    apply_norm: bool | torch.Tensor = True
+    if skip_norm_last_row:
+        if hidden_t.ndim != 2 or hidden_t.shape[0] < 1:
+            raise ValueError(
+                f"skip_norm_last_row expected [layers, hidden], got {tuple(hidden_t.shape)}."
+            )
+        apply_norm = torch.ones(hidden_t.shape[0], dtype=torch.bool, device=device)
+        apply_norm[-1] = False
     with torch.no_grad():
         probs = _probs_from_hidden(
             hidden_t,
@@ -755,6 +782,7 @@ def _compute_topk(
             norm_weight=norm_weight,
             norm_eps=norm_eps,
             softcap=softcap,
+            apply_norm=apply_norm,
         ).detach().cpu().numpy()
 
     n_rows = probs.shape[0]
@@ -1187,6 +1215,7 @@ def main():
                     norm_weight=norm_weight,
                     norm_eps=norm_eps,
                     softcap=softcap,
+                    skip_norm_last_row=True,
                 )
                 out_path = out_dir / f"{prefix}_{label}.png"
                 _save_topk_table_png(

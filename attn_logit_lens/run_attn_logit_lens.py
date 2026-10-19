@@ -423,19 +423,31 @@ def logit_lens_topk(
     norm_eps: float,
     softcap: float | None,
     scatter: Callable[[int, np.ndarray], None] | None = None,
+    norm_rows: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Final-norm logit lens. ``hidden`` is ``[N, H]``; returns ids/probs ``[N, K]``.
 
     ``scatter(start, probs)`` receives each chunk of full softmax rows when set.
+    ``norm_rows`` is a length-``N`` bool mask: ``True`` applies the final RMSNorm.
+    ``None`` applies it to every row. The last residual row from
+    ``output_hidden_states`` is already post-norm, so that row is ``False``.
     """
     if hidden.ndim != 2:
         raise ValueError(f"logit_lens_topk expected [N, H], got {hidden.shape}.")
     n_rows = int(hidden.shape[0])
+    if norm_rows is not None and norm_rows.shape != (n_rows,):
+        raise ValueError(
+            f"norm_rows shape {norm_rows.shape} != ({n_rows},)."
+        )
     top_ids = np.zeros((n_rows, top_k), dtype=np.int64)
     top_vals = np.zeros((n_rows, top_k), dtype=np.float32)
     for start in range(0, n_rows, LENS_ROW_CHUNK):
         end = min(start + LENS_ROW_CHUNK, n_rows)
         hidden_t = torch.as_tensor(hidden[start:end], dtype=torch.float32, device=device)
+        if norm_rows is None:
+            apply_norm: bool | torch.Tensor = True
+        else:
+            apply_norm = torch.as_tensor(norm_rows[start:end], dtype=torch.bool, device=device)
         with torch.no_grad():
             probs = _probs_from_hidden(
                 hidden_t,
@@ -444,6 +456,7 @@ def logit_lens_topk(
                 norm_weight=norm_weight,
                 norm_eps=norm_eps,
                 softcap=softcap,
+                apply_norm=apply_norm,
             )
             ids_chunk, vals_chunk = _topk_from_probs(probs, top_k)
             if scatter is not None:
@@ -1327,6 +1340,9 @@ def _run_lenses(
         ultimate_count.reshape(-1)[start:end] += 1
 
     plain_batch = np.stack([job.hidden for job in jobs], axis=0).reshape(n_jobs * n_layers, hidden_dim)
+    # Row -1 of each residual is the post-final-norm hidden state from generate().
+    norm_rows = np.ones((n_jobs, n_layers), dtype=bool)
+    norm_rows[:, -1] = False
     plain_ids, plain_vals = logit_lens_topk(
         plain_batch,
         top_k=top_k,
@@ -1337,6 +1353,7 @@ def _run_lenses(
         norm_eps=norm_eps,
         softcap=softcap,
         scatter=_scatter_plain if ultimate else None,
+        norm_rows=norm_rows.reshape(-1),
     )
     plain_l2 = np.linalg.norm(plain_batch, axis=-1).astype(np.float32, copy=False)
     plain_ids = plain_ids.reshape(n_jobs, n_layers, top_k)
